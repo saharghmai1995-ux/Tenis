@@ -1,0 +1,114 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─── NeoTennis Markov Quant — Ledger Schema ────────────────────────────────
+
+model TennisMatch {
+  id         String   @id @default(cuid())
+  eventKey   String   @unique // espn competition id (stable per match)
+  dateKey    String   // YYYYMMDD
+  tour       String   // ATP | WTA
+  tournament String
+  city       String?
+  surface    String   // HARD | CLAY | GRASS
+  surfaceSrc String   // MAPPED | INFERRED
+  round      String
+  singles    Boolean  @default(true)
+  playerA    String
+  playerB    String
+  flagA      String?
+  flagB      String?
+  rankA      Int?
+  rankB      Int?
+  pointsA    Float?
+  pointsB    Float?
+  status     String   // pre | in | post
+  startTime  DateTime?
+  favorite   String?  // A | B
+
+  // ── Layer 1 (serve point + hold)
+  pServeA Float?
+  pServeB Float?
+  holdA   Float?
+  holdB   Float?
+
+  // ── Layer 2/3 (set & match)
+  setWinA Float?
+  p20     Float?
+  p21     Float?
+  p12     Float?
+  p02     Float?
+  ou95    Float? // set over 9.5 games
+  ou215   Float? // match over 21.5 games
+  tb1     Float? // tiebreak in set 1
+
+  // ── Market fusion (65% market / 35% surface Elo)
+  marketProbA Float?
+  marketOddsA Float?
+  pEloA       Float?
+  pEloB       Float?
+  pFinalA     Float?
+  pFinalB     Float?
+  marketGap   Boolean @default(false)
+
+  // ── Supervisor gate
+  vetoed       Boolean @default(false)
+  vetoReason   String?
+  dualEligible Boolean @default(false)
+
+  // ── Slips
+  slipAText String?
+  slipAOdds Float?
+  slipAProb Float?
+  slipBText String?
+  slipBOdds Float?
+  slipBProb Float?
+
+  timing  String? // T-30m Pre-Warmup | In-Play After Early Break | ...
+  hashPre String?
+
+  // ── Settlement
+  resultSetsA Int?
+  resultSetsB Int?
+  resultCode  String? // 2-0 | 2-1 | 1-2 | 0-2
+  settled     Boolean @default(false)
+
+  picks TennisPick[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model TennisPick {
+  id      String     @id @default(cuid())
+  matchId String
+  match   TennisMatch @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  line    String // DUAL | COMBO | SNIPER | SHADOW
+  leg     String // A | B | B-O205 | COMBO-2 | COMBO-3 | SNIPER-<key>
+  desc    String
+  odds    Float
+  prob    Float
+  stake   Float      @default(1)
+  meta    String? // structured settlement payload (JSON)
+  status  String     @default("PENDING") // PENDING | WON | LOST | VOID
+  profit  Float?
+  settledAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@unique([matchId, line, leg])
+}
+
+model EngineLog {
+  id      String   @id @default(cuid())
+  kind    String // FEED | SETTLE | TELEGRAM
+  message String
+  meta    String?
+  createdAt DateTime @default(now())
+}
