@@ -33,6 +33,12 @@ function Bar({ label, value, tone = "bg-amber-300" }: { label: string; value: nu
   );
 }
 
+const ARCH_STYLE: Record<string, string> = {
+  ARCH1: "border-amber-300/40 bg-amber-300/10 text-amber-300",
+  ARCH2: "border-fuchsia-400/40 bg-fuchsia-400/10 text-fuchsia-300",
+  ARCH3: "border-emerald-400/40 bg-emerald-400/10 text-emerald-300",
+};
+
 export function AnalysisDialog({
   match,
   open,
@@ -68,7 +74,7 @@ export function AnalysisDialog({
           <section className="rounded-xl border border-white/10 bg-white/[0.03] p-3.5">
             <h4 className="flex items-center gap-2 text-xs font-bold text-amber-300">
               <Sigma className="h-3.5 w-3.5" />
-              لایه ۱ — احتمال برد امتیاز روی سرویس و Hold
+              لایه ۱ — احتمال برد امتیاز روی سرویس و Hold (کالیبره Kovalchik 2016)
             </h4>
             <div className="mt-2.5 space-y-1.5">
               <Bar
@@ -82,17 +88,25 @@ export function AnalysisDialog({
                 tone={fav === "B" ? "bg-amber-300" : "bg-white/40"}
               />
             </div>
-            <div className="mono-num mt-2 grid grid-cols-3 gap-2 text-[10px] text-muted-foreground">
+            {/* v2.0 font fix — mono-num only on latin numbers; Persian labels
+                ride font-sans (the v1.0 mono container rendered ▒▒▒) */}
+            <div className="mt-2 grid grid-cols-3 gap-2 text-[10px] text-muted-foreground">
               <div className="rounded-lg bg-white/5 p-2 text-center">
-                <div className="text-white">p={m.reverse.pServeA.toFixed(3)}</div>
+                <div className="text-white">
+                  <span className="mono-num">p={m.reverse.pFinalA.toFixed(3)}</span>
+                </div>
                 <div>سرویس {m.playerA.shortName}</div>
               </div>
               <div className="rounded-lg bg-white/5 p-2 text-center">
-                <div className="text-white">p={m.reverse.pServeB.toFixed(3)}</div>
+                <div className="text-white">
+                  <span className="mono-num">p={m.reverse.pFinalB.toFixed(3)}</span>
+                </div>
                 <div>سرویس {m.playerB.shortName}</div>
               </div>
               <div className="rounded-lg bg-white/5 p-2 text-center">
-                <div className="text-white">S={m.markov.setWinA.toFixed(3)}</div>
+                <div className="text-white">
+                  <span className="mono-num">S={m.markov.setWinA.toFixed(3)}</span>
+                </div>
                 <div>برد ست {m.playerA.shortName}</div>
               </div>
             </div>
@@ -118,20 +132,29 @@ export function AnalysisDialog({
                   }`}
                 >
                   <div className="mono-num text-base font-extrabold">{(o.v * 100).toFixed(1)}%</div>
-                  <div className="mono-num text-[10px] text-muted-foreground">
-                    {o.k} {o.fav ? "★ فاوریت" : ""}
+                  {/* v2.0 font fix — mono only around the latin score code */}
+                  <div className="text-[10px] text-muted-foreground">
+                    <span className="mono-num">{o.k}</span> {o.fav ? "★ فاوریت" : ""}
                   </div>
                 </div>
               ))}
             </div>
-            <div className="mono-num mt-3 flex flex-wrap gap-3 text-[10px] text-muted-foreground">
-              <span>Over 9.5 گیم ست: {(m.markov.ou95 * 100).toFixed(0)}%</span>
-              <span>Over 21.5 گیم مسابقه: {(m.markov.ou215 * 100).toFixed(0)}%</span>
-              <span>تای‌بریک ست اول: {(m.markov.tb1 * 100).toFixed(0)}%</span>
+            <div className="mt-3 flex flex-wrap gap-3 text-[10px] text-muted-foreground">
+              <span>
+                Over <span className="mono-num">9.5</span> گیم ست:{" "}
+                <span className="mono-num">{(m.markov.ou95 * 100).toFixed(0)}%</span>
+              </span>
+              <span>
+                Over <span className="mono-num">21.5</span> گیم مسابقه:{" "}
+                <span className="mono-num">{(m.markov.ou215 * 100).toFixed(0)}%</span>
+              </span>
+              <span>
+                تای‌بریک ست اول: <span className="mono-num">{(m.markov.tb1 * 100).toFixed(0)}%</span>
+              </span>
             </div>
           </section>
 
-          {/* Reverse solver + fusion */}
+          {/* Reverse solver + fusion + v2.0 calibration */}
           <section className="rounded-xl border border-white/10 bg-white/[0.03] p-3.5">
             <h4 className="flex items-center gap-2 text-xs font-bold text-amber-300">
               <Microscope className="h-3.5 w-3.5" />
@@ -143,38 +166,48 @@ export function AnalysisDialog({
                 (Polymarket فاقد مارکت این مچ) — تحلیل صرفاً بر پایه Elo سطح زمین از نقاط رنکینگ رسمی.
               </p>
             ) : (
-              <div className="mono-num mt-2 flex flex-wrap gap-3 text-[10px] text-muted-foreground">
+              <div className="mt-2 flex flex-wrap gap-3 text-[10px] text-muted-foreground">
                 <span>
-                  P_bازار A = {((m.reverse.marketProbA ?? 0) * 100).toFixed(1)}%
-                  ( @{m.reverse.marketOddsA?.toFixed(2)} )
+                  احتمال بازار A ={" "}
+                  <span className="mono-num">
+                    {((m.reverse.marketProbA ?? 0) * 100).toFixed(1)}% (@
+                    {m.reverse.marketOddsA?.toFixed(2)})
+                  </span>
                 </span>
                 <span>حذف حاشیه: {m.reverse.method === "shin" ? "مدل Shin" : "روش توانی"}</span>
               </div>
             )}
-            <div className="mono-num mt-2 grid grid-cols-2 gap-2 text-[10px] sm:grid-cols-4">
+            {/* v2.0 font fix — numeric cells isolated */}
+            <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] sm:grid-cols-4">
               <div className="rounded-lg bg-white/5 p-2">
-                <div className="text-white">{m.reverse.pServeA.toFixed(3)}</div>
-                <div className="text-muted-foreground">pMarket سرویس A</div>
+                <div className="mono-num text-white">{m.reverse.pRawA.toFixed(3)}</div>
+                <div className="text-muted-foreground">خام سرویس A</div>
               </div>
               <div className="rounded-lg bg-white/5 p-2">
-                <div className="text-white">{m.reverse.pServeB.toFixed(3)}</div>
-                <div className="text-muted-foreground">pMarket سرویس B</div>
+                <div className="mono-num text-white">{m.reverse.pRawB.toFixed(3)}</div>
+                <div className="text-muted-foreground">خام سرویس B</div>
               </div>
-              <div className="rounded-lg bg-white/5 p-2">
-                <div className="text-white">{m.reverse.pFinalA.toFixed(3)}</div>
-                <div className="text-muted-foreground">pFinal سرویس A</div>
+              <div className="rounded-lg border border-amber-300/20 bg-amber-300/5 p-2">
+                <div className="mono-num text-amber-300">{m.reverse.pFinalA.toFixed(3)}</div>
+                <div className="text-muted-foreground">کالیبره سرویس A</div>
               </div>
-              <div className="rounded-lg bg-white/5 p-2">
-                <div className="text-white">{m.reverse.pFinalB.toFixed(3)}</div>
-                <div className="text-muted-foreground">pFinal سرویس B</div>
+              <div className="rounded-lg border border-amber-300/20 bg-amber-300/5 p-2">
+                <div className="mono-num text-amber-300">{m.reverse.pFinalB.toFixed(3)}</div>
+                <div className="text-muted-foreground">کالیبره سرویس B</div>
               </div>
             </div>
-            <p className="mono-num mt-2 text-[10px] text-muted-foreground" dir="ltr">
-              pFinalA = 0.65 · pMarketA + 0.35 · pSurfaceEloA
+            <p className="mt-2 text-[10px] leading-5 text-muted-foreground">
+              کالیبراسیون v2.0 — پایه تور ATP/WTA (
+              <span className="mono-num" dir="ltr">
+                ATP 0.64/0.61/0.67 · WTA ≈ 0.58
+              </span>{" "}
+              — Kovalchik 2016) با بست فیزیکی هر‌طرف؛ فاوریت شفاف در بازه{" "}
+              <span className="mono-num">0.65–0.72</span> و حریف در{" "}
+              <span className="mono-num">0.56–0.63</span> می‌نشیند (اصلاح Hold فوق‌العاده بالای نسخه ۱٫۰).
             </p>
           </section>
 
-          {/* Supervisor */}
+          {/* v2.0 · 3-archetype supervisor report */}
           <section
             className={`rounded-xl border p-3.5 ${
               m.veto.vetoed
@@ -186,15 +219,48 @@ export function AnalysisDialog({
           >
             <h4 className="flex items-center gap-2 text-xs font-bold">
               <Lock className="h-3.5 w-3.5" />
-              دروازه وتوی ایجنت سوپروایزر
+              دروازه سوپروایزر — ارزیابی ۳ الگوی متعامد
             </h4>
+
+            {(m.archEvals ?? []).length > 0 && (
+              <div className="mt-2.5 grid gap-1.5">
+                {(m.archEvals ?? []).map((e) => (
+                  <div
+                    key={e.code}
+                    className={`flex flex-wrap items-center justify-between gap-2 rounded-lg border px-2.5 py-1.5 text-[11px] ${
+                      m.archetype?.code === e.code
+                        ? ARCH_STYLE[e.code]
+                        : "border-white/10 bg-white/[0.03] text-muted-foreground"
+                    }`}
+                  >
+                    <span className="font-bold">
+                      {m.archetype?.code === e.code ? "👑 " : ""}
+                      {e.labelFa}
+                    </span>
+                    <span className="flex items-center gap-2 text-[10px]">
+                      <span className="mono-num">پوشش {(e.coverage * 100).toFixed(1)}%</span>
+                      {e.eligible ? (
+                        <span className="text-emerald-300">✓ واجد شرایط</span>
+                      ) : (
+                        <span className="text-rose-300/90">✗ {e.whyNot}</span>
+                      )}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {m.veto.vetoed ? (
               <p className="mt-2 text-[12px] leading-6 text-rose-200">🛡️ {m.veto.reason}</p>
             ) : m.dualEligible ? (
               <div className="mt-2 space-y-2">
                 <p className="text-[12px] text-emerald-200">
-                  ✅ مسابقه تایید شد — فاوریت {favName} با Hold{" "}
-                  <span className="mono-num">{Math.round((fav === "A" ? m.markov.gA : m.markov.gB) * 100)}%</span> صلاحیت زوج‌تیپ طلایی دارد.
+                  ✅ مسابقه تایید شد — <span className="font-bold">{m.archetype?.labelFa}</span> برای{" "}
+                  {favName} انتخاب شد (کم‌ریسک‌ترین پوشش): ریسک باخت همزمان{" "}
+                  <span className="mono-num">
+                    {((m.archetype?.pairLoss ?? 0) * 100).toFixed(1)}%
+                  </span>{" "}
+                  زیر سقف <span className="mono-num">9.5%</span>.
                 </p>
                 {m.slips.A && (
                   <div className="rounded-lg border border-amber-300/30 bg-amber-300/10 p-2.5">
@@ -211,7 +277,11 @@ export function AnalysisDialog({
                       <span className="mono-num">@{m.slips.B.odds.toFixed(2)}</span>
                     </div>
                     <p className="mt-1 text-[10px] text-muted-foreground">
-                      پوشش همزمان 2-1 و 1-2 — تنها باختِ ممکن: 0-2 که سوپروایزر زیر 8.5% قفل کرده.
+                      پوشش متعامد الگو — تنها فضای باختِ همزمان{" "}
+                      <span className="mono-num">
+                        {((m.archetype?.pairLoss ?? 0) * 100).toFixed(1)}%
+                      </span>{" "}
+                      است که سوپروایزر قفل کرده.
                     </p>
                   </div>
                 )}
@@ -223,10 +293,10 @@ export function AnalysisDialog({
               </div>
             ) : (
               <p className="mt-2 text-[12px] leading-6 text-amber-200">
-                از وتو عبور کرد اما دروازه طلایی (Hold ≥ 80%) را پاس نکرد — مسابقه تحت نظارت است.
+                از فیلتر تاپ-۱۰۰ عبور کرد اما هیچ الگویی ریسک را زیر سقف نمی‌بندد — مسابقه تحت نظارت است.
               </p>
             )}
-            <div className="mono-num mt-2 text-[10px] text-muted-foreground">
+            <div className="mt-2 text-[10px] text-muted-foreground">
               زمان‌بندی: {m.timing.label}
             </div>
           </section>
@@ -236,23 +306,27 @@ export function AnalysisDialog({
             <section className="rounded-xl border border-white/10 bg-white/[0.03] p-3.5 text-[11px] text-muted-foreground">
               <span className="font-bold text-white/80">فید بازار آزاد:</span>{" "}
               <span className="mono-num">
-                Polymarket — {m.market.playerA} @{m.market.oddsA.toFixed(2)} / {m.market.playerB} @{m.market.oddsB.toFixed(2)}
+                Polymarket — {m.market.playerA} @{m.market.oddsA.toFixed(2)} / {m.market.playerB} @
+                {m.market.oddsB.toFixed(2)}
               </span>
             </section>
           )}
 
           <div className="flex flex-wrap gap-2 pb-1">
             <Badge variant="outline" className="border-white/10 bg-white/5 text-[10px] text-muted-foreground">
-              رنک رسمی: {m.playerA.rank ? `#${m.playerA.rank}` : "—"} / {m.playerB.rank ? `#${m.playerB.rank}` : "—"}
+              رنک رسمی:{" "}
+              <span className="mono-num">
+                {m.playerA.rank ? `#${m.playerA.rank}` : "—"} / {m.playerB.rank ? `#${m.playerB.rank}` : "—"}
+              </span>
             </Badge>
             {m.playerA.seed && (
               <Badge variant="outline" className="border-white/10 bg-white/5 text-[10px] text-muted-foreground">
-                سید {m.playerA.name}: {m.playerA.seed}
+                سید {m.playerA.name}: <span className="mono-num">{m.playerA.seed}</span>
               </Badge>
             )}
             {m.playerB.seed && (
               <Badge variant="outline" className="border-white/10 bg-white/5 text-[10px] text-muted-foreground">
-                سید {m.playerB.name}: {m.playerB.seed}
+                سید {m.playerB.name}: <span className="mono-num">{m.playerB.seed}</span>
               </Badge>
             )}
           </div>

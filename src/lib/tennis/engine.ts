@@ -1,6 +1,7 @@
-// ─── NeoTennis Markov Quant — Engine Orchestrator ──────────────────────────
-// Live feed → market fusion → 4-layer Markov → supervisor gate → production
-// lines → SHA-256 persistence → 72h auto-settlement → ledger payload.
+// ─── NeoTennis Markov Quant v2.0 — Engine Orchestrator ─────────────────────
+// Live feed → market fusion → Kovalchik-calibrated 4-layer Markov →
+// 3-archetype supervisor gate → production lines → SHA-256 persistence →
+// 7-day historical auto-settlement → disjoint ledger payload.
 
 import { db } from "@/lib/db";
 import {
@@ -9,16 +10,18 @@ import {
   fetchScoreboard,
   buildRankingLookup,
   todayKey,
+  dateKeyDaysAgo,
   surnameOf,
 } from "./espn";
 import { fetchPolymarketOdds, matchMarket } from "./polymarket";
 import { fetchCityWeather } from "./weather";
 import { fullMarkov, matchWinProbA, solveSet } from "./markov";
 import { removeMargin, reverseAnalysis } from "./solver";
-import { buildSlips, isDualEligible, round2, supervisorGate } from "./supervisor";
+import { buildSlips, evaluateArchetypes, isDualEligible, supervisorGate } from "./supervisor";
 import { canonicalMatchString, sha256 } from "./hash";
-import { runSettlement } from "./settlement";
+import { extractSettleableResult, runSettlement } from "./settlement";
 import { buildLedgerPayload } from "./ledger";
+import { dedupeByKey, matchContentKey } from "./dedupe";
 import type {
   AnalyzedMatch,
   EspnMatch,
@@ -29,10 +32,12 @@ import type {
   RankRow,
   SourceStatus,
   TimingInfo,
+  Tour,
   WeatherInfo,
 } from "./types";
 
 const FEED_TTL_MS = 75 * 1000;
+const HISTORY_WINDOW_DAYS = 7;
 let feedCache: { at: number; payload: FeedPayload } | null = null;
 let feedPromise: Promise<FeedPayload> | null = null;
 
@@ -92,6 +97,80 @@ function timingOf(m: EspnMatch, favorite: "A" | "B"): TimingInfo {
   };
 }
 
+/**
+ * Full v2.0 analysis pipeline for a single match (works for pre / in / post):
+ * market fusion (when available) → Kovalchik calibration → Markov DP →
+ * 3-archetype evaluation → supervisor gate → slips → SHA-256 lock.
+ */
+function analyzeMatch(
+  m: EspnMatch,
+  market: MarketOdds | undefined,
+  weather?: WeatherInfo
+): AnalyzedMatch {
+  let marketProbA: number | undefined;
+  let marketOddsA: number | undefined;
+  let method: "shin" | "power" = "shin";
+  if (market) {
+    const rm = removeMargin([market.oddsA, market.oddsB], "shin");
+    marketProbA = rm.probs[0];
+    marketOddsA = market.oddsA;
+    method = rm.method;
+  }
+
+  const rev = reverseAnalysis(
+    marketProbA,
+    m.playerA.points,
+    m.playerB.points,
+    m.surface,
+    m.tour
+  );
+  const mk = fullMarkov(rev.pFinalA, rev.pFinalB);
+  const winA = matchWinProbA(rev.pFinalA, rev.pFinalB);
+  const favorite: "A" | "B" = winA >= 0.5 ? "A" : "B";
+  const favWinProb = favorite === "A" ? winA : 1 - winA;
+
+  const am: AnalyzedMatch = {
+    ...m,
+    weather,
+    market,
+    reverse: { ...rev, marketOddsA, method },
+    markov: mk,
+    favorite,
+    favWinProb,
+    veto: { vetoed: false, code: "NONE" },
+    dualEligible: false,
+    slips: {},
+    timing: { label: "", code: "WAIT", optimal: false },
+  };
+
+  const archReport = evaluateArchetypes(am);
+  am.archEvals = archReport.evals;
+  am.archetype = archReport.selected;
+  am.veto = supervisorGate(am, archReport.selected);
+  am.dualEligible = isDualEligible(am);
+  am.slips = buildSlips(am);
+  am.timing = timingOf(m, favorite);
+
+  if (am.slips.A && am.slips.B) {
+    am.hashPre = sha256(
+      canonicalMatchString({
+        dateKey: m.dateKey,
+        tour: m.tour,
+        tournament: m.tournament,
+        surface: m.surface,
+        round: m.round,
+        playerA: m.playerA.name,
+        playerB: m.playerB.name,
+        slipAText: am.slips.A.textEn,
+        slipAOdds: am.slips.A.odds,
+        slipBText: am.slips.B.textEn,
+        slipBOdds: am.slips.B.odds,
+      })
+    );
+  }
+  return am;
+}
+
 export async function buildFeed(force = false): Promise<FeedPayload> {
   if (!force && feedCache && Date.now() - feedCache.at < FEED_TTL_MS) {
     return feedCache.payload;
@@ -115,10 +194,23 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
     const matches: EspnMatch[] = [...(sbAtp ?? []), ...(sbWta ?? [])].filter(
       (m) => m.singles
     );
+    // v2.0 dedupe — by ESPN event key AND by stable match content key
+    // (kills the double-listed matches that duplicated the shadow ledger)
     const seen = new Set<string>();
+    const contentSeen = new Set<string>();
     const unique = matches.filter((m) => {
       if (seen.has(m.eventKey)) return false;
       seen.add(m.eventKey);
+      const ck = matchContentKey({
+        tour: m.tour,
+        dateKey: m.dateKey,
+        tournament: m.tournament,
+        round: m.round,
+        playerA: m.playerA.name,
+        playerB: m.playerB.name,
+      });
+      if (contentSeen.has(ck)) return false;
+      contentSeen.add(ck);
       return true;
     });
 
@@ -152,126 +244,47 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
     const weatherByCity = new Map<string, WeatherInfo>();
     for (const w of weatherList) if (w) weatherByCity.set(w.city.toLowerCase(), w);
 
-    // market mapping (Polymarket → ESPN match)
+    // market mapping (Polymarket → ESPN match) — live markets only matter
+    // for matches that have not finished yet
     const marketMap = pmOdds
       ? matchMarket(
-          unique.map((m) => ({ playerA: m.playerA.name, playerB: m.playerB.name })),
+          unique
+            .filter((m) => m.state !== "post")
+            .map((m) => ({ playerA: m.playerA.name, playerB: m.playerB.name })),
           pmOdds
         )
       : new Map<string, MarketOdds>();
 
-    // ── per-match analysis (finished matches skip the heavy solver path)
+    // ── per-match analysis (unified v2.0 path for pre / in / post)
     const analyzed: AnalyzedMatch[] = [];
     for (const m of unique) {
       try {
-        if (m.state === "post") {
-          const finished: AnalyzedMatch = {
-            ...m,
-            market: undefined,
-            reverse: {
-              marketGap: true,
-              pServeA: 0.62,
-              pServeB: 0.62,
-              pEloA: 0.62,
-              pEloB: 0.62,
-              pFinalA: 0.62,
-              pFinalB: 0.62,
-              eloWinA: 0.5,
-              method: "shin",
-            },
-            markov: {
-              gA: 0,
-              gB: 0,
-              setWinA: 0.5,
-              ou95: 0,
-              tb1: 0,
-              over105Set1: 0,
-              p20: 0,
-              p21: 0,
-              p12: 0,
-              p02: 0,
-              ou215: 0,
-              slipBCombined: 0,
-            },
-            favorite: m.playerA.winner ? "A" : "B",
-            favWinProb: 0,
-            veto: { vetoed: false, code: "NONE" },
-            dualEligible: false,
-            slips: {},
-            timing: { label: "تسویه‌شده", code: "DONE", optimal: false },
-          };
-          analyzed.push(finished);
-          continue;
-        }
         const key = `${m.playerA.name}__${m.playerB.name}`;
-        const market: MarketOdds | undefined = marketMap.get(key);
-
-        let marketProbA: number | undefined;
-        let marketOddsA: number | undefined;
-        let method: "shin" | "power" = "shin";
-        if (market) {
-          const rm = removeMargin([market.oddsA, market.oddsB], "shin");
-          marketProbA = rm.probs[0];
-          marketOddsA = market.oddsA;
-          method = rm.method;
-        }
-
-        const rev = reverseAnalysis(
-          marketProbA,
-          m.playerA.points,
-          m.playerB.points,
-          m.surface
-        );
-        const mk = fullMarkov(rev.pFinalA, rev.pFinalB);
-        const winA = matchWinProbA(rev.pFinalA, rev.pFinalB);
-        const favorite: "A" | "B" = winA >= 0.5 ? "A" : "B";
-        const favWinProb = favorite === "A" ? winA : 1 - winA;
-
-        const am: AnalyzedMatch = {
-          ...m,
-          weather: m.city ? weatherByCity.get(m.city.toLowerCase()) : undefined,
-          market,
-          reverse: { ...rev, marketOddsA, method },
-          markov: mk,
-          favorite,
-          favWinProb,
-          veto: { vetoed: false, code: "NONE" },
-          dualEligible: false,
-          slips: {},
-          timing: { label: "", code: "WAIT", optimal: false },
-        };
-        am.veto = supervisorGate(am);
-        am.dualEligible = isDualEligible(am);
-        am.slips = buildSlips(am);
-        am.timing = timingOf(m, favorite);
-        if (am.slips.A && am.slips.B) {
-          am.hashPre = sha256(
-            canonicalMatchString({
-              dateKey: m.dateKey,
-              tour: m.tour,
-              tournament: m.tournament,
-              surface: m.surface,
-              round: m.round,
-              playerA: m.playerA.name,
-              playerB: m.playerB.name,
-              slipAText: am.slips.A.textEn,
-              slipAOdds: am.slips.A.odds,
-              slipBText: am.slips.B.textEn,
-              slipBOdds: am.slips.B.odds,
-            })
-          );
-        }
-        analyzed.push(am);
+        const market = m.state === "post" ? undefined : marketMap.get(key);
+        const weather = m.city ? weatherByCity.get(m.city.toLowerCase()) : undefined;
+        analyzed.push(analyzeMatch(m, market, weather));
       } catch (e) {
         console.error("[engine] analysis failed", m.eventKey, e);
       }
     }
 
+    // ── v2.0 · 7-day historical auto-settlement ────────────────────────────
+    // Finished ATP/WTA matches of the last 7 days are analyzed with the same
+    // calibrated engine; the ones that pass the 3-archetype gate are
+    // auto-picked and settled with the real linescores so the Combined Win
+    // Rate gauge and the 1000-unit bank curve are alive from first load.
+    const historySummary = await processHistorySettlement(rankLookup);
+
     // ── persist → build lines → persist picks → settle → ledger
     await persistMatches(analyzed);
     const lines = buildLines(analyzed);
-    await persistPicksFromLines(lines);
-    const settleSummary = await runSettlement(3);
+    const settledItems = [...lines.dual, ...lines.combo2, ...lines.combo3, ...lines.sniper, ...lines.shadow];
+    const allItems = dedupeByKey(
+      [...settledItems, ...historySummary.items],
+      (i) => `${i.matchId}|${i.line}|${i.leg}`
+    );
+    await persistPicks(allItems);
+    const settleSummary = await runSettlement(HISTORY_WINDOW_DAYS);
     const ledger = await buildLedgerPayload();
 
     const payload: FeedPayload = {
@@ -283,7 +296,13 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
       news: [...(nwAtp ?? []), ...(nwWta ?? [])].slice(0, 12),
       lines,
       ledger,
-      settlementSummary: { ...settleSummary, picked: analyzed.length },
+      settlementSummary: {
+        settled: settleSummary.settled,
+        picked: analyzed.length,
+        windowDays: HISTORY_WINDOW_DAYS,
+        historyAnalyzed: historySummary.analyzed,
+        historyApproved: historySummary.approved,
+      },
     };
     feedCache = { at: Date.now(), payload };
     return payload;
@@ -296,15 +315,138 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
   }
 }
 
+// ─── v2.0 · 7-Day Historical Auto-Settlement ───────────────────────────────
+
+interface HistorySummary {
+  analyzed: number;
+  approved: number;
+  items: LineItem[];
+}
+
+async function processHistorySettlement(
+  rankLookup: Map<string, RankRow>
+): Promise<HistorySummary> {
+  const summary: HistorySummary = { analyzed: 0, approved: 0, items: [] };
+
+  try {
+    // 1) finished matches of today + the past 7 days — today's post matches
+    //    flow through the same fresh-check as the older days
+    const dateKeys = [
+      todayKey(),
+      ...Array.from({ length: HISTORY_WINDOW_DAYS }, (_, i) => dateKeyDaysAgo(i + 1)),
+    ];
+    const tours: Tour[] = ["ATP", "WTA"];
+    const fetched: EspnMatch[] = [];
+    await Promise.all(
+      tours.flatMap((t) =>
+        dateKeys.map(async (d) => {
+          try {
+            fetched.push(...(await fetchScoreboard(t, d)));
+          } catch (e) {
+            console.error("[history] scoreboard fetch failed", t, d, e);
+          }
+        })
+      )
+    );
+
+    const finished = dedupeByKey(
+      fetched.filter((m) => m.state === "post" && m.singles),
+      (m) => m.eventKey
+    );
+
+    // 2) which of these are new (never processed for settlement)?
+    const eventKeys = finished.map((m) => m.eventKey);
+    const knownRows = eventKeys.length
+      ? await db.tennisMatch.findMany({
+          where: { eventKey: { in: eventKeys } },
+          select: { eventKey: true, historyProcessed: true },
+        })
+      : [];
+    const processed = new Set(
+      knownRows.filter((r) => r.historyProcessed).map((r) => r.eventKey)
+    );
+    const fresh = finished.filter((m) => !processed.has(m.eventKey));
+    if (fresh.length === 0) return summary;
+
+    // 3) attach official ranking points + analyze
+    const processedKeys: string[] = [];
+    const freshAnalyzed: AnalyzedMatch[] = [];
+    for (const m of fresh) {
+      try {
+        const resolve = (name: string) => {
+          const exact = rankLookup.get(name.toLowerCase());
+          if (exact) return exact;
+          const s = surnameOf(name);
+          const row = rankLookup.get(s);
+          return row && surnameOf(row.name) === s ? row : undefined;
+        };
+        const rowA = resolve(m.playerA.name);
+        const rowB = resolve(m.playerB.name);
+        if (rowA) {
+          m.playerA.points = m.playerA.points ?? rowA.points;
+          m.playerA.rank = rowA.rank;
+        }
+        if (rowB) {
+          m.playerB.points = m.playerB.points ?? rowB.points;
+          m.playerB.rank = rowB.rank;
+        }
+        const am = analyzeMatch(m, undefined);
+        freshAnalyzed.push(am);
+        processedKeys.push(m.eventKey);
+      } catch (e) {
+        console.error("[history] analysis failed", m.eventKey, e);
+      }
+    }
+
+    // 4) persist match rows (marks them processed) and build DUAL items
+    await persistMatches(freshAnalyzed, true);
+    for (const am of freshAnalyzed) {
+      const result = extractSettleableResult(am);
+      const approved = !am.veto.vetoed && am.dualEligible && !!am.slips.A && !!am.slips.B;
+      if (approved && result) {
+        summary.items.push(...dualItemsOf(am));
+        summary.approved++;
+      }
+    }
+    summary.analyzed = freshAnalyzed.length;
+
+    // 5) engine log + explicit processed-marker for rows that pre-existed
+    await db.engineLog
+      .create({
+        data: {
+          kind: "HISTORY",
+          message: `7-day auto-settlement scan: analyzed=${summary.analyzed} approved=${summary.approved}`,
+        },
+      })
+      .catch(() => undefined);
+
+    if (processedKeys.length) {
+      await db.tennisMatch
+        .updateMany({
+          where: { eventKey: { in: processedKeys } },
+          data: { historyProcessed: true },
+        })
+        .catch(() => undefined);
+    }
+  } catch (e) {
+    console.error("[history] pipeline failed", e);
+  }
+
+  return summary;
+}
+
 // ─── Persistence ───────────────────────────────────────────────────────────
 
-async function persistMatches(analyzed: AnalyzedMatch[]) {
+async function persistMatches(analyzed: AnalyzedMatch[], history = false) {
   for (const m of analyzed) {
     try {
+      const rowData = rowOf(m);
+      // the historyProcessed marker must only be written by the settlement
+      // processor — feed upserts never touch it (update omits the flag)
       const row = await db.tennisMatch.upsert({
         where: { eventKey: m.eventKey },
-        create: rowOf(m),
-        update: rowOf(m),
+        create: { ...rowData, historyProcessed: history },
+        update: rowData,
       });
       m.dbId = row.id;
     } catch (e) {
@@ -368,15 +510,8 @@ function rowOf(m: AnalyzedMatch) {
   };
 }
 
-async function persistPicksFromLines(lines: {
-  dual: LineItem[];
-  combo2: LineItem[];
-  combo3: LineItem[];
-  sniper: LineItem[];
-  shadow: LineItem[];
-}) {
-  const all = [...lines.dual, ...lines.combo2, ...lines.combo3, ...lines.sniper, ...lines.shadow];
-  for (const item of all) {
+async function persistPicks(items: LineItem[]) {
+  for (const item of items) {
     const matchId = item.matchId;
     // matchId must be a DB id; eventKeys (fallbacks) are skipped
     if (!matchId || matchId.includes("__")) continue;
@@ -436,7 +571,54 @@ function baseItem(m: AnalyzedMatch): Omit<
     startTime: m.startTime,
     timing: m.timing,
     hashPre: m.hashPre,
+    archetype: m.archetype,
   };
+}
+
+/** The two complementary DUAL legs of an approved match (archetype-aware). */
+function dualItemsOf(m: AnalyzedMatch): LineItem[] {
+  if (!m.slips.A || !m.slips.B) return [];
+  const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
+  const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
+  return [
+    {
+      ...baseItem(m),
+      line: "DUAL",
+      leg: m.slips.A.leg,
+      desc: m.slips.A.text,
+      descEn: m.slips.A.textEn,
+      odds: m.slips.A.odds,
+      prob: m.slips.A.prob,
+      stake: 1,
+      slipProbA: m.slips.A.prob,
+      slipProbB: m.slips.B.prob,
+      meta: JSON.stringify({
+        kind: "dualA",
+        arch: m.archetype?.code,
+        favName,
+        eventKey: m.eventKey,
+      }),
+    },
+    {
+      ...baseItem(m),
+      line: "DUAL",
+      leg: m.slips.B.leg,
+      desc: m.slips.B.text,
+      descEn: m.slips.B.textEn,
+      odds: m.slips.B.odds,
+      prob: m.slips.B.prob,
+      stake: 1,
+      slipProbA: m.slips.A.prob,
+      slipProbB: m.slips.B.prob,
+      meta: JSON.stringify({
+        kind: "dualB",
+        arch: m.archetype?.code,
+        favName,
+        dogName,
+        eventKey: m.eventKey,
+      }),
+    },
+  ];
 }
 
 export function buildLines(analyzed: AnalyzedMatch[]) {
@@ -449,42 +631,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
     const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
 
     if (!m.veto.vetoed && m.slips.A && m.slips.B && m.dualEligible) {
-      const combined = m.slips.B.textEn.includes("+1.5 SETS");
-      dual.push({
-        ...baseItem(m),
-        line: "DUAL",
-        leg: "A",
-        desc: m.slips.A.text,
-        descEn: m.slips.A.textEn,
-        odds: m.slips.A.odds,
-        prob: m.slips.A.prob,
-        stake: 1,
-        slipProbA: m.slips.A.prob,
-        slipProbB: m.slips.B.prob,
-        meta: JSON.stringify({
-          kind: "dualA",
-          favName,
-          eventKey: m.eventKey,
-        }),
-      });
-      dual.push({
-        ...baseItem(m),
-        line: "DUAL",
-        leg: combined ? "B-O205" : "B",
-        desc: m.slips.B.text,
-        descEn: m.slips.B.textEn,
-        odds: m.slips.B.odds,
-        prob: m.slips.B.prob,
-        stake: 1,
-        slipProbA: m.slips.A.prob,
-        slipProbB: m.slips.B.prob,
-        meta: JSON.stringify({
-          kind: combined ? "dualBCombined" : "dualB",
-          favName,
-          dogName,
-          eventKey: m.eventKey,
-        }),
-      });
+      dual.push(...dualItemsOf(m));
     }
 
     if (m.veto.vetoed) {
@@ -496,7 +643,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
         leg: "A",
         desc: `🛡️ وتوشده توسط سوپروایزر — ${m.veto.reason ?? ""}`,
         descEn: `VETOED · FAV 2-0 (P=${(p20Fav * 100).toFixed(1)}%)`,
-        odds: p20Fav > 0.01 ? round2(1 / p20Fav) : 99,
+        odds: p20Fav > 0.01 ? Math.round((1 / p20Fav) * 100) / 100 : 99,
         prob: p20Fav,
         stake: 1,
         meta: JSON.stringify({ kind: "dualA", favName, eventKey: m.eventKey }),
@@ -507,7 +654,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
         leg: "B",
         desc: `🛡️ وتوشده توسط سوپروایزر — ${m.veto.reason ?? ""}`,
         descEn: `VETOED · OVER 2.5 SETS (P=${(over25 * 100).toFixed(1)}%)`,
-        odds: over25 > 0.01 ? round2(1 / over25) : 99,
+        odds: over25 > 0.01 ? Math.round((1 / over25) * 100) / 100 : 99,
         prob: over25,
         stake: 1,
         meta: JSON.stringify({ kind: "dualB", favName, dogName, eventKey: m.eventKey }),
@@ -542,7 +689,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
       leg: legTag,
       desc: `${legTag.startsWith("COMBO-3") ? "میکس ۳ تایی" : "میکس ۲ تایی"} سلاطین سرویس: ${names.join(" × ")}`,
       descEn: names.join(" × "),
-      odds: round2(odds),
+      odds: Math.round(odds * 100) / 100,
       prob,
       stake: 1,
       timing: legs[0].timing,
@@ -596,7 +743,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
     ];
     for (const c of candidates) {
       if (c.prob <= 0.01) continue;
-      const odds = round2(1 / c.prob);
+      const odds = Math.round((1 / c.prob) * 100) / 100;
       if (odds < SNIPER_MIN_ODDS || odds > SNIPER_MAX_ODDS) continue;
       sniper.push({
         ...baseItem(m),
@@ -619,7 +766,17 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
   }
   sniper.sort((a, b) => b.odds - a.odds);
 
-  return { dual, combo2, combo3, sniper, shadow };
+  // v2.0 dedupe — no pick list may contain the same (match, line, leg) twice
+  const dedupe = (items: LineItem[]) =>
+    dedupeByKey(items, (i) => `${i.matchId}|${i.line}|${i.leg}`);
+
+  return {
+    dual: dedupe(dual),
+    combo2: dedupe(combo2),
+    combo3: dedupe(combo3),
+    sniper: dedupe(sniper),
+    shadow: dedupe(shadow),
+  };
 }
 
 // ─── force-refresh helper (used by API) ────────────────────────────────────

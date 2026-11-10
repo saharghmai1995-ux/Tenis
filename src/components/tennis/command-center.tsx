@@ -164,7 +164,8 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
     {
       icon: Banknote,
       label: "بانک ۱۰۰۰ واحدی",
-      value: `${stats.bank.toLocaleString("fa-IR")}`,
+      // v2.0 font fix — latin digits only inside mono-num
+      value: stats.bank.toLocaleString("en-US"),
       hint: `${stats.profit >= 0 ? "+" : ""}${stats.profit.toFixed(1)} واحد`,
       tone: stats.profit >= 0 ? "text-emerald-300" : "text-rose-300",
     },
@@ -178,8 +179,9 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
     {
       icon: Flame,
       label: "رگبار فعلی",
-      value: streakUp ? `${stats.streak} برد` : `${Math.abs(stats.streak)} باخت`,
-      hint: "برد پیاپی آخرین تیپ‌ها",
+      // v2.0 font fix — Persian word removed from the mono cell
+      value: `${stats.streak}`,
+      hint: streakUp ? "برد پیاپی آخرین تیپ‌ها" : "باخت پیاپی آخرین تیپ‌ها",
       tone: streakUp ? "text-amber-300" : "text-rose-300",
     },
     {
@@ -205,7 +207,7 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
           <CardContent className="pt-2">
             <WinRateGauge rate={stats.combinedWinRate} />
             <p className="text-center text-[11px] text-muted-foreground">
-              تجمیع ۳ خط تولید — دفتر سایه جداست (بدون دوباره‌شماری)
+              تجمیع ۳ خط تولید — تسویه خودکار ۷ روزه ESPN — دفتر سایه جداست
             </p>
           </CardContent>
         </Card>
@@ -243,7 +245,7 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
             <ShieldOff className="h-4 w-4 text-amber-300" />
             دفترکل افرازی (Disjoint Ledger)
             <span className="text-[11px] font-normal text-muted-foreground">
-              — هر خط تولید مستقل تسویه می‌شود؛ وتوها فقط در دفتر سایه
+              — هر خط تولید مستقل تسویه می‌شود؛ وین‌ریت زوج‌تیپ در سطح جفت (پوشش) محاسبه می‌شود؛ وتوها فقط در دفتر سایه
             </span>
           </CardTitle>
         </CardHeader>
@@ -316,9 +318,18 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
                   {best.matchLabel} — <span className="mono-num">@{best.odds.toFixed(2)}</span>{" "}
                   ({LINE_LABELS[best.line]})
                 </p>
-                <p className={`mono-num mt-1 flex items-center gap-1 text-sm font-bold ${best.profit && best.profit > 0 ? "text-emerald-300" : ""}`}>
-                  {best.profit && best.profit > 0 ? <ArrowUpRight className="h-4 w-4" /> : <ArrowDownRight className="h-4 w-4" />}
-                  +{(best.profit ?? 0).toFixed(1)} واحد
+                <p className="mt-1 flex items-center gap-1 text-sm font-bold" dir="ltr">
+                  {best.profit && best.profit > 0 ? (
+                    <ArrowUpRight className="h-4 w-4 text-emerald-300" />
+                  ) : (
+                    <ArrowDownRight className="h-4 w-4 text-rose-300" />
+                  )}
+                  {/* v2.0 font fix — number isolated in mono span */}
+                  <span className={`mono-num ${best.profit && best.profit > 0 ? "text-emerald-300" : "text-rose-300"}`}>
+                    {best.profit && best.profit > 0 ? "+" : ""}
+                    {(best.profit ?? 0).toFixed(1)}
+                  </span>
+                  <span className="text-muted-foreground">واحد</span>
                 </p>
               </div>
             )}

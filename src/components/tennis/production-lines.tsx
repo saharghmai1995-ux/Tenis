@@ -16,6 +16,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { dedupeByKey } from "@/lib/tennis/dedupe";
 import type { AnalyzedMatch, FeedPayload, LineItem, Surface } from "@/lib/tennis/types";
 
 const SURFACE_DOT: Record<Surface, string> = {
@@ -28,6 +29,12 @@ const SURFACE_LABEL: Record<Surface, string> = {
   HARD: "هارد",
   CLAY: "خاک",
   GRASS: "چمن",
+};
+
+const ARCH_STYLE: Record<string, string> = {
+  ARCH1: "border-amber-300/40 bg-amber-300/10 text-amber-300",
+  ARCH2: "border-fuchsia-400/40 bg-fuchsia-400/10 text-fuchsia-300",
+  ARCH3: "border-emerald-400/40 bg-emerald-400/10 text-emerald-300",
 };
 
 function SurfaceDot({ surface }: { surface: Surface }) {
@@ -113,6 +120,24 @@ function LineCard({
         <Badge variant="outline" className="border-white/10 bg-white/5 text-[10px] text-muted-foreground">
           {startLabel(item)}
         </Badge>
+        {item.archetype && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Badge
+                variant="outline"
+                className={`gap-1 text-[10px] font-bold ${ARCH_STYLE[item.archetype.code] ?? "border-white/10 bg-white/5 text-muted-foreground"}`}
+              >
+                👑 {item.archetype.labelFa}
+                <span className="mono-num">· {(item.archetype.coverage * 100).toFixed(1)}%</span>
+              </Badge>
+            </TooltipTrigger>
+            <TooltipContent className="text-xs">
+              {item.archetype.labelEn} — پوشش کل فضای پیشامد{" "}
+              <span className="mono-num">{(item.archetype.coverage * 100).toFixed(1)}%</span> · ریسک باخت
+              همزمان <span className="mono-num">{(item.archetype.pairLoss * 100).toFixed(1)}%</span>
+            </TooltipContent>
+          </Tooltip>
+        )}
         {item.timing.optimal && (
           <Badge className="border-0 bg-amber-300 text-[10px] font-bold text-black">
             <Rocket className="h-3 w-3" /> {item.timing.code === "T30" ? "T-30m Pre-Warmup" : "In-Play After Early Break"}
@@ -123,26 +148,33 @@ function LineCard({
             <Lock className="h-3 w-3" /> {item.hashPre.slice(0, 10)}
           </Badge>
         )}
-        <span className="mono-num ms-auto text-[10px] text-muted-foreground">
-          استیک: {item.stake} واحد
+        {/* v2.0 font fix — Persian label in font-sans, only the number in mono */}
+        <span className="ms-auto text-[10px] text-muted-foreground">
+          استیک: <span className="mono-num">{item.stake}</span> واحد
         </span>
       </div>
     </div>
   );
 }
 
-// ─── Near-gate candidates (matches that almost passed the golden gate) ─────
+// ─── Near-gate strip: live 3-archetype candidacy for unapproved matches ────
 function NearGateStrip({ matches }: { matches: AnalyzedMatch[] }) {
   const candidates = useMemo(() => {
     return matches
       .filter((m) => m.state !== "post" && !m.veto.vetoed)
+      .slice(0, 40)
       .map((m) => {
         const fav = m.favorite;
         const hold = fav === "A" ? m.markov.gA : m.markov.gB;
-        return { m, hold, p02: m.markov.p02 };
+        const sFav = fav === "A" ? m.markov.setWinA : 1 - m.markov.setWinA;
+        const best = [...(m.archEvals ?? [])]
+          .filter((e) => e.eligible)
+          .sort((a, b) => a.pairLoss - b.pairLoss)[0];
+        const anyWindow = (m.archEvals ?? []).some((e) => e.eligible);
+        return { m, hold, sFav, best, anyWindow };
       })
-      .filter((c) => !c.m.veto.vetoed)
-      .sort((a, b) => a.p02 - b.p02)
+      .filter((c) => !c.best)
+      .sort((a, b) => a.sFav - b.sFav)
       .slice(0, 4);
   }, [matches]);
 
@@ -151,10 +183,10 @@ function NearGateStrip({ matches }: { matches: AnalyzedMatch[] }) {
     <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
       <div className="flex items-center gap-2 text-xs font-bold text-white/80">
         <ShieldAlert className="h-3.5 w-3.5 text-amber-300" />
-        کاندیدهای نزدیک به دروازه طلایی (نظارت زنده سوپروایزر)
+        کاندیدهای زیر ذره‌بین سوپروایزر (ارزیابی زنده ۳ الگو)
       </div>
       <div className="mt-3 grid gap-2 sm:grid-cols-2">
-        {candidates.map(({ m, hold, p02 }) => (
+        {candidates.map(({ m, hold, sFav }) => (
           <div key={m.eventKey} className="rounded-xl border border-white/5 bg-white/[0.03] p-2.5">
             <div className="flex items-center justify-between text-xs">
               <span className="font-bold">
@@ -164,29 +196,31 @@ function NearGateStrip({ matches }: { matches: AnalyzedMatch[] }) {
               </span>
               <span className="mono-num text-[10px] text-muted-foreground">{m.tournament.slice(0, 16)}</span>
             </div>
-            <div className="mono-num mt-2 space-y-1 text-[10px] text-muted-foreground">
+            <div className="mt-2 space-y-1 text-[10px] text-muted-foreground">
               <div className="flex items-center gap-2">
-                <span className="w-14">Hold%</span>
+                <span className="w-24">S_fav</span>
                 <div className="h-1.5 flex-1 rounded-full bg-white/10">
                   <div
-                    className={`h-full rounded-full ${hold >= 80 ? "bg-emerald-400" : "bg-amber-400"}`}
+                    className="h-full rounded-full bg-cyan-400"
+                    style={{ width: `${Math.min(100, (sFav / 0.9) * 100)}%` }}
+                  />
+                </div>
+                <span className="mono-num">{(sFav * 100).toFixed(0)}%</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="w-24">Hold fav</span>
+                <div className="h-1.5 flex-1 rounded-full bg-white/10">
+                  <div
+                    className={`h-full rounded-full ${hold >= 0.85 ? "bg-emerald-400" : "bg-amber-400"}`}
                     style={{ width: `${Math.min(100, (hold / 0.95) * 100)}%` }}
                   />
                 </div>
-                <span className={hold >= 80 ? "text-emerald-300" : ""}>{Math.round(hold * 100)}%{hold >= 80 ? " ✓" : ""}</span>
+                <span className={`mono-num ${hold >= 0.85 ? "text-emerald-300" : ""}`}>{Math.round(hold * 100)}%</span>
               </div>
-              <div className="flex items-center gap-2">
-                <span className="w-14">P(0-2)</span>
-                <div className="h-1.5 flex-1 rounded-full bg-white/10">
-                  <div
-                    className={`h-full rounded-full ${p02 <= 0.085 ? "bg-emerald-400" : "bg-rose-400"}`}
-                    style={{ width: `${Math.min(100, (p02 / 0.25) * 100)}%` }}
-                  />
-                </div>
-                <span className={p02 <= 0.085 ? "text-emerald-300" : "text-rose-300"}>
-                  {(p02 * 100).toFixed(1)}%{p02 <= 0.085 ? " ✓" : " ✗"}
-                </span>
-              </div>
+              <p className="pt-0.5 leading-4 text-muted-foreground/80">
+                خارج از پنجره الگوها — پنجره رقابتی{" "}
+                <span className="mono-num">56% ≤ S_fav &lt; 68%</span>
+              </p>
             </div>
           </div>
         ))}
@@ -198,6 +232,17 @@ function NearGateStrip({ matches }: { matches: AnalyzedMatch[] }) {
 export function ProductionLines({ feed }: { feed: FeedPayload }) {
   const [booster, setBooster] = useState(true);
   const { dual, combo2, combo3, sniper, shadow } = feed.lines;
+
+  // v2.0 bug fix — the shadow ledger is grouped ONE row per match (the v1.0
+  // audit saw every match listed twice). Legs stay separate for settlement;
+  // the render unifies them by matchId with the canonical Map dedupe.
+  const shadowGroups = useMemo(() => {
+    const first = dedupeByKey(
+      [...shadow].sort((a, b) => a.matchId.localeCompare(b.matchId)),
+      (s) => s.matchId
+    );
+    return first.slice(0, 10);
+  }, [shadow]);
 
   // Principal-Lock Booster display: asymmetric staking preview on dual line
   const boosterNote = booster
@@ -212,7 +257,8 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
             <Rocket className="h-4 w-4 text-amber-300" />
             خطوط تولید سیگنال (۳ لاین مستقل)
             <span className="text-[11px] font-normal text-muted-foreground">
-              — خروجی امروز: {dual.length} تیپ دوقلو · {combo2.length + combo3.length} میکس · {sniper.length} اسنایپر · {shadow.length} وتو
+              — سوپروایزر ۳ الگویی · خروجی امروز: {dual.length} تیپ دوقلو · {combo2.length + combo3.length} میکس ·{" "}
+              {sniper.length} اسنایپر · {shadow.length} وتو
             </span>
           </CardTitle>
         </CardHeader>
@@ -220,7 +266,7 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
           <Tabs defaultValue="dual">
             <TabsList className="grid w-full grid-cols-3 bg-white/5">
               <TabsTrigger value="dual" className="gap-1.5 text-xs">
-                <Target className="h-3.5 w-3.5" /> دوقلوی ست‌شماری
+                <Target className="h-3.5 w-3.5" /> زوج‌تیپ الگویی
               </TabsTrigger>
               <TabsTrigger value="combo" className="gap-1.5 text-xs">
                 <Sparkles className="h-3.5 w-3.5" /> میکس سلاطین سرویس
@@ -247,11 +293,12 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
               {dual.length === 0 ? (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center">
                   <ShieldAlert className="mx-auto h-8 w-8 text-amber-300/60" />
-                  <p className="mt-3 text-sm font-bold">دروازه طلایی امروز باز نشد</p>
+                  <p className="mt-3 text-sm font-bold">هیچ الگویی امروز صلاحیت نگرفت</p>
                   <p className="mx-auto mt-1 max-w-md text-xs leading-6 text-muted-foreground">
-                    سوپروایزر هیچ مسابقه‌ای را با شرایط <span className="mono-num">P(0-2) ≤ 8.5%</span> و{" "}
-                    <span className="mono-num">Hold ≥ 80%</span> نیافت — تقویم امروز مسابقات متوازن دارد.
-                    زوج‌تیپ طلایی فقط با فرا رسیدن فاوریت‌های قوی صادر می‌شود.
+                    سوپروایزر v2.0 هر مسابقه را با ۳ الگوی متعامد ارزیابی می‌کند
+                    (تسلط فاوریت / نبرد نزدیک / سپر سرویس‌زنان) و فقط وقتی ریسک باخت
+                    همزمان زیر <span className="mono-num">9.5%</span> باشد تایید می‌کند.
+                    بازی‌های رقابتی تراز اول با «الگوی ۲» تایید و تسویه می‌شوند — نه وتو.
                   </p>
                 </div>
               ) : (
@@ -268,11 +315,12 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
                 <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-4">
                   <div className="flex items-center gap-2 text-xs font-bold text-muted-foreground">
                     <ShieldAlert className="h-3.5 w-3.5" />
-                    🛡️ دفتر سایه — انتقال به دفتر سایه ({shadow.length} تیپ وتوشده، بدون احتساب وین‌ریت)
+                    🛡️ دفتر سایه — ({shadow.length} تیپ وتوشده، بدون احتساب وین‌ریت)
                   </div>
+                  {/* v2.0 bug fix: dedupe by match id — one line per match */}
                   <div className="scroll-slim mt-2 grid max-h-40 gap-1.5 overflow-y-auto">
-                    {shadow.slice(0, 10).map((s) => (
-                      <div key={`${s.matchId}-${s.leg}`} className="flex items-center gap-2 rounded-lg border border-white/5 px-2.5 py-1.5 text-[11px]">
+                    {shadowGroups.map((s) => (
+                      <div key={s.matchId} className="flex items-center gap-2 rounded-lg border border-white/5 px-2.5 py-1.5 text-[11px]">
                         <span className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${SURFACE_DOT[s.surface]}`} />
                         <span className="truncate text-muted-foreground">{s.desc}</span>
                         <span className="mono-num ms-auto shrink-0 text-[10px] text-white/40">

@@ -1,8 +1,10 @@
-// ─── NeoTennis Markov Quant — 72h Auto-Settlement Engine ───────────────────
-// Finished matches (status: post) within the last 72h are read from the ESPN
-// ?dates=YYYYMMDD endpoint, sets-won are counted from linescores, and every
-// pick (DUAL / COMBO / SNIPER / SHADOW) is settled against the pre-match
-// SHA-256 lock stored in the ledger.
+// ─── NeoTennis Markov Quant v2.0 — 7-Day Auto-Settlement Engine ────────────
+// Finished matches (status: post) within the last 7 days are read from the
+// ESPN ?dates=YYYYMMDD endpoint, sets-won are counted from linescores, and
+// every pick (DUAL / COMBO / SNIPER / SHADOW) is settled against the
+// pre-match SHA-256 lock stored in the ledger.
+// v2.0: adds the 3-archetype legs (A-O195 / B-ALT / A-O225 / B-U225) and a
+// hard validity guard so retired/partial linescores can never settle a pick.
 
 import { db } from "@/lib/db";
 import { fetchScoreboard, dateKeyDaysAgo, todayKey } from "./espn";
@@ -33,11 +35,28 @@ function codeOf(setsA: number, setsB: number): ResultCode {
   return `${setsA}-${setsB}` as ResultCode;
 }
 
+/** A linescore pair is only settleable when it looks like a finished set. */
+function terminalSet(a: number, b: number): boolean {
+  const hi = Math.max(a, b);
+  const lo = Math.min(a, b);
+  if (hi < 1) return false;
+  return (hi >= 6 && hi - lo >= 2) || (hi === 7 && lo === 6);
+}
+
+export function extractSettleableResult(m: EspnMatch): MatchResult | null {
+  return extractResult(m);
+}
+
 function extractResult(m: EspnMatch): MatchResult | null {
   if (m.state !== "post") return null;
   const lsA = m.playerA.linescores;
   const lsB = m.playerB.linescores;
   if (!lsA.length || lsA.length !== lsB.length) return null;
+
+  // v2.0 validity guard — retired / partial linescores must never settle picks
+  for (let i = 0; i < lsA.length; i++) {
+    if (!terminalSet(lsA[i].value ?? 0, lsB[i].value ?? 0)) return null;
+  }
 
   const setsA = lsA.filter((l) => l.winner === true).length;
   const setsB = lsB.filter((l) => l.winner === true).length;
@@ -61,6 +80,9 @@ function extractResult(m: EspnMatch): MatchResult | null {
   }
   const a = setsA + setsB > 0 ? setsA : setsA2;
   const b = setsA + setsB > 0 ? setsB : setsB2;
+
+  // a Bo3 result needs at least two completed sets
+  if (a + b < 2) return null;
 
   return {
     eventKey: m.eventKey,
@@ -103,18 +125,54 @@ function settlePick(
   const profitOf = (won: boolean) => (won ? (pick.odds - 1) * pick.stake : -pick.stake);
 
   if (pick.line === "DUAL" || pick.line === "SHADOW") {
+    const favWonMatch =
+      side === "A"
+        ? result.setsA > result.setsB
+        : side === "B"
+          ? result.setsB > result.setsA
+          : false;
+    const favWon20 =
+      side === "A" ? result.code === "2-0" : side === "B" ? result.code === "0-2" : false;
+    const dogSide = side === "A" ? "B" : "A";
+    const set1Winner = result.set1Games.a > result.set1Games.b ? "A" : "B";
+    const dogWonSet1 = set1Winner === dogSide;
+
     if (pick.leg === "A") {
-      const won = side === "A" ? result.code === "2-0" : side === "B" ? result.code === "0-2" : false;
+      const won = favWon20;
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
-    // leg B — covers both 2-1 and 1-2 regardless of favorite side
-    const covered = result.code === "2-1" || result.code === "1-2";
-    if (!covered) return { status: "LOST", profit: profitOf(false) };
+    if (pick.leg === "A-O195") {
+      // ARCH2-A — favorite wins the match AND over 19.5 total games
+      const won = favWonMatch && result.totalGames >= 20;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (pick.leg === "A-O225") {
+      // ARCH3-A — over 22.5 total games
+      const won = result.totalGames >= 23;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (pick.leg === "B") {
+      // covers both 2-1 and 1-2 regardless of favorite side
+      const covered = result.code === "2-1" || result.code === "1-2";
+      return { status: covered ? "WON" : "LOST", profit: profitOf(covered) };
+    }
+    if (pick.leg === "B-ALT") {
+      // ARCH2-B — underdog wins set 1 OR favorite quick 2-0 under 19.5 games
+      const won = dogWonSet1 || (favWon20 && result.totalGames <= 19);
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (pick.leg === "B-U225") {
+      // ARCH3-B — favorite 2-0 clean break under 22.5 games
+      const won = favWon20 && result.totalGames <= 22;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
     if (pick.leg === "B-O205") {
+      const covered = result.code === "2-1" || result.code === "1-2";
+      if (!covered) return { status: "LOST", profit: profitOf(false) };
       const won = result.totalGames >= 21;
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
-    return { status: "WON", profit: profitOf(true) };
+    return { status: "VOID", profit: 0 };
   }
 
   if (pick.line === "SNIPER") {
@@ -138,7 +196,7 @@ function settlePick(
   return { status: "VOID", profit: 0 };
 }
 
-export async function runSettlement(windowDays = 3): Promise<{
+export async function runSettlement(windowDays = 7): Promise<{
   settled: number;
   picked: number;
   windowDays: number;

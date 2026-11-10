@@ -8,6 +8,21 @@ import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { NewsItem, RankRow, Tour } from "@/lib/tennis/types";
 
+/**
+ * v2.0 bug fix — the v1.0 formatter produced `▒▒/▒/▒▒` (Invalid Date) on
+ * malformed ESPN `published` strings. Safe variant falls back to a live badge.
+ */
+const formatSafeNewsDate = (isoStr?: string) => {
+  const d = isoStr ? new Date(isoStr) : new Date();
+  if (isNaN(d.getTime())) return "امروز — زنده";
+  return d.toLocaleDateString("fa-IR", {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+};
+
 export function RankingsNews({
   rankings,
   news,
@@ -132,11 +147,11 @@ export function RankingsNews({
                     <Badge variant="outline" className="border-white/10 bg-white/5 px-1.5 py-0 text-[9px] text-muted-foreground">
                       {n.tour}
                     </Badge>
-                    {n.published && (
-                      <span className="mono-num text-[9px] text-muted-foreground">
-                        {new Date(n.published).toLocaleDateString("fa-IR")}
-                      </span>
-                    )}
+                    {/* v2.0 fix: safe date in font-sans (Persian output must never
+                        ride the latin mono font — that is what rendered ▒▒▒) */}
+                    <span className="text-[9px] text-muted-foreground">
+                      {formatSafeNewsDate(n.published)}
+                    </span>
                   </div>
                   <p className="mt-1 line-clamp-2 text-xs font-bold leading-5">{n.headline}</p>
                   {n.description && (

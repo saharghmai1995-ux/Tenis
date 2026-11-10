@@ -83,8 +83,9 @@ function WeatherChip({ match }: { match: AnalyzedMatch }) {
 function ScoreLine({ match }: { match: AnalyzedMatch }) {
   if (match.state === "pre") {
     const start = match.startTime ? new Date(match.startTime) : null;
+    // v2.0 font fix — fa-IR digits are Persian script → font-sans (not mono)
     return (
-      <span className="mono-num text-[11px] text-muted-foreground">
+      <span className="text-[11px] text-muted-foreground">
         {start ? start.toLocaleTimeString("fa-IR", { hour: "2-digit", minute: "2-digit" }) : "—"}
       </span>
     );
@@ -256,8 +257,10 @@ export function Scoreboard({
                   <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-white/5 pt-2.5">
                     <ScoreLine match={m} />
                     {m.state !== "post" && (
-                      <span className="mono-num text-[10px] text-muted-foreground">
-                        مدل: {Math.round(m.favWinProb * 100)}%
+                      // v2.0 font fix — Persian «مدل:» label rides font-sans,
+                      // only the numeric value wears mono-num
+                      <span className="text-[10px] text-muted-foreground">
+                        مدل: <span className="mono-num">{Math.round(m.favWinProb * 100)}%</span>
                       </span>
                     )}
                     <Tooltip>

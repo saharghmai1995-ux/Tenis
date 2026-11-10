@@ -2,7 +2,7 @@
 // Hierarchy:  Point → Game → Set → Match   (no draws in tennis)
 // Reference: Standard tennis Markov equations + Kovalchik (2016)
 
-import type { MatchJointCell, ResultCode, SetJointCell } from "./types";
+import type { ArchMetrics, MatchJointCell, ResultCode, SetJointCell } from "./types";
 
 // ─── Layer 1 · Closed-form Service-Game Hold Probability G(p) ──────────────
 /**
@@ -152,7 +152,7 @@ export function bo3Outcomes(setWinA: number): {
   };
 }
 
-// ─── Match-level joint distribution (outcome × total games) ────────────────
+// ─── Match-level joint distribution (outcome × total games × set-1 winner) ─
 // Set serve order alternates: set1 A-first, set2 B-first, set3 A-first
 // (assumes player A won the racket toss — documented engine assumption).
 const MAX_GAMES = 42;
@@ -164,19 +164,19 @@ export function matchJointDist(
   const D1 = solveSet(gA, gB, "A").joint;
   const D2 = solveSet(gA, gB, "B").joint;
   const D3 = D1;
-  const buckets = new Map<ResultCode, number[]>();
+  // bucket key: code | total games | set-1 winner — keeps the set-1
+  // orientation needed by the v2.0 archetype coverage mathematics
+  const buckets = new Map<
+    string,
+    { code: ResultCode; games: number; set1A: boolean; prob: number }
+  >();
 
-  const add = (code: ResultCode, games: number, prob: number) => {
-    let arr = buckets.get(code);
-    if (!arr) {
-      arr = new Array(MAX_GAMES + 1).fill(0);
-      buckets.set(code, arr);
-    }
-    if (games <= MAX_GAMES) arr[games] += prob;
+  const add = (code: ResultCode, games: number, set1A: boolean, prob: number) => {
+    const key = `${code}|${games}|${set1A ? "A" : "B"}`;
+    const cell = buckets.get(key);
+    if (cell) cell.prob += prob;
+    else buckets.set(key, { code, games, set1A, prob });
   };
-
-  const codeOf = (a: number, b: number): ResultCode =>
-    (a === 2 ? `${a}-0` : `${a}-1`) as ResultCode;
 
   for (const t1 of D1) {
     const w1A = t1.gamesA > t1.gamesB;
@@ -190,30 +190,111 @@ export function matchJointDist(
       const p12 = t1.prob * t2.prob;
       const g12 = t1.gamesA + t1.gamesB + t2.gamesA + t2.gamesB;
       if (sa2 === 2) {
-        add("2-0", g12, p12);
+        add("2-0", g12, w1A, p12);
         continue;
       }
       if (sb2 === 2) {
-        add("0-2", g12, p12);
+        add("0-2", g12, w1A, p12);
         continue;
       }
       // set 3 decides
       for (const t3 of D3) {
         const w3A = t3.gamesA > t3.gamesB;
         const code: ResultCode = w3A ? "2-1" : "1-2";
-        add(code, g12 + t3.gamesA + t3.gamesB, p12 * t3.prob);
+        add(code, g12 + t3.gamesA + t3.gamesB, w1A, p12 * t3.prob);
       }
     }
   }
 
   const cells: MatchJointCell[] = [];
-  for (const code of ["2-0", "2-1", "1-2", "0-2"] as ResultCode[]) {
-    const arr = buckets.get(code) ?? new Array(MAX_GAMES + 1).fill(0);
-    for (let g = 0; g <= MAX_GAMES; g++) {
-      if (arr[g] > 0) cells.push({ code, games: [g], prob: arr[g] });
+  const dist = new Map<ResultCode, number[]>();
+  for (const cell of buckets.values()) {
+    cells.push({ code: cell.code, games: [cell.games], prob: cell.prob, set1A: cell.set1A });
+    let arr = dist.get(cell.code);
+    if (!arr) {
+      arr = new Array(MAX_GAMES + 1).fill(0);
+      dist.set(cell.code, arr);
     }
+    if (cell.games <= MAX_GAMES) arr[cell.games] += cell.prob;
   }
-  return { cells, dist: buckets };
+  return { cells, dist };
+}
+
+// ─── v2.0 · Exact archetype metrics from the joint Bo3 distribution ────────
+/**
+ * Computes every quantity the 3-archetype supervisor needs, directly from the
+ * exact terminal-path distribution (outcome × total games × set-1 winner).
+ * All outputs are favorite-oriented (`fav` side).
+ *
+ * Uncovered (simultaneous-loss) spaces:
+ *  · ARCH1 — underdog wins 2-0 straight sets.
+ *  · ARCH2 — favorite 2-1 escape in ≤ 19 games (the only 2-1 total below the
+ *            19.5 floor is the 6-4 6-4 6-4 triple) UNION dog wins the match
+ *            1-2 after losing set 1.
+ *  · ARCH3 — underdog wins the match in ≤ 22 total games.
+ */
+export function archetypeMetrics(
+  cells: MatchJointCell[],
+  set1WinA: number, // exact P(A wins set 1) from the set-1 DP (A serves first)
+  fav: "A" | "B"
+): ArchMetrics {
+  const favIsA = fav === "A";
+  const totalProb = cells.reduce((s, c) => s + c.prob, 0);
+  const norm = totalProb > 0 ? totalProb : 1;
+
+  let favWinOver195 = 0;
+  let fav20Under195 = 0;
+  let fav20Under225 = 0;
+  let dogSet1 = 0;
+  let over225 = 0;
+  let pairLoss3 = 0;
+
+  for (const c of cells) {
+    const g = c.games[0] ?? 0;
+    const p = c.prob / norm;
+    const favWonMatch = favIsA
+      ? c.code === "2-0" || c.code === "2-1"
+      : c.code === "0-2" || c.code === "1-2";
+    const favWon20 = favIsA ? c.code === "2-0" : c.code === "0-2";
+    const set1WonByFav = c.set1A === favIsA;
+
+    if (favWonMatch && g >= 20) favWinOver195 += p;
+    if (favWon20 && g <= 19) fav20Under195 += p;
+    if (favWon20 && g <= 22) fav20Under225 += p;
+    if (!set1WonByFav) dogSet1 += p;
+    if (g >= 23) over225 += p;
+    if (!favWonMatch && g <= 22) pairLoss3 += p;
+  }
+
+  // ARCH1 pair loss = underdog 2-0 (straight-set sweep of the favorite)
+  const pairLoss1 =
+    cells
+      .filter((c) => (favIsA ? c.code === "0-2" : c.code === "2-0"))
+      .reduce((s, c) => s + c.prob, 0) / norm;
+
+  // ARCH2 pair loss = {fav 2-1 escape in ≤ 19 games} ∪ {dog wins 1-2 after fav took set 1}
+  let pairLoss2 = 0;
+  for (const c of cells) {
+    const g = c.games[0] ?? 0;
+    const p = c.prob / norm;
+    const favWonMatch21 = favIsA ? c.code === "2-1" : c.code === "1-2";
+    const dogWonMatch12 = favIsA ? c.code === "1-2" : c.code === "2-1";
+    const set1WonByFav = c.set1A === favIsA;
+    if (favWonMatch21 && g <= 19) pairLoss2 += p;
+    if (dogWonMatch12 && set1WonByFav) pairLoss2 += p;
+  }
+
+  return {
+    set1Fav: favIsA ? set1WinA : 1 - set1WinA,
+    favWinOver195,
+    fav20Under195,
+    dogSet1,
+    over225,
+    fav20Under225,
+    pairLoss1,
+    pairLoss2,
+    pairLoss3,
+  };
 }
 
 // ─── Full Engine Pipeline: serve probs → all derived quantities ────────────
@@ -230,6 +311,7 @@ export interface FullMarkov {
   p02: number;
   ou215: number;
   slipBCombined: number;
+  arch: ArchMetrics; // v2.0 — favorite-oriented archetype coverage metrics
 }
 
 export function fullMarkov(pA: number, pB: number): FullMarkov {
@@ -259,8 +341,8 @@ export function fullMarkov(pA: number, pB: number): FullMarkov {
   // Layer 3 — doc formulas
   const bo3 = bo3Outcomes(setWinA);
 
-  // Match-level games distribution
-  const { dist } = matchJointDist(gA, gB);
+  // Match-level games distribution (with set-1 winner orientation)
+  const { cells, dist } = matchJointDist(gA, gB);
   let over215 = 0;
   let slipBCombined = 0;
   for (const [code, arr] of dist.entries()) {
@@ -271,6 +353,10 @@ export function fullMarkov(pA: number, pB: number): FullMarkov {
       if ((code === "2-1" || code === "1-2") && g >= 21) slipBCombined += arr[g];
     }
   }
+
+  // v2.0 — exact archetype metrics for the model favorite
+  const fav: "A" | "B" = pA >= pB ? "A" : "B";
+  const arch = archetypeMetrics(cells, sA.winA, fav);
 
   return {
     gA,
@@ -285,6 +371,7 @@ export function fullMarkov(pA: number, pB: number): FullMarkov {
     p02: bo3.p02,
     ou215: over215,
     slipBCombined,
+    arch,
   };
 }
 

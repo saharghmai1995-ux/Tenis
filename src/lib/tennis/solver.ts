@@ -4,7 +4,7 @@
 // 3) Surface-Weighted Elo fusion: pFinal = 0.65·pMarket + 0.35·pSurfaceElo
 
 import { matchWinProbA } from "./markov";
-import type { SolverResult, Surface } from "./types";
+import type { SolverResult, Surface, Tour } from "./types";
 
 // ─── 1 · Margin Removal ────────────────────────────────────────────────────
 
@@ -186,7 +186,8 @@ export function reverseAnalysis(
   marketProbA: number | undefined,
   pointsA: number | undefined,
   pointsB: number | undefined,
-  surface: Surface
+  surface: Surface,
+  tour: Tour = "ATP"
 ): {
   pServeA: number;
   pServeB: number;
@@ -194,6 +195,8 @@ export function reverseAnalysis(
   pEloB: number;
   pFinalA: number;
   pFinalB: number;
+  pRawA: number;
+  pRawB: number;
   eloWinA: number;
   marketProbA?: number;
   marketGap: boolean;
@@ -205,6 +208,13 @@ export function reverseAnalysis(
   // Elo-side serve probs: reverse-solve from the Elo win probability
   const eloSolved = solveServeProbs(eloWinA, spread);
 
+  let pRawA: number;
+  let pRawB: number;
+  let marketSolved: SolverResult | null = null;
+  let marketGap: boolean;
+  let marketProbOut: number | undefined;
+  const method: "shin" | "power" = "shin";
+
   if (
     marketProbA === undefined ||
     !Number.isFinite(marketProbA) ||
@@ -212,31 +222,93 @@ export function reverseAnalysis(
     marketProbA >= 0.99
   ) {
     // Market gap → surface Elo carries the full weight (honest fallback)
-    return {
-      pServeA: eloSolved.pA,
-      pServeB: eloSolved.pB,
-      pEloA: eloSolved.pA,
-      pEloB: eloSolved.pB,
-      pFinalA: eloSolved.pA,
-      pFinalB: eloSolved.pB,
-      eloWinA,
-      marketGap: true,
-      method: "shin",
-    };
+    pRawA = eloSolved.pA;
+    pRawB = eloSolved.pB;
+    marketGap = true;
+  } else {
+    marketSolved = solveServeProbs(marketProbA, spread);
+    pRawA = 0.65 * marketSolved.pA + 0.35 * eloSolved.pA;
+    pRawB = 0.65 * marketSolved.pB + 0.35 * eloSolved.pB;
+    marketProbOut = marketProbA;
+    marketGap = false;
   }
 
-  const marketSolved = solveServeProbs(marketProbA, spread);
+  // v2.0 — Kovalchik tour-average calibration (fixes the v1.0 inflation
+  // where both players were priced above 94% hold)
+  const cal = calibrateServePair(pRawA, pRawB, tour, surface);
+
   return {
-    pServeA: marketSolved.pA,
-    pServeB: marketSolved.pB,
+    // market-implied serve pair when available, Elo solve otherwise (display)
+    pServeA: marketSolved ? marketSolved.pA : eloSolved.pA,
+    pServeB: marketSolved ? marketSolved.pB : eloSolved.pB,
     pEloA: eloSolved.pA,
     pEloB: eloSolved.pB,
-    // 65% market + 35% surface-weighted Elo — doc formula
-    pFinalA: 0.65 * marketSolved.pA + 0.35 * eloSolved.pA,
-    pFinalB: 0.65 * marketSolved.pB + 0.35 * eloSolved.pB,
+    pFinalA: cal.pA,
+    pFinalB: cal.pB,
+    pRawA,
+    pRawB,
     eloWinA,
-    marketProbA,
-    marketGap: false,
-    method: "shin",
+    marketProbA: marketProbOut,
+    marketGap,
+    method,
   };
+}
+
+// ─── 4 · v2.0 Kovalchik-2016 Tour Calibration ──────────────────────────────
+/**
+ * Re-centers the solved serve-point probabilities on the real ATP/WTA tour
+ * baselines (Kovalchik 2016: ATP hard ≈ 0.64, clay ≈ 0.61, grass ≈ 0.67;
+ * WTA ≈ 0.58) and clamps the pair into physically realistic bounds, so a
+ * clear favorite lands in p ∈ [0.65, 0.72] with the opponent in [0.56, 0.63]
+ * instead of the v1.0 inflation (both holds > 94%).
+ */
+export const TOUR_SURFACE_BASE: Record<Tour, Record<Surface, number>> = {
+  ATP: { HARD: 0.64, CLAY: 0.61, GRASS: 0.67 },
+  WTA: { HARD: 0.585, CLAY: 0.575, GRASS: 0.605 },
+};
+
+/** Per-side realistic bounds (favorite / underdog) per tour & surface. */
+const SIDE_BOUNDS: Record<
+  Tour,
+  Record<Surface, { favMin: number; favMax: number; dogMin: number; dogMax: number; muSlack: number }>
+> = {
+  ATP: {
+    HARD: { favMin: 0.6, favMax: 0.72, dogMin: 0.545, dogMax: 0.665, muSlack: 0.025 },
+    CLAY: { favMin: 0.585, favMax: 0.7, dogMin: 0.535, dogMax: 0.635, muSlack: 0.025 },
+    GRASS: { favMin: 0.615, favMax: 0.735, dogMin: 0.555, dogMax: 0.695, muSlack: 0.025 },
+  },
+  WTA: {
+    HARD: { favMin: 0.565, favMax: 0.685, dogMin: 0.52, dogMax: 0.61, muSlack: 0.025 },
+    CLAY: { favMin: 0.555, favMax: 0.675, dogMin: 0.51, dogMax: 0.6, muSlack: 0.025 },
+    GRASS: { favMin: 0.58, favMax: 0.7, dogMin: 0.525, dogMax: 0.63, muSlack: 0.025 },
+  },
+};
+
+/** Maximum realistic serve-quality spread on tour (Kovalchik 2016 domain). */
+const MAX_SPREAD = 0.16;
+
+export function calibrateServePair(
+  pA: number,
+  pB: number,
+  tour: Tour,
+  surface: Surface
+): { pA: number; pB: number } {
+  const base = TOUR_SURFACE_BASE[tour][surface];
+  const b = SIDE_BOUNDS[tour][surface];
+
+  const muRaw = (pA + pB) / 2;
+  const dRaw = Math.abs(pA - pB);
+
+  // 1) blend the raw level toward the tour baseline (55% baseline pull)
+  const muBlend = 0.45 * muRaw + 0.55 * base;
+  const mu = Math.max(base - b.muSlack, Math.min(base + b.muSlack, muBlend));
+
+  // 2) cap the spread at the calibrated tour maximum
+  const d = Math.min(dRaw, MAX_SPREAD);
+
+  // 3) enforce per-side realistic bounds (favorite gets the higher half)
+  const fav = Math.max(b.favMin, Math.min(b.favMax, mu + d / 2));
+  const dog = Math.max(b.dogMin, Math.min(b.dogMax, mu - d / 2));
+
+  return pA >= pB ? { pA: fav, pB: dog } : { pA: dog, pB: fav };
 }

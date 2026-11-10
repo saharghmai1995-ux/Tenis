@@ -6,6 +6,34 @@ export type SurfaceSource = "MAPPED" | "INFERRED";
 export type MatchState = "pre" | "in" | "post";
 export type ResultCode = "2-0" | "2-1" | "1-2" | "0-2";
 export type ProductionLine = "DUAL" | "COMBO" | "SNIPER" | "SHADOW";
+export type ArchetypeCode = "ARCH1" | "ARCH2" | "ARCH3";
+
+// ─── v2.0 · Adaptive 3-Archetype Supervisor ────────────────────────────────
+/** Exact pair-loss / coverage metrics computed from the Bo3 joint Markov distribution. */
+export interface ArchMetrics {
+  set1Fav: number;        // P(favorite wins set 1)
+  favWinOver195: number;  // ARCH2-A: favorite wins AND total games ≥ 20
+  fav20Under195: number;  // ARCH2-B tail: favorite 2-0 in ≤ 19 total games
+  dogSet1: number;        // ARCH2-B head: underdog wins set 1
+  over225: number;        // ARCH3-A: total games ≥ 23
+  fav20Under225: number;  // ARCH3-B: favorite 2-0 in ≤ 22 total games
+  pairLoss1: number;      // ARCH1 simultaneous-loss = P(underdog 2-0)
+  pairLoss2: number;      // ARCH2 simultaneous-loss (exact uncovered mass)
+  pairLoss3: number;      // ARCH3 simultaneous-loss (exact uncovered mass)
+}
+
+export interface ArchetypeInfo {
+  code: ArchetypeCode;
+  labelFa: string;
+  labelEn: string;
+  coverage: number; // 1 − pairLoss
+  pairLoss: number;
+}
+
+export interface ArchetypeEval extends ArchetypeInfo {
+  eligible: boolean;
+  whyNot?: string;
+}
 
 export interface SourceStatus {
   ok: boolean;
@@ -96,6 +124,7 @@ export interface MatchJointCell {
   code: ResultCode;
   games: number[];
   prob: number;
+  set1A?: boolean; // v2.0 — whether player A won set 1 along this terminal path
 }
 
 export interface MarkovResult {
@@ -115,6 +144,8 @@ export interface MarkovResult {
   // Match-level games distribution
   ou215: number; // match over 21.5 games
   slipBCombined: number; // +1.5 sets underdog AND over 20.5 games (exact from DP)
+  // v2.0 · favorite-oriented archetype metrics (exact, from joint DP)
+  arch: ArchMetrics;
 }
 
 export interface SolverResult {
@@ -131,14 +162,16 @@ export interface ReverseAnalysis {
   pServeB: number;
   pEloA: number;
   pEloB: number;
-  pFinalA: number;
-  pFinalB: number;
+  pFinalA: number;      // calibrated serve prob (v2.0)
+  pFinalB: number;      // calibrated serve prob (v2.0)
+  pRawA: number;        // pre-calibration fused serve prob
+  pRawB: number;
   eloWinA: number;
   method: "shin" | "power";
 }
 
 export interface Slip {
-  leg: "A" | "B";
+  leg: string; // A | B | A-O195 | B-ALT | A-O225 | B-U225 (archetype legs, v2.0)
   text: string;
   textEn: string;
   odds: number;
@@ -167,6 +200,8 @@ export interface AnalyzedMatch extends EspnMatch {
   favWinProb: number;
   veto: VetoInfo;
   dualEligible: boolean;
+  archetype?: ArchetypeInfo;       // selected complementary archetype (v2.0)
+  archEvals?: ArchetypeEval[];     // full 3-archetype candidacy report (v2.0)
   slips: { A?: Slip; B?: Slip };
   timing: TimingInfo;
   hashPre?: string;
@@ -198,10 +233,12 @@ export interface LineItem {
   hashPre?: string;
   slipProbA?: number;
   slipProbB?: number;
+  archetype?: ArchetypeInfo; // v2.0
 }
 
 export interface LedgerRow {
   id: string;
+  matchId: string; // v2.0 — pair-level hedge accounting
   line: ProductionLine;
   leg: string;
   desc: string;
@@ -214,6 +251,7 @@ export interface LedgerRow {
   tournament: string;
   surface: Surface;
   result?: string;
+  hash?: string; // pre-match SHA-256 lock (v2.0 record table)
   createdAt: string;
 }
 
@@ -266,5 +304,11 @@ export interface FeedPayload {
     shadow: LineItem[];
   };
   ledger: LedgerPayload;
-  settlementSummary: { settled: number; picked: number; windowDays: number };
+  settlementSummary: {
+    settled: number;
+    picked: number;
+    windowDays: number;
+    historyAnalyzed?: number; // new finished matches processed this build (v2.0)
+    historyApproved?: number; // finished matches approved by the 3-archetype gate (v2.0)
+  };
 }

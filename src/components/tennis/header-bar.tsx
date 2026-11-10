@@ -25,7 +25,7 @@ function TehranClock() {
     };
   }, []);
   if (!now) {
-    return <span className="mono-num text-xs text-muted-foreground">--:--:--</span>;
+    return <span className="text-xs text-muted-foreground">--:--:--</span>;
   }
   const fmt = new Intl.DateTimeFormat("fa-IR", {
     timeZone: "Asia/Tehran",
@@ -34,7 +34,9 @@ function TehranClock() {
     second: "2-digit",
   });
   return (
-    <span className="mono-num text-xs text-muted-foreground" dir="ltr">
+    // v2.0 font fix — fa-IR output is Persian-script; it must ride font-sans
+    // (latin mono rendered the Persian digits as ▒▒▒ squares)
+    <span className="text-xs text-muted-foreground" dir="ltr">
       {fmt.format(now)}
     </span>
   );
@@ -64,11 +66,19 @@ export function HeaderBar({ onRefresh, refreshing, lastUpdated, sources }: Heade
             <span className="absolute h-5 w-5 rounded-full border-x-2 border-white/70 [transform:rotate(38deg)]" />
           </div>
           <div>
-            <h1 className="text-base font-extrabold leading-tight sm:text-lg">
+            {/* v2.0 fix — the v1.0 header dropped the «ن» and rendered «ئوتتیس»;
+                full bilingual brand title is enforced here */}
+            <h1 className="flex flex-wrap items-baseline gap-x-2 text-base font-extrabold leading-tight sm:text-lg">
               نئوتنیس مارکوف کوانت
+              <span className="mono-num text-[11px] font-bold tracking-tight text-amber-300/90" dir="ltr">
+                NeoTennis Markov Quant
+              </span>
+              <Badge className="border-0 bg-amber-300/15 px-1.5 py-0 text-[9px] font-bold text-amber-300">
+                v2.0
+              </Badge>
             </h1>
             <p className="mono-num text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-              NeoTennis Markov Quant · @aineobet Tennis Division
+              Calibrated Multi-Archetype Supervisor · 7-Day Auto-Settlement · @aineobet Tennis Division
             </p>
           </div>
         </div>
@@ -127,7 +137,7 @@ export function HeaderBar({ onRefresh, refreshing, lastUpdated, sources }: Heade
             </span>
           ))}
           {lastUpdated && (
-            <span className="mono-num ms-auto shrink-0 text-[10px] text-muted-foreground">
+            <span className="ms-auto shrink-0 text-[10px] text-muted-foreground">
               sync {new Date(lastUpdated).toLocaleTimeString("fa-IR")}
             </span>
           )}

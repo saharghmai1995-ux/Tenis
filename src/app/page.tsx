@@ -7,6 +7,7 @@ import { useFeed } from "@/components/tennis/use-feed";
 import { HeaderBar } from "@/components/tennis/header-bar";
 import { CommandCenter } from "@/components/tennis/command-center";
 import { ProductionLines } from "@/components/tennis/production-lines";
+import { RecordTable } from "@/components/tennis/record-table";
 import { Scoreboard } from "@/components/tennis/scoreboard";
 import { RankingsNews } from "@/components/tennis/rankings-news";
 import { TennisFooter } from "@/components/tennis/footer";
@@ -77,6 +78,7 @@ export default function Home() {
           <>
             <CommandCenter ledger={data.ledger} />
             <ProductionLines feed={data} />
+            <RecordTable ledger={data.ledger} />
             <Scoreboard matches={data.matches} onAnalyze={openAnalysis} />
             <RankingsNews rankings={data.rankings} news={data.news} />
             <PosterStudio matches={posterMatches} allMatches={data.matches.filter((m) => m.state !== "post")} />

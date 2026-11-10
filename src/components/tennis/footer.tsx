@@ -12,11 +12,11 @@ export function TennisFooter() {
         <p className="flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground">
           <span className="inline-flex items-center gap-1">
             <ShieldCheck className="h-3 w-3 text-emerald-400" />
-            تسویه خودکار ۷۲ ساعته از سرور ESPN
+            تسویه خودکار ۷ روزه از سرور ESPN
           </span>
           <span className="inline-flex items-center gap-1">
             <Zap className="h-3 w-3 text-amber-300" />
-            موتور مارکوف ۴ لایه · بی‌داده فرضی (Zero-Mock)
+            موتور مارکوف ۴ لایه · کالیبره Kovalchik 2016 · سوپروایزر ۳ الگویی
           </span>
         </p>
       </div>

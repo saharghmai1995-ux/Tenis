@@ -7,7 +7,7 @@ export const dynamic = "force-dynamic";
 export async function POST(request: Request) {
   try {
     const body = (await request.json().catch(() => ({}))) as { days?: number };
-    const days = Math.min(Math.max(body.days ?? 3, 1), 7);
+    const days = Math.min(Math.max(body.days ?? 7, 1), 7);
     const summary = await runSettlement(days);
     const ledger = await buildLedgerPayload();
     return NextResponse.json({ ok: true, summary, ledger });

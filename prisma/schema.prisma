@@ -79,6 +79,9 @@ model TennisMatch {
   resultCode  String? // 2-0 | 2-1 | 1-2 | 0-2
   settled     Boolean @default(false)
 
+  // ── v2.0 7-day historical auto-settlement marker
+  historyProcessed Boolean @default(false)
+
   picks TennisPick[]
 
   createdAt DateTime @default(now())
