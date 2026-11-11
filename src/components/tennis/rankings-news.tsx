@@ -155,7 +155,12 @@ export function RankingsNews({
                   </div>
                   <p className="mt-1 line-clamp-2 text-xs font-bold leading-5">{n.headline}</p>
                   {n.description && (
-                    <p className="mt-0.5 line-clamp-2 text-[10px] leading-4 text-muted-foreground">
+                    // v3.0 fix — English summary must stay LTR / left-aligned so
+                    // the trailing period never jumps to the start of the line
+                    <p
+                      dir="ltr"
+                      className="mt-0.5 line-clamp-2 text-left font-sans text-[10px] leading-4 text-muted-foreground"
+                    >
                       {n.description}
                     </p>
                   )}

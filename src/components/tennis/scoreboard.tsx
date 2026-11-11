@@ -16,6 +16,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { TiltCard } from "@/components/tennis/spatial-tilt";
 import type { AnalyzedMatch, MatchState, Surface, Tour } from "@/lib/tennis/types";
 
 const SURFACE_CLASS: Record<Surface, { wrap: string; text: string; dot: string; label: string }> = {
@@ -193,12 +194,15 @@ export function Scoreboard({
               const sc = SURFACE_CLASS[m.surface];
               const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
               return (
-                <div
+                <TiltCard
                   key={m.eventKey}
-                  className={`${sc.wrap} rise-in group relative overflow-hidden rounded-2xl border border-white/10 bg-white/[0.03] p-4 transition-all hover:translate-y-[-2px] hover:bg-white/[0.05] hover:shadow-[0_8px_30px_-12px_var(--surface-accent-soft)]`}
+                  className={`${sc.wrap} rise-in group relative overflow-hidden rounded-2xl border border-white/10 p-4 hover:shadow-[0_20px_50px_rgba(0,0,0,0.55),inset_0_1px_1px_rgba(255,255,255,0.15)]`}
                 >
+                  {/* v3.0 spatial glass substrate */}
+                  <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-white/[0.06] via-transparent to-white/[0.02] backdrop-blur-md" />
                   {/* surface glow strip */}
-                  <span className={`absolute inset-x-0 top-0 h-0.5 ${sc.dot} opacity-70`} />
+                  <span className={`absolute inset-x-0 top-0 z-10 h-0.5 ${sc.dot} opacity-70`} />
+                  <div className="relative">
                   <div className="flex items-start justify-between gap-2">
                     <div className="flex items-center gap-1.5">
                       <Badge variant="outline" className={`${sc.text} border-white/10 bg-white/5 text-[10px]`}>
@@ -279,7 +283,8 @@ export function Scoreboard({
                       </TooltipContent>
                     </Tooltip>
                   </div>
-                </div>
+                  </div>
+                </TiltCard>
               );
             })}
           </div>

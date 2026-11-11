@@ -17,15 +17,16 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "نئوتنیس مارکوف کوانت | NeoTennis Markov Quant",
+  title: "نئوتنیس مارکوف کوانت v3.0 | NeoTennis Markov Quant",
   description:
-    "ترمینال کمّی مهندسی تنیس حرفه‌ای ATP/WTA — زنجیره مارکوف ۴ لایه، مهندسی معکوس ضرایب، دروازه وتو سوپروایزر و دفترکل SHA-256",
+    "ترمینال کمّی مهندسی تنیس حرفه‌ای ATP/WTA — رادار سه‌بعدی چشم شاهین، زنجیره مارکوف ۴ لایه، مهندسی معکوس ضرایب، سوپروایزر ۳ الگویی با سهمیه تایید ۶۵٪ و کارنامه SHA-256 در سطح مسابقه",
   keywords: [
     "tennis",
     "ATP",
     "WTA",
     "Markov chain",
     "quant",
+    "hawk-eye",
     "aineobet",
     "نئوتنیس",
   ],

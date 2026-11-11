@@ -16,6 +16,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { TiltCard } from "@/components/tennis/spatial-tilt";
 import { dedupeByKey } from "@/lib/tennis/dedupe";
 import type { AnalyzedMatch, FeedPayload, LineItem, Surface } from "@/lib/tennis/types";
 
@@ -88,7 +89,8 @@ function LineCard({
     );
 
   return (
-    <div className={`rise-in rounded-2xl border p-4 ${accent}`}>
+    <TiltCard className={`rise-in rounded-2xl border ${accent}`}>
+      <div className="p-4">
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-2">
           {icon}
@@ -103,11 +105,12 @@ function LineCard({
           </div>
         </div>
         <div className="text-left">
-          <div className="mono-num text-2xl font-extrabold text-white">
+          {/* v3.0 — odds live in a dark capsule, mono tabular-nums */}
+          <div className="num-capsule text-xl font-extrabold text-white">
             {item.odds.toFixed(2)}
-            <span className="text-sm text-muted-foreground">x</span>
+            <span className="text-xs text-muted-foreground">x</span>
           </div>
-          <div className="mono-num text-[10px] text-muted-foreground">
+          <div className="mono-num mt-1 text-[10px] text-muted-foreground" dir="ltr">
             P={Math.round(item.prob * 100)}%
           </div>
         </div>
@@ -128,6 +131,7 @@ function LineCard({
                 className={`gap-1 text-[10px] font-bold ${ARCH_STYLE[item.archetype.code] ?? "border-white/10 bg-white/5 text-muted-foreground"}`}
               >
                 👑 {item.archetype.labelFa}
+                {item.archetype.adaptive && " (سازگار)"}
                 <span className="mono-num">· {(item.archetype.coverage * 100).toFixed(1)}%</span>
               </Badge>
             </TooltipTrigger>
@@ -144,16 +148,19 @@ function LineCard({
           </Badge>
         )}
         {item.hashPre && (
-          <Badge variant="outline" className="mono-num gap-1 border-cyan-400/30 bg-cyan-400/5 text-[10px] text-cyan-300">
+          <Badge variant="outline" className="mono-num gap-1 border-cyan-400/30 bg-cyan-400/5 text-[10px] text-cyan-300" dir="ltr">
             <Lock className="h-3 w-3" /> {item.hashPre.slice(0, 10)}
           </Badge>
         )}
-        {/* v2.0 font fix — Persian label in font-sans, only the number in mono */}
-        <span className="ms-auto text-[10px] text-muted-foreground">
-          استیک: <span className="mono-num">{item.stake}</span> واحد
+        {/* v3.0 — stake rides a mono capsule, Persian label rides font-sans */}
+        <span className="ms-auto flex items-center gap-1.5 text-[10px] text-muted-foreground">
+          استیک:
+          <span className="num-capsule text-[10px]">{item.stake}</span>
+          واحد
         </span>
       </div>
-    </div>
+      </div>
+    </TiltCard>
   );
 }
 
@@ -251,13 +258,13 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
 
   return (
     <section aria-label="خطوط تولید" className="space-y-4">
-      <Card className="glass-card">
+      <Card className="spatial-card rounded-2xl">
         <CardHeader className="pb-2">
           <CardTitle className="flex flex-wrap items-center gap-2 text-sm font-bold">
             <Rocket className="h-4 w-4 text-amber-300" />
             خطوط تولید سیگنال (۳ لاین مستقل)
             <span className="text-[11px] font-normal text-muted-foreground">
-              — سوپروایزر ۳ الگویی · خروجی امروز: {dual.length} تیپ دوقلو · {combo2.length + combo3.length} میکس ·{" "}
+              — سوپروایزر ۳ الگویی با سهمیه تایید ۶۵٪ · خروجی امروز: {Math.ceil(dual.length / 2)} مسابقه زوج‌تیپ ({dual.length} بال) · {combo2.length + combo3.length} میکس ·{" "}
               {sniper.length} اسنایپر · {shadow.length} وتو
             </span>
           </CardTitle>
@@ -336,7 +343,7 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
             <TabsContent value="combo" className="mt-4 space-y-3">
               {[...combo2, ...combo3].length === 0 ? (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  میکی با پنجره هدف <span className="mono-num">2.80x–5.80x</span> یافت نشد — سلاطین سرویس امروز در تداخل رنکینگ هستند.
+                  میکس با پنجره هدف <span className="mono-num">2.80x–5.80x</span> یافت نشد — سلاطین سرویس امروز در تداخل رنکینگ هستند.
                 </div>
               ) : (
                 <div className="grid gap-3 xl:grid-cols-2">
@@ -350,7 +357,7 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
             <TabsContent value="sniper" className="mt-4 space-y-3">
               {sniper.length === 0 ? (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  تیر خالصی در پنجره هدف <span className="mono-num">4.20x–8.50x</span> پیدا نشد.
+                  تیر خالصی در پنجره هدف <span className="mono-num">4.20x–7.50x</span> پیدا نشد.
                 </div>
               ) : (
                 <div className="grid gap-3 xl:grid-cols-2">

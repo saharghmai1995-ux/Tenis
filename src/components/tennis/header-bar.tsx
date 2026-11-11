@@ -74,11 +74,14 @@ export function HeaderBar({ onRefresh, refreshing, lastUpdated, sources }: Heade
                 NeoTennis Markov Quant
               </span>
               <Badge className="border-0 bg-amber-300/15 px-1.5 py-0 text-[9px] font-bold text-amber-300">
-                v2.0
+                v3.0
+              </Badge>
+              <Badge variant="outline" className="gap-1 border-cyan-400/30 bg-cyan-400/5 px-1.5 py-0 text-[9px] font-bold text-cyan-300">
+                3D Hawk-Eye
               </Badge>
             </h1>
             <p className="mono-num text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-              Calibrated Multi-Archetype Supervisor · 7-Day Auto-Settlement · @aineobet Tennis Division
+              3D Hawk-Eye Telemetry · Match-Level Ledger · Spatial Glass Edition · @aineobet Tennis Division
             </p>
           </div>
         </div>

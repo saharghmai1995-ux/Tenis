@@ -1,0 +1,786 @@
+     1→// ─── NeoTennis Markov Quant v2.0 — Engine Orchestrator ─────────────────────
+     2→// Live feed → market fusion → Kovalchik-calibrated 4-layer Markov →
+     3→// 3-archetype supervisor gate → production lines → SHA-256 persistence →
+     4→// 7-day historical auto-settlement → disjoint ledger payload.
+     5→
+     6→import { db } from "@/lib/db";
+     7→import {
+     8→  fetchNews,
+     9→  fetchRankings,
+    10→  fetchScoreboard,
+    11→  buildRankingLookup,
+    12→  todayKey,
+    13→  dateKeyDaysAgo,
+    14→  surnameOf,
+    15→} from "./espn";
+    16→import { fetchPolymarketOdds, matchMarket } from "./polymarket";
+    17→import { fetchCityWeather } from "./weather";
+    18→import { fullMarkov, matchWinProbA, solveSet } from "./markov";
+    19→import { removeMargin, reverseAnalysis } from "./solver";
+    20→import { buildSlips, evaluateArchetypes, isDualEligible, supervisorGate } from "./supervisor";
+    21→import { canonicalMatchString, sha256 } from "./hash";
+    22→import { extractSettleableResult, runSettlement } from "./settlement";
+    23→import { buildLedgerPayload } from "./ledger";
+    24→import { dedupeByKey, matchContentKey } from "./dedupe";
+    25→import type {
+    26→  AnalyzedMatch,
+    27→  EspnMatch,
+    28→  FeedPayload,
+    29→  LineItem,
+    30→  MarketOdds,
+    31→  NewsItem,
+    32→  RankRow,
+    33→  SourceStatus,
+    34→  TimingInfo,
+    35→  Tour,
+    36→  WeatherInfo,
+    37→} from "./types";
+    38→
+    39→const FEED_TTL_MS = 75 * 1000;
+    40→const HISTORY_WINDOW_DAYS = 7;
+    41→let feedCache: { at: number; payload: FeedPayload } | null = null;
+    42→let feedPromise: Promise<FeedPayload> | null = null;
+    43→
+    44→async function timed<T>(
+    45→  fn: () => Promise<T>,
+    46→  key: string,
+    47→  sources: Record<string, SourceStatus>
+    48→): Promise<T | null> {
+    49→  const t0 = Date.now();
+    50→  try {
+    51→    const v = await fn();
+    52→    sources[key] = {
+    53→      ok: true,
+    54→      latencyMs: Date.now() - t0,
+    55→      count: Array.isArray(v) ? v.length : undefined,
+    56→    };
+    57→    return v;
+    58→  } catch (e) {
+    59→    sources[key] = {
+    60→      ok: false,
+    61→      latencyMs: Date.now() - t0,
+    62→      error: e instanceof Error ? e.message : String(e),
+    63→    };
+    64→    return null;
+    65→  }
+    66→}
+    67→
+    68→function timingOf(m: EspnMatch, favorite: "A" | "B"): TimingInfo {
+    69→  if (m.state === "post") return { label: "تسویه‌شده", code: "DONE", optimal: false };
+    70→  if (m.state === "in") {
+    71→    const setsA = m.playerA.linescores.filter((l) => l.winner).length;
+    72→    const setsB = m.playerB.linescores.filter((l) => l.winner).length;
+    73→    const favSets = favorite === "A" ? setsA : setsB;
+    74→    const dogSets = favorite === "A" ? setsB : setsA;
+    75→    if (dogSets > favSets) {
+    76→      return {
+    77→        label: "In-Play After Early Break — بهترین لحظه ورود",
+    78→        code: "INPLAY_BREAK",
+    79→        optimal: true,
+    80→      };
+    81→    }
+    82→    return { label: "در حال بازی — In-Play", code: "INPLAY", optimal: false };
+    83→  }
+    84→  const start = m.startTime ? new Date(m.startTime).getTime() : NaN;
+    85→  const mins = Number.isFinite(start) ? (start - Date.now()) / 60000 : Infinity;
+    86→  if (mins <= 45) {
+    87→    return {
+    88→      label: "T-30m Pre-Warmup — بهترین زمان ثبت ضریب",
+    89→      code: "T30",
+    90→      optimal: true,
+    91→    };
+    92→  }
+    93→  return {
+    94→    label: `شروع در ${Number.isFinite(mins) ? Math.round(mins) : "?"} دقیقه — صبر تا پنجره T-30m`,
+    95→    code: "WAIT",
+    96→    optimal: false,
+    97→  };
+    98→}
+    99→
+   100→/**
+   101→ * Full v2.0 analysis pipeline for a single match (works for pre / in / post):
+   102→ * market fusion (when available) → Kovalchik calibration → Markov DP →
+   103→ * 3-archetype evaluation → supervisor gate → slips → SHA-256 lock.
+   104→ */
+   105→function analyzeMatch(
+   106→  m: EspnMatch,
+   107→  market: MarketOdds | undefined,
+   108→  weather?: WeatherInfo
+   109→): AnalyzedMatch {
+   110→  let marketProbA: number | undefined;
+   111→  let marketOddsA: number | undefined;
+   112→  let method: "shin" | "power" = "shin";
+   113→  if (market) {
+   114→    const rm = removeMargin([market.oddsA, market.oddsB], "shin");
+   115→    marketProbA = rm.probs[0];
+   116→    marketOddsA = market.oddsA;
+   117→    method = rm.method;
+   118→  }
+   119→
+   120→  const rev = reverseAnalysis(
+   121→    marketProbA,
+   122→    m.playerA.points,
+   123→    m.playerB.points,
+   124→    m.surface,
+   125→    m.tour
+   126→  );
+   127→  const mk = fullMarkov(rev.pFinalA, rev.pFinalB);
+   128→  const winA = matchWinProbA(rev.pFinalA, rev.pFinalB);
+   129→  const favorite: "A" | "B" = winA >= 0.5 ? "A" : "B";
+   130→  const favWinProb = favorite === "A" ? winA : 1 - winA;
+   131→
+   132→  const am: AnalyzedMatch = {
+   133→    ...m,
+   134→    weather,
+   135→    market,
+   136→    reverse: { ...rev, marketOddsA, method },
+   137→    markov: mk,
+   138→    favorite,
+   139→    favWinProb,
+   140→    veto: { vetoed: false, code: "NONE" },
+   141→    dualEligible: false,
+   142→    slips: {},
+   143→    timing: { label: "", code: "WAIT", optimal: false },
+   144→  };
+   145→
+   146→  const archReport = evaluateArchetypes(am);
+   147→  am.archEvals = archReport.evals;
+   148→  am.archetype = archReport.selected;
+   149→  am.veto = supervisorGate(am, archReport.selected);
+   150→  am.dualEligible = isDualEligible(am);
+   151→  am.slips = buildSlips(am);
+   152→  am.timing = timingOf(m, favorite);
+   153→
+   154→  if (am.slips.A && am.slips.B) {
+   155→    am.hashPre = sha256(
+   156→      canonicalMatchString({
+   157→        dateKey: m.dateKey,
+   158→        tour: m.tour,
+   159→        tournament: m.tournament,
+   160→        surface: m.surface,
+   161→        round: m.round,
+   162→        playerA: m.playerA.name,
+   163→        playerB: m.playerB.name,
+   164→        slipAText: am.slips.A.textEn,
+   165→        slipAOdds: am.slips.A.odds,
+   166→        slipBText: am.slips.B.textEn,
+   167→        slipBOdds: am.slips.B.odds,
+   168→      })
+   169→    );
+   170→  }
+   171→  return am;
+   172→}
+   173→
+   174→export async function buildFeed(force = false): Promise<FeedPayload> {
+   175→  if (!force && feedCache && Date.now() - feedCache.at < FEED_TTL_MS) {
+   176→    return feedCache.payload;
+   177→  }
+   178→  if (feedPromise) return feedPromise;
+   179→
+   180→  feedPromise = (async () => {
+   181→    const sources: Record<string, SourceStatus> = {};
+   182→
+   183→    const [sbAtp, sbWta, rkAtp, rkWta, nwAtp, nwWta, pmOdds] = await Promise.all([
+   184→      timed(() => fetchScoreboard("ATP"), "espn_atp_scoreboard", sources),
+   185→      timed(() => fetchScoreboard("WTA"), "espn_wta_scoreboard", sources),
+   186→      timed(() => fetchRankings("ATP"), "espn_atp_rankings", sources),
+   187→      timed(() => fetchRankings("WTA"), "espn_wta_rankings", sources),
+   188→      timed(() => fetchNews("ATP"), "espn_atp_news", sources),
+   189→      timed(() => fetchNews("WTA"), "espn_wta_news", sources),
+   190→      timed(() => fetchPolymarketOdds(), "polymarket_gamma", sources),
+   191→    ]);
+   192→
+   193→    const rankLookup = buildRankingLookup([...(rkAtp ?? []), ...(rkWta ?? [])]);
+   194→    const matches: EspnMatch[] = [...(sbAtp ?? []), ...(sbWta ?? [])].filter(
+   195→      (m) => m.singles
+   196→    );
+   197→    // v2.0 dedupe — by ESPN event key AND by stable match content key
+   198→    // (kills the double-listed matches that duplicated the shadow ledger)
+   199→    const seen = new Set<string>();
+   200→    const contentSeen = new Set<string>();
+   201→    const unique = matches.filter((m) => {
+   202→      if (seen.has(m.eventKey)) return false;
+   203→      seen.add(m.eventKey);
+   204→      const ck = matchContentKey({
+   205→        tour: m.tour,
+   206→        dateKey: m.dateKey,
+   207→        tournament: m.tournament,
+   208→        round: m.round,
+   209→        playerA: m.playerA.name,
+   210→        playerB: m.playerB.name,
+   211→      });
+   212→      if (contentSeen.has(ck)) return false;
+   213→      contentSeen.add(ck);
+   214→      return true;
+   215→    });
+   216→
+   217→    // attach official ranking info (rankings table is authoritative;
+   218→    // scoreboard curatedRank is only the tournament seed)
+   219→    for (const m of unique) {
+   220→      const resolve = (name: string) => {
+   221→        const exact = rankLookup.get(name.toLowerCase());
+   222→        if (exact) return exact;
+   223→        const s = surnameOf(name);
+   224→        const row = rankLookup.get(s);
+   225→        return row && surnameOf(row.name) === s ? row : undefined;
+   226→      };
+   227→      const rowA = resolve(m.playerA.name);
+   228→      const rowB = resolve(m.playerB.name);
+   229→      if (rowA) {
+   230→        m.playerA.points = m.playerA.points ?? rowA.points;
+   231→        m.playerA.rank = rowA.rank;
+   232→      }
+   233→      if (rowB) {
+   234→        m.playerB.points = m.playerB.points ?? rowB.points;
+   235→        m.playerB.rank = rowB.rank;
+   236→      }
+   237→    }
+   238→
+   239→    // weather for unique tournament cities (bounded)
+   240→    const cities = [
+   241→      ...new Set(unique.map((m) => m.city).filter((c): c is string => !!c)),
+   242→    ].slice(0, 10);
+   243→    const weatherList = await Promise.all(cities.map((c) => fetchCityWeather(c)));
+   244→    const weatherByCity = new Map<string, WeatherInfo>();
+   245→    for (const w of weatherList) if (w) weatherByCity.set(w.city.toLowerCase(), w);
+   246→
+   247→    // market mapping (Polymarket → ESPN match) — live markets only matter
+   248→    // for matches that have not finished yet
+   249→    const marketMap = pmOdds
+   250→      ? matchMarket(
+   251→          unique
+   252→            .filter((m) => m.state !== "post")
+   253→            .map((m) => ({ playerA: m.playerA.name, playerB: m.playerB.name })),
+   254→          pmOdds
+   255→        )
+   256→      : new Map<string, MarketOdds>();
+   257→
+   258→    // ── per-match analysis (unified v2.0 path for pre / in / post)
+   259→    const analyzed: AnalyzedMatch[] = [];
+   260→    for (const m of unique) {
+   261→      try {
+   262→        const key = `${m.playerA.name}__${m.playerB.name}`;
+   263→        const market = m.state === "post" ? undefined : marketMap.get(key);
+   264→        const weather = m.city ? weatherByCity.get(m.city.toLowerCase()) : undefined;
+   265→        analyzed.push(analyzeMatch(m, market, weather));
+   266→      } catch (e) {
+   267→        console.error("[engine] analysis failed", m.eventKey, e);
+   268→      }
+   269→    }
+   270→
+   271→    // ── v2.0 · 7-day historical auto-settlement ────────────────────────────
+   272→    // Finished ATP/WTA matches of the last 7 days are analyzed with the same
+   273→    // calibrated engine; the ones that pass the 3-archetype gate are
+   274→    // auto-picked and settled with the real linescores so the Combined Win
+   275→    // Rate gauge and the 1000-unit bank curve are alive from first load.
+   276→    const historySummary = await processHistorySettlement(rankLookup);
+   277→
+   278→    // ── persist → build lines → persist picks → settle → ledger
+   279→    await persistMatches(analyzed);
+   280→    const lines = buildLines(analyzed);
+   281→    const settledItems = [...lines.dual, ...lines.combo2, ...lines.combo3, ...lines.sniper, ...lines.shadow];
+   282→    const allItems = dedupeByKey(
+   283→      [...settledItems, ...historySummary.items],
+   284→      (i) => `${i.matchId}|${i.line}|${i.leg}`
+   285→    );
+   286→    await persistPicks(allItems);
+   287→    const settleSummary = await runSettlement(HISTORY_WINDOW_DAYS);
+   288→    const ledger = await buildLedgerPayload();
+   289→
+   290→    const payload: FeedPayload = {
+   291→      ok: true,
+   292→      generatedAt: new Date().toISOString(),
+   293→      sources,
+   294→      matches: analyzed,
+   295→      rankings: { atp: rkAtp ?? [], wta: rkWta ?? [] },
+   296→      news: [...(nwAtp ?? []), ...(nwWta ?? [])].slice(0, 12),
+   297→      lines,
+   298→      ledger,
+   299→      settlementSummary: {
+   300→        settled: settleSummary.settled,
+   301→        picked: analyzed.length,
+   302→        windowDays: HISTORY_WINDOW_DAYS,
+   303→        historyAnalyzed: historySummary.analyzed,
+   304→        historyApproved: historySummary.approved,
+   305→      },
+   306→    };
+   307→    feedCache = { at: Date.now(), payload };
+   308→    return payload;
+   309→  })();
+   310→
+   311→  try {
+   312→    return await feedPromise;
+   313→  } finally {
+   314→    feedPromise = null;
+   315→  }
+   316→}
+   317→
+   318→// ─── v2.0 · 7-Day Historical Auto-Settlement ───────────────────────────────
+   319→
+   320→interface HistorySummary {
+   321→  analyzed: number;
+   322→  approved: number;
+   323→  items: LineItem[];
+   324→}
+   325→
+   326→async function processHistorySettlement(
+   327→  rankLookup: Map<string, RankRow>
+   328→): Promise<HistorySummary> {
+   329→  const summary: HistorySummary = { analyzed: 0, approved: 0, items: [] };
+   330→
+   331→  try {
+   332→    // 1) finished matches of today + the past 7 days — today's post matches
+   333→    //    flow through the same fresh-check as the older days
+   334→    const dateKeys = [
+   335→      todayKey(),
+   336→      ...Array.from({ length: HISTORY_WINDOW_DAYS }, (_, i) => dateKeyDaysAgo(i + 1)),
+   337→    ];
+   338→    const tours: Tour[] = ["ATP", "WTA"];
+   339→    const fetched: EspnMatch[] = [];
+   340→    await Promise.all(
+   341→      tours.flatMap((t) =>
+   342→        dateKeys.map(async (d) => {
+   343→          try {
+   344→            fetched.push(...(await fetchScoreboard(t, d)));
+   345→          } catch (e) {
+   346→            console.error("[history] scoreboard fetch failed", t, d, e);
+   347→          }
+   348→        })
+   349→      )
+   350→    );
+   351→
+   352→    const finished = dedupeByKey(
+   353→      fetched.filter((m) => m.state === "post" && m.singles),
+   354→      (m) => m.eventKey
+   355→    );
+   356→
+   357→    // 2) which of these are new (never processed for settlement)?
+   358→    const eventKeys = finished.map((m) => m.eventKey);
+   359→    const knownRows = eventKeys.length
+   360→      ? await db.tennisMatch.findMany({
+   361→          where: { eventKey: { in: eventKeys } },
+   362→          select: { eventKey: true, historyProcessed: true },
+   363→        })
+   364→      : [];
+   365→    const processed = new Set(
+   366→      knownRows.filter((r) => r.historyProcessed).map((r) => r.eventKey)
+   367→    );
+   368→    const fresh = finished.filter((m) => !processed.has(m.eventKey));
+   369→    if (fresh.length === 0) return summary;
+   370→
+   371→    // 3) attach official ranking points + analyze
+   372→    const processedKeys: string[] = [];
+   373→    const freshAnalyzed: AnalyzedMatch[] = [];
+   374→    for (const m of fresh) {
+   375→      try {
+   376→        const resolve = (name: string) => {
+   377→          const exact = rankLookup.get(name.toLowerCase());
+   378→          if (exact) return exact;
+   379→          const s = surnameOf(name);
+   380→          const row = rankLookup.get(s);
+   381→          return row && surnameOf(row.name) === s ? row : undefined;
+   382→        };
+   383→        const rowA = resolve(m.playerA.name);
+   384→        const rowB = resolve(m.playerB.name);
+   385→        if (rowA) {
+   386→          m.playerA.points = m.playerA.points ?? rowA.points;
+   387→          m.playerA.rank = rowA.rank;
+   388→        }
+   389→        if (rowB) {
+   390→          m.playerB.points = m.playerB.points ?? rowB.points;
+   391→          m.playerB.rank = rowB.rank;
+   392→        }
+   393→        const am = analyzeMatch(m, undefined);
+   394→        freshAnalyzed.push(am);
+   395→        processedKeys.push(m.eventKey);
+   396→      } catch (e) {
+   397→        console.error("[history] analysis failed", m.eventKey, e);
+   398→      }
+   399→    }
+   400→
+   401→    // 4) persist match rows (marks them processed) and build DUAL items
+   402→    await persistMatches(freshAnalyzed, true);
+   403→    for (const am of freshAnalyzed) {
+   404→      const result = extractSettleableResult(am);
+   405→      const approved = !am.veto.vetoed && am.dualEligible && !!am.slips.A && !!am.slips.B;
+   406→      if (approved && result) {
+   407→        summary.items.push(...dualItemsOf(am));
+   408→        summary.approved++;
+   409→      }
+   410→    }
+   411→    summary.analyzed = freshAnalyzed.length;
+   412→
+   413→    // 5) engine log + explicit processed-marker for rows that pre-existed
+   414→    await db.engineLog
+   415→      .create({
+   416→        data: {
+   417→          kind: "HISTORY",
+   418→          message: `7-day auto-settlement scan: analyzed=${summary.analyzed} approved=${summary.approved}`,
+   419→        },
+   420→      })
+   421→      .catch(() => undefined);
+   422→
+   423→    if (processedKeys.length) {
+   424→      await db.tennisMatch
+   425→        .updateMany({
+   426→          where: { eventKey: { in: processedKeys } },
+   427→          data: { historyProcessed: true },
+   428→        })
+   429→        .catch(() => undefined);
+   430→    }
+   431→  } catch (e) {
+   432→    console.error("[history] pipeline failed", e);
+   433→  }
+   434→
+   435→  return summary;
+   436→}
+   437→
+   438→// ─── Persistence ───────────────────────────────────────────────────────────
+   439→
+   440→async function persistMatches(analyzed: AnalyzedMatch[], history = false) {
+   441→  for (const m of analyzed) {
+   442→    try {
+   443→      const rowData = rowOf(m);
+   444→      // the historyProcessed marker must only be written by the settlement
+   445→      // processor — feed upserts never touch it (update omits the flag)
+   446→      const row = await db.tennisMatch.upsert({
+   447→        where: { eventKey: m.eventKey },
+   448→        create: { ...rowData, historyProcessed: history },
+   449→        update: rowData,
+   450→      });
+   451→      m.dbId = row.id;
+   452→    } catch (e) {
+   453→      console.error("[engine] persist match failed", m.eventKey, e);
+   454→    }
+   455→  }
+   456→}
+   457→
+   458→function rowOf(m: AnalyzedMatch) {
+   459→  return {
+   460→    eventKey: m.eventKey,
+   461→    dateKey: m.dateKey,
+   462→    tour: m.tour,
+   463→    tournament: m.tournament,
+   464→    city: m.city ?? null,
+   465→    surface: m.surface,
+   466→    surfaceSrc: m.surfaceSrc,
+   467→    round: m.round,
+   468→    singles: m.singles,
+   469→    playerA: m.playerA.name,
+   470→    playerB: m.playerB.name,
+   471→    flagA: m.playerA.flagUrl ?? null,
+   472→    flagB: m.playerB.flagUrl ?? null,
+   473→    rankA: m.playerA.rank ?? null,
+   474→    rankB: m.playerB.rank ?? null,
+   475→    pointsA: m.playerA.points ?? null,
+   476→    pointsB: m.playerB.points ?? null,
+   477→    status: m.state,
+   478→    startTime: m.startTime ? new Date(m.startTime) : null,
+   479→    favorite: m.favorite,
+   480→    pServeA: m.reverse.pServeA,
+   481→    pServeB: m.reverse.pServeB,
+   482→    holdA: m.markov.gA,
+   483→    holdB: m.markov.gB,
+   484→    setWinA: m.markov.setWinA,
+   485→    p20: m.markov.p20,
+   486→    p21: m.markov.p21,
+   487→    p12: m.markov.p12,
+   488→    p02: m.markov.p02,
+   489→    ou95: m.markov.ou95,
+   490→    ou215: m.markov.ou215,
+   491→    tb1: m.markov.tb1,
+   492→    marketProbA: m.reverse.marketProbA ?? null,
+   493→    marketOddsA: m.reverse.marketOddsA ?? null,
+   494→    pEloA: m.reverse.pEloA,
+   495→    pEloB: m.reverse.pEloB,
+   496→    pFinalA: m.reverse.pFinalA,
+   497→    pFinalB: m.reverse.pFinalB,
+   498→    marketGap: m.reverse.marketGap,
+   499→    vetoed: m.veto.vetoed,
+   500→    vetoReason: m.veto.reason ?? null,
+   501→    dualEligible: m.dualEligible,
+   502→    slipAText: m.slips.A?.textEn ?? null,
+   503→    slipAOdds: m.slips.A?.odds ?? null,
+   504→    slipAProb: m.slips.A?.prob ?? null,
+   505→    slipBText: m.slips.B?.textEn ?? null,
+   506→    slipBOdds: m.slips.B?.odds ?? null,
+   507→    slipBProb: m.slips.B?.prob ?? null,
+   508→    timing: m.timing.label,
+   509→    hashPre: m.hashPre ?? null,
+   510→  };
+   511→}
+   512→
+   513→async function persistPicks(items: LineItem[]) {
+   514→  for (const item of items) {
+   515→    const matchId = item.matchId;
+   516→    // matchId must be a DB id; eventKeys (fallbacks) are skipped
+   517→    if (!matchId || matchId.includes("__")) continue;
+   518→    try {
+   519→      await db.tennisPick.upsert({
+   520→        where: {
+   521→          matchId_line_leg: { matchId, line: item.line, leg: item.leg },
+   522→        },
+   523→        create: {
+   524→          matchId,
+   525→          line: item.line,
+   526→          leg: item.leg,
+   527→          desc: item.desc,
+   528→          odds: item.odds,
+   529→          prob: item.prob,
+   530→          stake: item.stake,
+   531→          meta: item.meta ?? null,
+   532→          status: "PENDING",
+   533→        },
+   534→        update: {
+   535→          desc: item.desc,
+   536→          odds: item.odds,
+   537→          prob: item.prob,
+   538→          stake: item.stake,
+   539→          meta: item.meta ?? null,
+   540→        },
+   541→      });
+   542→    } catch (e) {
+   543→      console.error("[engine] persist pick failed", item.line, item.leg, e);
+   544→    }
+   545→  }
+   546→}
+   547→
+   548→// ─── Production lines assembly ─────────────────────────────────────────────
+   549→
+   550→const COMBO_MIN_ODDS = 2.8;
+   551→const COMBO_MAX_ODDS = 5.8;
+   552→const SNIPER_MIN_ODDS = 4.2;
+   553→const SNIPER_MAX_ODDS = 8.5;
+   554→
+   555→function baseItem(m: AnalyzedMatch): Omit<
+   556→  LineItem,
+   557→  "line" | "leg" | "desc" | "descEn" | "odds" | "prob" | "stake"
+   558→> & { meta?: string } {
+   559→  return {
+   560→    matchId: m.dbId ?? m.eventKey,
+   561→    tournament: m.tournament,
+   562→    tour: m.tour,
+   563→    surface: m.surface,
+   564→    round: m.round,
+   565→    playerA: m.playerA.name,
+   566→    playerB: m.playerB.name,
+   567→    rankA: m.playerA.rank,
+   568→    rankB: m.playerB.rank,
+   569→    favorite: m.favorite,
+   570→    state: m.state,
+   571→    startTime: m.startTime,
+   572→    timing: m.timing,
+   573→    hashPre: m.hashPre,
+   574→    archetype: m.archetype,
+   575→  };
+   576→}
+   577→
+   578→/** The two complementary DUAL legs of an approved match (archetype-aware). */
+   579→function dualItemsOf(m: AnalyzedMatch): LineItem[] {
+   580→  if (!m.slips.A || !m.slips.B) return [];
+   581→  const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
+   582→  const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
+   583→  return [
+   584→    {
+   585→      ...baseItem(m),
+   586→      line: "DUAL",
+   587→      leg: m.slips.A.leg,
+   588→      desc: m.slips.A.text,
+   589→      descEn: m.slips.A.textEn,
+   590→      odds: m.slips.A.odds,
+   591→      prob: m.slips.A.prob,
+   592→      stake: 1,
+   593→      slipProbA: m.slips.A.prob,
+   594→      slipProbB: m.slips.B.prob,
+   595→      meta: JSON.stringify({
+   596→        kind: "dualA",
+   597→        arch: m.archetype?.code,
+   598→        favName,
+   599→        eventKey: m.eventKey,
+   600→      }),
+   601→    },
+   602→    {
+   603→      ...baseItem(m),
+   604→      line: "DUAL",
+   605→      leg: m.slips.B.leg,
+   606→      desc: m.slips.B.text,
+   607→      descEn: m.slips.B.textEn,
+   608→      odds: m.slips.B.odds,
+   609→      prob: m.slips.B.prob,
+   610→      stake: 1,
+   611→      slipProbA: m.slips.A.prob,
+   612→      slipProbB: m.slips.B.prob,
+   613→      meta: JSON.stringify({
+   614→        kind: "dualB",
+   615→        arch: m.archetype?.code,
+   616→        favName,
+   617→        dogName,
+   618→        eventKey: m.eventKey,
+   619→      }),
+   620→    },
+   621→  ];
+   622→}
+   623→
+   624→export function buildLines(analyzed: AnalyzedMatch[]) {
+   625→  const dual: LineItem[] = [];
+   626→  const shadow: LineItem[] = [];
+   627→  const eligible = analyzed.filter((m) => m.state !== "post");
+   628→
+   629→  for (const m of eligible) {
+   630→    const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
+   631→    const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
+   632→
+   633→    if (!m.veto.vetoed && m.slips.A && m.slips.B && m.dualEligible) {
+   634→      dual.push(...dualItemsOf(m));
+   635→    }
+   636→
+   637→    if (m.veto.vetoed) {
+   638→      const p20Fav = m.favorite === "A" ? m.markov.p20 : m.markov.p02;
+   639→      const over25 = m.markov.p21 + m.markov.p12;
+   640→      shadow.push({
+   641→        ...baseItem(m),
+   642→        line: "SHADOW",
+   643→        leg: "A",
+   644→        desc: `🛡️ وتوشده توسط سوپروایزر — ${m.veto.reason ?? ""}`,
+   645→        descEn: `VETOED · FAV 2-0 (P=${(p20Fav * 100).toFixed(1)}%)`,
+   646→        odds: p20Fav > 0.01 ? Math.round((1 / p20Fav) * 100) / 100 : 99,
+   647→        prob: p20Fav,
+   648→        stake: 1,
+   649→        meta: JSON.stringify({ kind: "dualA", favName, eventKey: m.eventKey }),
+   650→      });
+   651→      shadow.push({
+   652→        ...baseItem(m),
+   653→        line: "SHADOW",
+   654→        leg: "B",
+   655→        desc: `🛡️ وتوشده توسط سوپروایزر — ${m.veto.reason ?? ""}`,
+   656→        descEn: `VETOED · OVER 2.5 SETS (P=${(over25 * 100).toFixed(1)}%)`,
+   657→        odds: over25 > 0.01 ? Math.round((1 / over25) * 100) / 100 : 99,
+   658→        prob: over25,
+   659→        stake: 1,
+   660→        meta: JSON.stringify({ kind: "dualB", favName, dogName, eventKey: m.eventKey }),
+   661→      });
+   662→    }
+   663→  }
+   664→
+   665→  // ── Serve-Hold Combos (2-leg & 3-leg) from strongest approved favorites
+   666→  const approved = analyzed.filter(
+   667→    (m) => !m.veto.vetoed && m.state !== "post" && m.favWinProb > 0.55
+   668→  );
+   669→  const byStrength = [...approved].sort((a, b) => b.favWinProb - a.favWinProb);
+   670→  const combo2: LineItem[] = [];
+   671→  const combo3: LineItem[] = [];
+   672→
+   673→  const makeCombo = (legs: AnalyzedMatch[], legTag: string): LineItem | null => {
+   674→    if (legs.length < 2) return null;
+   675→    let prob = 1;
+   676→    let odds = 1;
+   677→    const names: string[] = [];
+   678→    const favorites: { name: string; eventKey: string }[] = [];
+   679→    for (const l of legs) {
+   680→      const fav = l.favorite === "A" ? l.playerA.name : l.playerB.name;
+   681→      prob *= l.favWinProb;
+   682→      odds *= 1 / l.favWinProb;
+   683→      names.push(`${fav} WIN`);
+   684→      favorites.push({ name: fav, eventKey: l.eventKey });
+   685→    }
+   686→    return {
+   687→      ...baseItem(legs[0]),
+   688→      line: "COMBO",
+   689→      leg: legTag,
+   690→      desc: `${legTag.startsWith("COMBO-3") ? "میکس ۳ تایی" : "میکس ۲ تایی"} سلاطین سرویس: ${names.join(" × ")}`,
+   691→      descEn: names.join(" × "),
+   692→      odds: Math.round(odds * 100) / 100,
+   693→      prob,
+   694→      stake: 1,
+   695→      timing: legs[0].timing,
+   696→      meta: JSON.stringify({ kind: "combo", favorites, size: legs.length }),
+   697→    };
+   698→  };
+   699→
+   700→  const primaryC2 = makeCombo(byStrength.slice(0, 2), "COMBO-2");
+   701→  if (primaryC2 && primaryC2.odds >= COMBO_MIN_ODDS && primaryC2.odds <= COMBO_MAX_ODDS)
+   702→    combo2.push(primaryC2);
+   703→  const primaryC3 = makeCombo(byStrength.slice(0, 3), "COMBO-3");
+   704→  if (primaryC3 && primaryC3.odds >= COMBO_MIN_ODDS && primaryC3.odds <= COMBO_MAX_ODDS)
+   705→    combo3.push(primaryC3);
+   706→
+   707→  for (let i = 0; i + 2 <= byStrength.length && combo2.length < 2; i++) {
+   708→    const alt = makeCombo(byStrength.slice(i, i + 2), "COMBO-2");
+   709→    if (alt && alt.odds >= COMBO_MIN_ODDS && alt.odds <= COMBO_MAX_ODDS) combo2.push(alt);
+   710→  }
+   711→  for (let i = 0; i + 3 <= byStrength.length && combo3.length < 2; i++) {
+   712→    const alt = makeCombo(byStrength.slice(i, i + 3), "COMBO-3");
+   713→    if (alt && alt.odds >= COMBO_MIN_ODDS && alt.odds <= COMBO_MAX_ODDS) combo3.push(alt);
+   714→  }
+   715→
+   716→  // ── High-Odds Sniper 4.20x–8.50x
+   717→  const sniper: LineItem[] = [];
+   718→  for (const m of approved) {
+   719→    const fav = m.favorite;
+   720→    const favName = fav === "A" ? m.playerA.name : m.playerB.name;
+   721→    const s1A = solveSet(m.markov.gA, m.markov.gB, "A").winA;
+   722→    const sFavSet1 = fav === "A" ? s1A : 1 - s1A;
+   723→    const sFavSet = Math.sqrt(Math.max(m.favWinProb, 0.01));
+   724→    const candidates: { key: string; desc: string; descEn: string; prob: number }[] = [
+   725→      {
+   726→        key: "comeback",
+   727→        desc: `${favName} ست اول را می‌بازد و ۲-۱ کامبک می‌کند`,
+   728→        descEn: `${favName} LOSES SET 1 & WINS 2-1 COMEBACK`,
+   729→        prob: (1 - sFavSet1) * sFavSet * sFavSet,
+   730→      },
+   731→      {
+   732→        key: "tiebreak",
+   733→        desc: `تای‌بریک در ست اول (${m.playerA.shortName} × ${m.playerB.shortName})`,
+   734→        descEn: `TIEBREAK IN SET 1 (${m.playerA.shortName} × ${m.playerB.shortName})`,
+   735→        prob: m.markov.tb1,
+   736→      },
+   737→      {
+   738→        key: "over105",
+   739→        desc: `بیش از 10.5 گیم در ست اول (${m.playerA.shortName} × ${m.playerB.shortName})`,
+   740→        descEn: `OVER 10.5 GAMES 1ST SET (${m.playerA.shortName} × ${m.playerB.shortName})`,
+   741→        prob: m.markov.over105Set1,
+   742→      },
+   743→    ];
+   744→    for (const c of candidates) {
+   745→      if (c.prob <= 0.01) continue;
+   746→      const odds = Math.round((1 / c.prob) * 100) / 100;
+   747→      if (odds < SNIPER_MIN_ODDS || odds > SNIPER_MAX_ODDS) continue;
+   748→      sniper.push({
+   749→        ...baseItem(m),
+   750→        line: "SNIPER",
+   751→        leg: `SNIPER-${c.key}`,
+   752→        desc: c.desc,
+   753→        descEn: c.descEn,
+   754→        odds,
+   755→        prob: c.prob,
+   756→        stake: 1,
+   757→        meta: JSON.stringify({
+   758→          kind: "sniper",
+   759→          snipeKind: c.key,
+   760→          favName,
+   761→          eventKey: m.eventKey,
+   762→        }),
+   763→      });
+   764→      break;
+   765→    }
+   766→  }
+   767→  sniper.sort((a, b) => b.odds - a.odds);
+   768→
+   769→  // v2.0 dedupe — no pick list may contain the same (match, line, leg) twice
+   770→  const dedupe = (items: LineItem[]) =>
+   771→    dedupeByKey(items, (i) => `${i.matchId}|${i.line}|${i.leg}`);
+   772→
+   773→  return {
+   774→    dual: dedupe(dual),
+   775→    combo2: dedupe(combo2),
+   776→    combo3: dedupe(combo3),
+   777→    sniper: dedupe(sniper),
+   778→    shadow: dedupe(shadow),
+   779→  };
+   780→}
+   781→
+   782→// ─── force-refresh helper (used by API) ────────────────────────────────────
+   783→export function todayKeyExport(): string {
+   784→  return todayKey();
+   785→}
+   786→

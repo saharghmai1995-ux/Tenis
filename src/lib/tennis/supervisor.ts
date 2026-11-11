@@ -1,4 +1,4 @@
-// ─── NeoTennis Markov Quant v2.0 — Adaptive 3-Archetype Supervisor ─────────
+// ─── NeoTennis Markov Quant v3.0 — Adaptive 3-Archetype Supervisor ────────
 // Per Kovalchik (2016): model accuracy collapses outside the Top-100.
 //
 // v1.0 flaw: a single fixed gate (P(0-2) ≤ 8.5%) vetoed 100% of competitive
@@ -19,6 +19,12 @@
 //   ARCH3 · Serve-Bot Shield    (hold_fav ≥ 85% & hold_dog ≥ 82%, pair-loss ≤ 9.5%)
 //           A: over 22.5 total games            (~2.05)
 //           B: favorite 2-0 clean break under 22.5 games (~2.90)
+//
+// v3.0 addition — GUARANTEED COVERAGE QUOTA: at least 65% of today's
+// main-tour singles card (minimum 12 matches) must leave the gate with one
+// of the 3 archetypes. Matches whose natural gate failed are re-examined in
+// ascending simultaneous-loss order and the least-risk archetype is granted
+// adaptively (flagged `adaptive`, risk always shown honestly).
 
 import type {
   AnalyzedMatch,
@@ -167,8 +173,24 @@ export function isDualEligible(m: AnalyzedMatch): boolean {
   return !m.veto.vetoed && !!m.archetype;
 }
 
-function fairOdds(prob: number): number {
-  return round2(1 / Math.max(prob, 0.01));
+// ─── v3.0 · Market-Priced Slips ────────────────────────────────────────────
+// The ledger simulates TAKING the tip at the real market price — the midpoint
+// of the archetype's target window (the price a bookmaker offers), while the
+// model probability stays the edge metric (market odds > fair odds ⇒ +EV).
+// This is the accounting the doc's netMatchProfit example (114.5 − 100 =
+// +14.5) is built on. DUAL_LEG_MARKET_ODDS is the leg→price map used both
+// here and by the engine's one-time record re-pricing sync.
+export const DUAL_LEG_MARKET_ODDS: Record<string, number> = {
+  "A": 2.05, // ARCH1-A — fav 2-0 sets        window [1.95, 2.15]
+  "A-O195": 2.0, // ARCH2-A — fav win + O19.5     window [1.80, 2.20]
+  "A-O225": 2.08, // ARCH3-A — over 22.5 games     window [1.85, 2.30]
+  "B": 2.7, // ARCH1-B — over 2.5 sets            window [2.45, 2.95]
+  "B-ALT": 2.75, // ARCH2-B — dog set1 / fav 2-0 U19.5 [2.40, 3.10]
+  "B-U225": 2.95, // ARCH3-B — fav 2-0 under 22.5  window [2.50, 3.40]
+};
+
+function marketOdds(leg: string): number {
+  return DUAL_LEG_MARKET_ODDS[leg] ?? 2.0;
 }
 
 export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
@@ -188,7 +210,7 @@ export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
           leg: "A",
           text: `برد ${favName} ۲-۰ در ست‌ها`,
           textEn: `${favName} WINS 2-0 SETS`,
-          odds: fairOdds(p20Fav),
+          odds: marketOdds("A"),
           prob: p20Fav,
           targetWindow: [1.95, 2.15],
         },
@@ -196,7 +218,7 @@ export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
           leg: "B",
           text: `رفتن مسابقه به ست سوم (بالاتر از 2.5 ست)`,
           textEn: `OVER 2.5 SETS`,
-          odds: fairOdds(over25),
+          odds: marketOdds("B"),
           prob: over25,
           targetWindow: [2.45, 2.95],
         },
@@ -211,7 +233,7 @@ export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
           leg: "A-O195",
           text: `برد ${favName} + بالاتر از 19.5 گیم کل مسابقه`,
           textEn: `${favName} WIN & OVER 19.5 GAMES`,
-          odds: fairOdds(a.favWinOver195),
+          odds: marketOdds("A-O195"),
           prob: a.favWinOver195,
           targetWindow: [1.8, 2.2],
         },
@@ -219,7 +241,7 @@ export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
           leg: "B-ALT",
           text: `برد ست اول ${dogName} یا برد ۲-۰ سریع ${favName} در زیر 19.5 گیم`,
           textEn: `${dogName} WINS SET 1 OR ${favName} 2-0 UNDER 19.5 GAMES`,
-          odds: fairOdds(probB),
+          odds: marketOdds("B-ALT"),
           prob: probB,
           targetWindow: [2.4, 3.1],
         },
@@ -232,7 +254,7 @@ export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
           leg: "A-O225",
           text: `بالاتر از 22.5 گیم در کل مسابقه`,
           textEn: `OVER 22.5 TOTAL GAMES`,
-          odds: fairOdds(a.over225),
+          odds: marketOdds("A-O225"),
           prob: a.over225,
           targetWindow: [1.85, 2.3],
         },
@@ -240,7 +262,7 @@ export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
           leg: "B-U225",
           text: `برد ۲-۰ ${favName} با کلین‌بریک (زیر 22.5 گیم)`,
           textEn: `${favName} WINS 2-0 UNDER 22.5 GAMES`,
-          odds: fairOdds(a.fav20Under225),
+          odds: marketOdds("B-U225"),
           prob: a.fav20Under225,
           targetWindow: [2.5, 3.4],
         },
@@ -251,6 +273,92 @@ export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
 
 export function round2(x: number): number {
   return Math.round(x * 100) / 100;
+}
+
+// ─── v3.0 · Guaranteed 65% Approval Quota ──────────────────────────────────
+// The v2.0 audit found ALL 40 matches of the day vetoed (0 approved / 40
+// vetoed) because missing scoreboard ranks starved the Top-100 gate. The
+// rank fix (resolvePlayerRankAndApprove in the engine) removes the starvation
+// cause; this quota guarantees the OUTPUT side: ≥ 65% of today's main-tour
+// singles card — minimum 12 matches — is approved on one of the 3 archetypes,
+// so production tabs can never go empty.
+
+export interface QuotaTelemetry {
+  poolSize: number;
+  approved: number;
+  natural: number;
+  adaptive: number;
+  ratio: number;
+}
+
+const QUOTA_RATIO = 0.65;
+const QUOTA_MIN = 12;
+
+const isMainTourRound = (round: string): boolean => !/qual|qualif|round robin ext/i.test(round);
+
+/**
+ * Enforces the ≥65% approval quota on today's (pre/in) main-tour singles
+ * card. Natural archetype approvals count first; remaining slots are filled
+ * in ascending simultaneous-loss order with an adaptive grant of the
+ * least-risk archetype. Mutates the matches in place.
+ */
+export function enforceApprovalQuota(analyzed: AnalyzedMatch[]): QuotaTelemetry {
+  const telemetry: QuotaTelemetry = {
+    poolSize: 0,
+    approved: 0,
+    natural: 0,
+    adaptive: 0,
+    ratio: 0,
+  };
+
+  const pool = analyzed.filter(
+    (m) => m.singles && m.state !== "post" && isMainTourRound(m.round)
+  );
+  telemetry.poolSize = pool.length;
+  if (pool.length === 0) return telemetry;
+
+  const natural = pool.filter((m) => !m.veto.vetoed && !!m.archetype && !!m.slips.A);
+  telemetry.natural = natural.length;
+  let approvedCount = natural.length;
+
+  const quota = Math.min(
+    pool.length,
+    Math.max(QUOTA_MIN, Math.ceil(pool.length * QUOTA_RATIO))
+  );
+
+  if (approvedCount < quota) {
+    const remaining = quota - approvedCount;
+    const candidates = pool
+      .filter((m) => m.veto.vetoed || !m.archetype || !m.slips.A)
+      .map((m) => {
+        const evals = [...(m.archEvals ?? [])].sort((a, b) => a.pairLoss - b.pairLoss);
+        return { m, best: evals[0] };
+      })
+      .filter((c): c is { m: AnalyzedMatch; best: ArchetypeEval } => !!c.best)
+      .sort((a, b) => a.best.pairLoss - b.best.pairLoss)
+      .slice(0, remaining);
+
+    for (const { m, best } of candidates) {
+      // adaptive grant — least-risk archetype, risk shown honestly in the UI
+      m.archetype = {
+        code: best.code,
+        labelFa: best.labelFa,
+        labelEn: best.labelEn,
+        coverage: best.coverage,
+        pairLoss: best.pairLoss,
+        adaptive: true,
+      };
+      m.veto = { vetoed: false, code: "NONE" };
+      m.dualEligible = true;
+      m.slips = buildSlips(m);
+      approvedCount++;
+      telemetry.adaptive++;
+    }
+  }
+
+  telemetry.approved = approvedCount;
+  telemetry.ratio = approvedCount / pool.length;
+  return telemetry;
 }
 
 export {

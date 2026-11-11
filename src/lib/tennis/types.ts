@@ -28,6 +28,8 @@ export interface ArchetypeInfo {
   labelEn: string;
   coverage: number; // 1 − pairLoss
   pairLoss: number;
+  /** v3.0 — granted by the 65% supervisor quota (least-risk archetype, risk shown honestly) */
+  adaptive?: boolean;
 }
 
 export interface ArchetypeEval extends ArchetypeInfo {
@@ -255,6 +257,59 @@ export interface LedgerRow {
   createdAt: string;
 }
 
+// ─── v3.0 · Match-Level Dual-Slip Accounting ───────────────────────────────
+/** One wing (slip) of a position — v3.0 keeps both wings inside one match row. */
+export interface LedgerLeg {
+  leg: string; // A | A-O195 | A-O225 | B | B-ALT | B-U225
+  label: string; // تیپ A / تیپ B
+  desc: string;
+  odds: number;
+  stake: number;
+  status: "PENDING" | "WON" | "LOST" | "VOID";
+  prob?: number;
+  /** exact wing P&L: (odds − 1) × stake on win, −stake on loss */
+  profit: number;
+}
+
+/**
+ * v3.0 — ONE row per match in the official SHA-256 record table.
+ * The two complementary slips are two wings of a single position:
+ *   netMatchProfit = winningSlipStake × winningSlipOdds − (stakeA + stakeB)
+ * The match is WON when EITHER wing wins.
+ */
+export interface LedgerMatchRow {
+  id: string; // stable: `${line}:${matchId}`
+  matchId: string;
+  line: ProductionLine; // DUAL | COMBO | SNIPER (SHADOW excluded from official record)
+  matchLabel: string;
+  tournament: string;
+  tour: Tour;
+  surface: Surface;
+  round?: string;
+  archetype?: {
+    code: ArchetypeCode;
+    labelFa: string;
+    labelEn: string;
+    coverage: number;
+    adaptive?: boolean;
+  };
+  /** both wings for DUAL — single wing for COMBO / SNIPER */
+  legs: LedgerLeg[];
+  winnerLeg?: string; // leg code of the winning wing (green tick)
+  status: "PENDING" | "WON" | "LOST";
+  /** total units staked on the match (stakeA + stakeB = 100 for DUAL) */
+  stake: number;
+  /** netMatchProfit — match-level consolidated P&L */
+  profit: number;
+  result?: string; // sets code 2-0 | 2-1 | 1-2 | 0-2
+  setsA?: number;
+  setsB?: number;
+  hash?: string; // pre-match SHA-256 lock
+  espnUrl?: string; // ESPN verification link
+  settledAt?: string;
+  createdAt: string;
+}
+
 export interface LineStats {
   line: ProductionLine;
   picks: number;
@@ -282,10 +337,19 @@ export interface LedgerPayload {
     picks: number;
     settled: number;
     streak: number;
-    bestWin?: LedgerRow;
+    bestWin?: LedgerMatchRow;
   };
   groups: LineStats[];
-  rows: LedgerRow[];
+  /** v3.0 — one consolidated row per match (DUAL grouped, both wings inside) */
+  rows: LedgerMatchRow[];
+  /** v3.0 — match-level supervisor quota telemetry */
+  quota?: {
+    poolSize: number;
+    approved: number;
+    natural: number;
+    adaptive: number;
+    ratio: number;
+  };
   bankCurve: BankPoint[];
 }
 
@@ -310,5 +374,12 @@ export interface FeedPayload {
     windowDays: number;
     historyAnalyzed?: number; // new finished matches processed this build (v2.0)
     historyApproved?: number; // finished matches approved by the 3-archetype gate (v2.0)
+    quota?: {
+      poolSize: number;
+      approved: number;
+      natural: number;
+      adaptive: number;
+      ratio: number;
+    }; // v3.0 — today's 65% approval telemetry
   };
 }

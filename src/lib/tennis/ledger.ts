@@ -1,52 +1,268 @@
-// ─── NeoTennis Markov Quant — Disjoint Ledger & Win-Rate Command Data ──────
-// The 3 production lines + shadow veto ledger are accounted SEPARATELY
-// (disjoint / no double counting). Combined Win Rate excludes SHADOW.
+// ─── NeoTennis Markov Quant v3.0 — Match-Level Consolidated Ledger ─────────
+// BUG FIXED (v2.0 audit): the SHA-256 record table logged TWO rows per match
+// (one for winning slip A, one for losing slip B) which produced the absurd
+// 29 wins / 30 losses (49.2%) next to an 89.7% gauge.
+//
+// v3.0 · Match-Level Dual-Slip Accounting:
+//   · the two complementary slips are TWO WINGS of ONE position per match
+//     (total investment = Stake_A + Stake_B = 100 units);
+//   · the match is WON when EITHER wing wins;
+//   · netMatchProfit = winningSlipStake × winningSlipOdds − (stakeA + stakeB);
+//   · the official record table holds EXACTLY ONE row per match with both
+//     wings shown side by side (winner marked) — the Combined Win Rate, the
+//     bank curve and the table are now one consistent accounting identity.
+// The shadow veto ledger stays disjoint and is excluded from the official
+// record (disjoint / no double counting).
 
 import { db } from "@/lib/db";
-import { dedupeById } from "./dedupe";
+import type { QuotaTelemetry } from "./supervisor";
 import type {
   BankPoint,
+  LedgerLeg,
+  LedgerMatchRow,
   LedgerPayload,
-  LedgerRow,
   LineStats,
   ProductionLine,
+  Surface,
+  Tour,
 } from "./types";
 
 const BANK_START = 1000;
 
-export async function buildLedgerPayload(): Promise<LedgerPayload> {
-  const picks = await db.tennisPick.findMany({
+interface PickWithMatch {
+  id: string;
+  matchId: string;
+  line: string;
+  leg: string;
+  desc: string;
+  odds: number;
+  prob: number;
+  stake: number;
+  meta: string | null;
+  status: string;
+  profit: number | null;
+  settledAt: Date | null;
+  createdAt: Date;
+  match: {
+    eventKey: string;
+    tournament: string;
+    tour: string;
+    surface: string;
+    round: string;
+    playerA: string;
+    playerB: string;
+    hashPre: string | null;
+    resultSetsA: number | null;
+    resultSetsB: number | null;
+    resultCode: string | null;
+  };
+}
+
+interface PickMeta {
+  kind?: string;
+  arch?: string;
+  archLabelFa?: string;
+  archLabelEn?: string;
+  archCoverage?: number;
+  archAdaptive?: boolean;
+  favName?: string;
+  eventKey?: string;
+}
+
+const ARCH_FALLBACK: Record<string, { labelFa: string; labelEn: string }> = {
+  ARCH1: { labelFa: "الگوی ۱ — تسلط فاوریت", labelEn: "Dominant Favorite" },
+  ARCH2: { labelFa: "الگوی ۲ — نبرد نزدیک ستارگان", labelEn: "Competitive Clash" },
+  ARCH3: { labelFa: "الگوی ۳ — سپر دوئل سرویس‌زنان", labelEn: "Serve-Bot Tie-Break Shield" },
+};
+
+function espnUrlOf(eventKey: string): string | undefined {
+  return /^\d+$/.test(eventKey)
+    ? `https://www.espn.com/tennis/match/_/gameId/${eventKey}`
+    : undefined;
+}
+
+/** exact wing P&L — settlement is re-derived (never trusts stale stored profit) */
+function wingProfitOf(status: string, odds: number, stake: number): number {
+  if (status === "WON") return (odds - 1) * stake;
+  if (status === "LOST") return -stake;
+  return 0;
+}
+
+function legLabelOf(leg: string): string {
+  return leg.startsWith("B") ? "تیپ B" : "تیپ A";
+}
+
+function buildLeg(p: PickWithMatch): LedgerLeg {
+  const status = p.status as LedgerLeg["status"];
+  return {
+    leg: p.leg,
+    label: legLabelOf(p.leg),
+    desc: p.desc,
+    odds: p.odds,
+    stake: p.stake,
+    status: status === "PENDING" || status === "VOID" ? "PENDING" : status,
+    prob: p.prob,
+    profit: wingProfitOf(status, p.odds, p.stake),
+  };
+}
+
+function parseMeta(metaStr: string | null): PickMeta {
+  try {
+    return metaStr ? (JSON.parse(metaStr) as PickMeta) : {};
+  } catch {
+    return {};
+  }
+}
+
+export async function buildLedgerPayload(
+  quota?: QuotaTelemetry
+): Promise<LedgerPayload> {
+  const picks = (await db.tennisPick.findMany({
     include: { match: true },
     orderBy: { createdAt: "asc" },
+  })) as unknown as PickWithMatch[];
+
+  // de-id dupes defensively
+  const byId = new Map<string, PickWithMatch>();
+  for (const p of picks) if (!byId.has(p.id)) byId.set(p.id, p);
+  const all = [...byId.values()];
+
+  // ── v3.0 · group the DUAL hedge into ONE match row ────────────────────────
+  interface DualAgg {
+    matchId: string;
+    legs: LedgerLeg[];
+    match: PickWithMatch["match"];
+    meta: PickMeta;
+    stake: number;
+    anyPending: boolean;
+    winner?: LedgerLeg;
+    settledAt: string;
+    createdAt: string;
+  }
+  const dual = new Map<string, DualAgg>();
+  const singles: { p: PickWithMatch; leg: LedgerLeg }[] = [];
+
+  for (const p of all) {
+    const leg = buildLeg(p);
+    if (p.line === "DUAL") {
+      const agg = dual.get(p.matchId) ?? {
+        matchId: p.matchId,
+        legs: [],
+        match: p.match,
+        meta: parseMeta(p.meta),
+        stake: 0,
+        anyPending: false,
+        settledAt: (p.settledAt ?? p.createdAt).toISOString(),
+        createdAt: p.createdAt.toISOString(),
+      };
+      // prefer the meta of wing A (carries the archetype lock)
+      if (leg.leg.startsWith("A") && !agg.meta.arch && parseMeta(p.meta).arch) {
+        agg.meta = parseMeta(p.meta);
+      }
+      agg.legs.push(leg);
+      agg.stake += leg.stake;
+      if (leg.status === "PENDING") agg.anyPending = true;
+      if (leg.status === "WON") agg.winner = leg;
+      const t = (p.settledAt ?? p.createdAt).toISOString();
+      if (t > agg.settledAt) agg.settledAt = t;
+      dual.set(p.matchId, agg);
+    } else if (p.line === "COMBO" || p.line === "SNIPER") {
+      singles.push({ p, leg });
+    }
+    // SHADOW rows stay in the disjoint shadow ledger — never in the record
+  }
+
+  const dualRows: LedgerMatchRow[] = [...dual.values()].map((a) => {
+    const decided = !a.anyPending && a.legs.every((l) => l.status !== "PENDING");
+    const status: LedgerMatchRow["status"] = !decided
+      ? "PENDING"
+      : a.winner
+        ? "WON"
+        : "LOST";
+    // doc formula: netMatchProfit = Σ(winningSlipStake × winningSlipOdds) − (stakeA + stakeB)
+    // (ARCH2 wings can BOTH win — fav loses set 1 then wins 2-1 — every
+    // winning wing is settled into the match-level net)
+    const wonReturn = a.legs
+      .filter((l) => l.status === "WON")
+      .reduce((s, l) => s + l.odds * l.stake, 0);
+    const profit = !decided ? 0 : wonReturn > 0 ? wonReturn - a.stake : -a.stake;
+    const archCode = a.meta.arch;
+    const fallback = archCode ? ARCH_FALLBACK[archCode] : undefined;
+    return {
+      id: `DUAL:${a.matchId}`,
+      matchId: a.matchId,
+      line: "DUAL" as ProductionLine,
+      matchLabel: `${a.match.playerA} × ${a.match.playerB}`,
+      tournament: a.match.tournament,
+      tour: a.match.tour as Tour,
+      surface: a.match.surface as Surface,
+      round: a.match.round,
+      archetype:
+        archCode && fallback
+          ? {
+              code: archCode as "ARCH1" | "ARCH2" | "ARCH3",
+              labelFa: a.meta.archLabelFa ?? fallback.labelFa,
+              labelEn: a.meta.archLabelEn ?? fallback.labelEn,
+              coverage: a.meta.archCoverage ?? 0,
+              adaptive: a.meta.archAdaptive,
+            }
+          : undefined,
+      legs: a.legs.sort((x, y) => x.leg.localeCompare(y.leg)),
+      winnerLeg: a.winner?.leg,
+      status,
+      stake: a.stake,
+      profit: Math.round(profit * 100) / 100,
+      result: a.match.resultCode ?? undefined,
+      setsA: a.match.resultSetsA ?? undefined,
+      setsB: a.match.resultSetsB ?? undefined,
+      hash: a.match.hashPre ?? undefined,
+      espnUrl: espnUrlOf(a.match.eventKey),
+      settledAt: decided ? a.settledAt : undefined,
+      createdAt: a.createdAt,
+    };
   });
 
-  const rows: LedgerRow[] = dedupeById(
-    picks.map((p) => ({
-      id: p.id,
-      matchId: p.matchId, // v2.0 — pair-level hedge accounting
+  const singleRows: LedgerMatchRow[] = singles.map(({ p, leg }) => {
+    const decided = leg.status === "WON" || leg.status === "LOST";
+    return {
+      id: `${p.line}:${p.id}`,
+      matchId: p.matchId,
       line: p.line as ProductionLine,
-      leg: p.leg,
-      desc: p.desc,
-      odds: p.odds,
-      stake: p.stake,
-      status: p.status as LedgerRow["status"],
-      profit: p.profit ?? undefined,
-      settledAt: p.settledAt?.toISOString(),
       matchLabel: `${p.match.playerA} × ${p.match.playerB}`,
       tournament: p.match.tournament,
-      surface: p.match.surface as LedgerRow["surface"],
+      tour: p.match.tour as Tour,
+      surface: p.match.surface as Surface,
+      round: p.match.round,
+      legs: [leg],
+      winnerLeg: leg.status === "WON" ? leg.leg : undefined,
+      status: decided ? (leg.status as "WON" | "LOST") : "PENDING",
+      stake: leg.stake,
+      profit: Math.round(leg.profit * 100) / 100,
       result: p.match.resultCode ?? undefined,
-      hash: p.match.hashPre ?? undefined, // v2.0 — SHA-256 record table
+      setsA: p.match.resultSetsA ?? undefined,
+      setsB: p.match.resultSetsB ?? undefined,
+      hash: p.match.hashPre ?? undefined,
+      espnUrl: espnUrlOf(p.match.eventKey),
+      settledAt: (p.settledAt ?? undefined)?.toISOString(),
       createdAt: p.createdAt.toISOString(),
-    }))
-  );
+    };
+  });
 
-  const groupOf = (line: ProductionLine): LineStats => {
-    const rs = rows.filter((r) => r.line === line);
+  // latest first, bounded
+  const rows = [...dualRows, ...singleRows]
+    .sort(
+      (a, b) =>
+        (b.settledAt ?? b.createdAt).localeCompare(a.settledAt ?? a.createdAt)
+    )
+    .slice(0, 80);
+
+  // ── disjoint line stats (DUAL at MATCH level, others per pick) ────────────
+  const lineStatsOf = (line: ProductionLine, rs: LedgerMatchRow[]): LineStats => {
     const won = rs.filter((r) => r.status === "WON").length;
     const lost = rs.filter((r) => r.status === "LOST").length;
     const pending = rs.filter((r) => r.status === "PENDING").length;
-    const profit = rs.reduce((s, r) => s + (r.profit ?? 0), 0);
+    const profit = rs.reduce((s, r) => s + r.profit, 0);
+    const stake = rs.reduce((s, r) => s + r.stake, 0);
     const decided = won + lost;
     return {
       line,
@@ -55,80 +271,54 @@ export async function buildLedgerPayload(): Promise<LedgerPayload> {
       lost,
       pending,
       winRate: decided > 0 ? won / decided : 0,
-      profit,
-      roi: rs.reduce((s, r) => s + r.stake, 0) > 0 ? profit / rs.reduce((s, r) => s + r.stake, 0) : 0,
+      profit: Math.round(profit * 100) / 100,
+      roi: stake > 0 ? profit / stake : 0,
     };
   };
 
-  // ── v2.0 pair-level accounting for the DUAL hedge ─────────────────────────
-  // The supervisor locks the PAIR (leg A + complementary leg B): the hedge
-  // wins when EITHER leg wins. Combined Win Rate is therefore a coverage
-  // metric computed at pair level — the doc target (~91%+) — while the bank
-  // curve keeps exact per-leg P&L accounting.
-  interface PairAgg {
-    key: string;
-    won: boolean;
-    lost: boolean;
-    anyPending: boolean;
-    profit: number;
-    stake: number;
-    matchLabel: string;
-    settledAt: string;
-  }
-  const pairs = new Map<string, PairAgg>();
-  for (const r of rows.filter((r) => r.line === "DUAL")) {
-    const p = pairs.get(r.matchId) ?? {
-      key: r.matchId,
-      won: false,
-      lost: false,
-      anyPending: false,
-      profit: 0,
-      stake: 0,
-      matchLabel: r.matchLabel,
-      settledAt: r.settledAt ?? r.createdAt,
-    };
-    if (r.status === "WON") p.won = true;
-    else if (r.status === "LOST") p.lost = true;
-    else if (r.status === "PENDING") p.anyPending = true;
-    p.profit += r.profit ?? 0;
-    p.stake += r.stake;
-    const t = r.settledAt ?? r.createdAt;
-    if (t > p.settledAt) p.settledAt = t;
-    pairs.set(r.matchId, p);
-  }
-  const pairList = [...pairs.values()];
-  const pairDecided = pairList.filter((p) => p.won || p.lost);
-  const pairWon = pairDecided.filter((p) => p.won).length;
-  const pairLost = pairDecided.length - pairWon;
-
   const groups: LineStats[] = [
-    {
-      ...groupOf("DUAL"),
-      // win-rate shown at pair (coverage) level; won/lost stay leg-level detail
-      winRate: pairDecided.length > 0 ? pairWon / pairDecided.length : 0,
-    },
-    groupOf("COMBO"),
-    groupOf("SNIPER"),
-    groupOf("SHADOW"),
+    lineStatsOf("DUAL", dualRows),
+    lineStatsOf("COMBO", singleRows.filter((r) => r.line === "COMBO")),
+    lineStatsOf("SNIPER", singleRows.filter((r) => r.line === "SNIPER")),
+    lineStatsOf(
+      "SHADOW",
+      all
+        .filter((p) => p.line === "SHADOW")
+        .map((p) => ({
+          id: `SHADOW:${p.id}`,
+          matchId: p.matchId,
+          line: "SHADOW" as ProductionLine,
+          matchLabel: `${p.match.playerA} × ${p.match.playerB}`,
+          tournament: p.match.tournament,
+          tour: p.match.tour as Tour,
+          surface: p.match.surface as Surface,
+          legs: [buildLeg(p)],
+          status: (p.status === "WON" ? "WON" : p.status === "LOST" ? "LOST" : "PENDING") as
+            | "PENDING"
+            | "WON"
+            | "LOST",
+          stake: p.stake,
+          profit: Math.round(wingProfitOf(p.status, p.odds, p.stake) * 100) / 100,
+          createdAt: p.createdAt.toISOString(),
+        }))
+    ),
   ];
 
-  // combined stats exclude the shadow ledger (pair-level for DUAL)
-  const mainRows = rows.filter((r) => r.line !== "SHADOW" && r.status !== "PENDING" && r.status !== "VOID");
-  const otherWon = mainRows.filter((r) => r.line !== "DUAL" && r.status === "WON").length;
-  const otherDecided = mainRows.filter((r) => r.line !== "DUAL").length;
-  const combinedDecided = pairDecided.length + otherDecided;
-  const combinedWonCount = pairWon + otherWon;
-  const combinedProfit = mainRows.reduce((s, r) => s + (r.profit ?? 0), 0);
-  const combinedStake = mainRows.reduce((s, r) => s + r.stake, 0);
+  // ── combined stats (official record only — shadow excluded, match level) ──
+  const official = [...dualRows, ...singleRows];
+  const decidedRows = official.filter((r) => r.status !== "PENDING");
+  const combinedWonCount = decidedRows.filter((r) => r.status === "WON").length;
+  const combinedProfit = decidedRows.reduce((s, r) => s + r.profit, 0);
+  const combinedStake = decidedRows.reduce((s, r) => s + r.stake, 0);
 
-  // bank curve over settled main-line picks (chronological, exact per-leg P&L)
-  const settledMain = [...mainRows].sort(
+  // bank curve over decided rows (chronological, match-level P&L for DUAL)
+  const chronological = [...decidedRows].sort(
     (a, b) => (a.settledAt ?? a.createdAt).localeCompare(b.settledAt ?? b.createdAt)
   );
   const bankCurve: BankPoint[] = [{ index: 0, bank: BANK_START, label: "START" }];
   let bank = BANK_START;
-  settledMain.forEach((r, i) => {
-    bank += r.profit ?? 0;
+  chronological.forEach((r, i) => {
+    bank += r.profit;
     bankCurve.push({
       index: i + 1,
       bank: Math.round(bank * 100) / 100,
@@ -136,16 +326,11 @@ export async function buildLedgerPayload(): Promise<LedgerPayload> {
     });
   });
 
-  // current streak — pair-aware (DUAL pairs collapse to one result event)
-  const resultEvents: { status: "WON" | "LOST"; at: string }[] = [
-    ...pairDecided.map((p) => ({
-      status: (p.won ? "WON" : "LOST") as "WON" | "LOST",
-      at: p.settledAt,
-    })),
-    ...mainRows
-      .filter((r) => r.line !== "DUAL")
-      .map((r) => ({ status: r.status as "WON" | "LOST", at: r.settledAt ?? r.createdAt })),
-  ].sort((a, b) => a.at.localeCompare(b.at));
+  // current streak — one result event per match (DUAL collapsed)
+  const resultEvents = chronological.map((r) => ({
+    status: r.status as "WON" | "LOST",
+    at: r.settledAt ?? r.createdAt,
+  }));
   let streak = 0;
   for (let i = resultEvents.length - 1; i >= 0; i--) {
     const s = resultEvents[i].status;
@@ -158,24 +343,25 @@ export async function buildLedgerPayload(): Promise<LedgerPayload> {
     }
   }
 
-  const bestWin = rows
+  const bestWin = [...official]
     .filter((r) => r.status === "WON")
-    .sort((a, b) => (b.profit ?? 0) - (a.profit ?? 0))[0];
+    .sort((a, b) => b.profit - a.profit)[0];
 
   return {
     stats: {
-      combinedWinRate: combinedDecided > 0 ? combinedWonCount / combinedDecided : 0,
+      combinedWinRate: decidedRows.length > 0 ? combinedWonCount / decidedRows.length : 0,
       bank: Math.round(bank * 100) / 100,
       bankStart: BANK_START,
       profit: Math.round(combinedProfit * 100) / 100,
       roi: combinedStake > 0 ? combinedProfit / combinedStake : 0,
-      picks: rows.length,
-      settled: combinedDecided,
+      picks: official.length,
+      settled: decidedRows.length,
       streak,
       bestWin,
     },
     groups,
-    rows: rows.slice(-80).reverse(), // latest first, bounded
+    rows,
+    quota,
     bankCurve,
   };
 }

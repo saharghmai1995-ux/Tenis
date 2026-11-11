@@ -7,7 +7,6 @@ import {
   Banknote,
   Crown,
   Flame,
-  Gauge,
   Layers,
   Scale,
   ShieldOff,
@@ -22,6 +21,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { GyroGauge } from "@/components/tennis/gyro-gauge";
 import type { LedgerPayload, ProductionLine } from "@/lib/tennis/types";
 
 const LINE_LABELS: Record<ProductionLine, string> = {
@@ -37,82 +37,6 @@ const LINE_COLORS: Record<ProductionLine, string> = {
   SNIPER: "text-rose-300",
   SHADOW: "text-muted-foreground",
 };
-
-// ─── Animated semicircle win-rate gauge ────────────────────────────────────
-function WinRateGauge({ rate }: { rate: number }) {
-  const pct = Math.max(0, Math.min(1, rate));
-  // semicircle from 180° → 0°
-  const radius = 80;
-  const cx = 110;
-  const cy = 104;
-  const arcLen = Math.PI * radius;
-  const filled = arcLen * pct;
-  const angle = Math.PI * (1 - pct);
-  const needleX = cx + radius * Math.cos(angle);
-  const needleY = cy - radius * Math.sin(angle);
-
-  return (
-    <div className="relative flex flex-col items-center">
-      <svg viewBox="0 0 220 132" className="w-full max-w-[240px]">
-        <defs>
-          <linearGradient id="gaugeGrad" x1="0" y1="0" x2="1" y2="0">
-            <stop offset="0%" stopColor="#fb7185" />
-            <stop offset="55%" stopColor="#fbbf24" />
-            <stop offset="100%" stopColor="#34d399" />
-          </linearGradient>
-        </defs>
-        <path
-          d={`M ${cx - radius} ${cy} A ${radius} ${radius} 0 0 1 ${cx + radius} ${cy}`}
-          fill="none"
-          stroke="rgba(255,255,255,0.08)"
-          strokeWidth="14"
-          strokeLinecap="round"
-        />
-        <path
-          d={`M ${cx - radius} ${cy} A ${radius} ${radius} 0 0 1 ${cx + radius} ${cy}`}
-          fill="none"
-          stroke="url(#gaugeGrad)"
-          strokeWidth="14"
-          strokeLinecap="round"
-          strokeDasharray={`${filled} ${arcLen}`}
-          style={{ transition: "stroke-dasharray 1.1s cubic-bezier(0.22,1,0.36,1)" }}
-        />
-        {/* needle */}
-        <line
-          x1={cx}
-          y1={cy}
-          x2={needleX}
-          y2={needleY}
-          stroke="white"
-          strokeWidth="2.5"
-          strokeLinecap="round"
-          style={{ transition: "all 1.1s cubic-bezier(0.22,1,0.36,1)" }}
-        />
-        <circle cx={cx} cy={cy} r="5" fill="#f5c542" />
-        <text
-          x={cx}
-          y={cy - 26}
-          textAnchor="middle"
-          className="mono-num"
-          fill="white"
-          fontSize="30"
-          fontWeight="800"
-        >
-          {(pct * 100).toFixed(1)}%
-        </text>
-        <text
-          x={cx}
-          y={cy - 8}
-          textAnchor="middle"
-          fill="rgba(255,255,255,0.5)"
-          fontSize="10"
-        >
-          COMBINED WIN RATE
-        </text>
-      </svg>
-    </div>
-  );
-}
 
 // ─── Bank growth curve (custom SVG area) ───────────────────────────────────
 function BankCurve({ bank, start }: { bank: number; start: number }) {
@@ -159,12 +83,13 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
   const { stats, groups } = ledger;
   const streakUp = stats.streak > 0;
   const best = stats.bestWin;
+  const dualGroup = groups.find((g) => g.line === "DUAL");
 
   const kpis = [
     {
       icon: Banknote,
       label: "بانک ۱۰۰۰ واحدی",
-      // v2.0 font fix — latin digits only inside mono-num
+      // v3.0 — financial figures always ride mono tabular-nums capsules
       value: stats.bank.toLocaleString("en-US"),
       hint: `${stats.profit >= 0 ? "+" : ""}${stats.profit.toFixed(1)} واحد`,
       tone: stats.profit >= 0 ? "text-emerald-300" : "text-rose-300",
@@ -173,20 +98,19 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
       icon: Scale,
       label: "بازده روی سرمایه",
       value: `${(stats.roi * 100).toFixed(1)}%`,
-      hint: `${stats.settled} تیپ تسویه‌شده`,
+      hint: `${stats.settled} مسابقه/تیپ تسویه‌شده`,
       tone: stats.roi >= 0 ? "text-emerald-300" : "text-rose-300",
     },
     {
       icon: Flame,
       label: "رگبار فعلی",
-      // v2.0 font fix — Persian word removed from the mono cell
       value: `${stats.streak}`,
       hint: streakUp ? "برد پیاپی آخرین تیپ‌ها" : "باخت پیاپی آخرین تیپ‌ها",
       tone: streakUp ? "text-amber-300" : "text-rose-300",
     },
     {
       icon: Layers,
-      label: "کل تیپ‌های دفترکل",
+      label: "کل پوزیشن‌های دفترکل",
       value: `${stats.picks}`,
       hint: `${groups.reduce((s, g) => s + g.pending, 0)} در انتظار نتیجه`,
       tone: "text-white",
@@ -196,28 +120,47 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
   return (
     <section aria-label="مرکز فرماندهی وین‌ریت" className="space-y-4">
       <div className="grid gap-4 lg:grid-cols-3">
-        {/* gauge */}
-        <Card className="glass-card rise-in">
+        {/* v3.0 — 3D multi-ring gyroscope */}
+        <Card className="spatial-card neon-conic rise-in rounded-2xl">
           <CardHeader className="pb-0">
             <CardTitle className="flex items-center gap-2 text-sm font-bold">
-              <Gauge className="h-4 w-4 text-amber-300" />
-              مرکز فرماندهی وین‌ریت
+              <Flame className="h-4 w-4 text-amber-300" />
+              گیج ژیروسکوپی سه‌بعدی وین‌ریت
             </CardTitle>
           </CardHeader>
           <CardContent className="pt-2">
-            <WinRateGauge rate={stats.combinedWinRate} />
+            <GyroGauge
+              rate={stats.combinedWinRate}
+              dualRate={dualGroup ? dualGroup.winRate : 0}
+              roiRate={Math.max(0, stats.roi)}
+            />
             <p className="text-center text-[11px] text-muted-foreground">
-              تجمیع ۳ خط تولید — تسویه خودکار ۷ روزه ESPN — دفتر سایه جداست
+              تجمیع ۳ خط تولید — تسویه خودکار ۷ روزه ESPN — حسابداری در سطح مسابقه
             </p>
+            {ledger.quota && ledger.quota.poolSize > 0 && (
+              <div className="mt-2 flex items-center justify-center gap-2 text-[10px] text-muted-foreground">
+                <span className="num-capsule text-[10px] text-amber-300">
+                  {ledger.quota.approved}/{ledger.quota.poolSize}
+                </span>
+                تایید سوپروایزر (
+                <span className="mono-num">{(ledger.quota.ratio * 100).toFixed(0)}%</span>
+                {ledger.quota.adaptive > 0 && (
+                  <>
+                    {" "}· <span className="mono-num">{ledger.quota.adaptive}</span> سازگار
+                  </>
+                )}
+                )
+              </div>
+            )}
           </CardContent>
         </Card>
 
         {/* bank curve */}
-        <Card className="glass-card rise-in lg:col-span-2">
+        <Card className="spatial-card rise-in rounded-2xl lg:col-span-2">
           <CardHeader className="pb-0">
             <CardTitle className="flex items-center gap-2 text-sm font-bold">
               <Banknote className="h-4 w-4 text-emerald-300" />
-              منحنی رشد بانک ۱۰۰۰ واحدی
+              منحنی رشد بانک ۱۰۰۰ واحدی — حسابداری سطح مسابقه
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-2 pt-2">
@@ -229,7 +172,9 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
                     <k.icon className="h-3 w-3" />
                     {k.label}
                   </div>
-                  <div className={`mono-num mt-1 text-lg font-bold ${k.tone}`}>{k.value}</div>
+                  <div className={`mono-num mt-1 text-lg font-bold ${k.tone}`} dir="ltr">
+                    {k.value}
+                  </div>
                   <div className="text-[10px] text-muted-foreground">{k.hint}</div>
                 </div>
               ))}
@@ -239,13 +184,13 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
       </div>
 
       {/* disjoint ledger */}
-      <Card className="glass-card rise-in">
+      <Card className="spatial-card rise-in rounded-2xl">
         <CardHeader className="pb-2">
           <CardTitle className="flex flex-wrap items-center gap-2 text-sm font-bold">
             <ShieldOff className="h-4 w-4 text-amber-300" />
             دفترکل افرازی (Disjoint Ledger)
             <span className="text-[11px] font-normal text-muted-foreground">
-              — هر خط تولید مستقل تسویه می‌شود؛ وین‌ریت زوج‌تیپ در سطح جفت (پوشش) محاسبه می‌شود؛ وتوها فقط در دفتر سایه
+              — زوج‌تیپ در سطح مسابقه تسویه می‌شود (دو بالِ یک پوزیشن)؛ وتوها فقط در دفتر سایه
             </span>
           </CardTitle>
         </CardHeader>
@@ -255,8 +200,8 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
                   <TableHead className="text-xs">خط تولید</TableHead>
-                  <TableHead className="text-xs">تیپ</TableHead>
-                  <TableHead className="text-xs">برد</TableHead>
+                  <TableHead className="text-xs">پوزیشن</TableHead>
+                  <TableHead className="text-xs">برد / باخت</TableHead>
                   <TableHead className="text-xs">وین‌ریت</TableHead>
                   <TableHead className="text-xs">سود</TableHead>
                 </TableRow>
@@ -267,16 +212,19 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
                     <TableCell className={`text-xs font-bold ${LINE_COLORS[g.line]}`}>
                       {LINE_LABELS[g.line]}
                     </TableCell>
-                    <TableCell className="mono-num text-xs">
+                    <TableCell className="mono-num text-xs" dir="ltr">
                       {g.picks}
                       <span className="text-muted-foreground"> ({g.pending}⏳)</span>
                     </TableCell>
-                    <TableCell className="mono-num text-xs">{g.won} / {g.lost}</TableCell>
-                    <TableCell className="mono-num text-xs">
+                    <TableCell className="mono-num text-xs" dir="ltr">
+                      {g.won} / {g.lost}
+                    </TableCell>
+                    <TableCell className="mono-num text-xs" dir="ltr">
                       {g.picks - g.pending > 0 ? `${(g.winRate * 100).toFixed(0)}%` : "—"}
                     </TableCell>
                     <TableCell
                       className={`mono-num text-xs ${g.profit >= 0 ? "text-emerald-300" : "text-rose-300"}`}
+                      dir="ltr"
                     >
                       {g.profit >= 0 ? "+" : ""}
                       {g.profit.toFixed(1)}
@@ -312,24 +260,23 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
               <div className="rounded-xl border border-amber-300/20 bg-amber-300/5 p-3">
                 <div className="flex items-center gap-2 text-xs font-bold text-amber-300">
                   <Crown className="h-3.5 w-3.5" />
-                  بهترین برد دفترکل
+                  بهترین برد دفترکل (سطح مسابقه)
                 </div>
                 <p className="mt-1.5 text-[11px] leading-5 text-muted-foreground">
-                  {best.matchLabel} — <span className="mono-num">@{best.odds.toFixed(2)}</span>{" "}
+                  {best.matchLabel} — <span className="num-capsule text-[10px]">@{best.legs[0]?.odds.toFixed(2)}</span>{" "}
                   ({LINE_LABELS[best.line]})
                 </p>
                 <p className="mt-1 flex items-center gap-1 text-sm font-bold" dir="ltr">
-                  {best.profit && best.profit > 0 ? (
+                  {best.profit > 0 ? (
                     <ArrowUpRight className="h-4 w-4 text-emerald-300" />
                   ) : (
                     <ArrowDownRight className="h-4 w-4 text-rose-300" />
                   )}
-                  {/* v2.0 font fix — number isolated in mono span */}
-                  <span className={`mono-num ${best.profit && best.profit > 0 ? "text-emerald-300" : "text-rose-300"}`}>
-                    {best.profit && best.profit > 0 ? "+" : ""}
-                    {(best.profit ?? 0).toFixed(1)}
+                  <span className={`mono-num ${best.profit > 0 ? "text-emerald-300" : "text-rose-300"}`}>
+                    {best.profit > 0 ? "+" : ""}
+                    {best.profit.toFixed(1)}
                   </span>
-                  <span className="text-muted-foreground">واحد</span>
+                  <span className="font-sans text-muted-foreground" dir="rtl">واحد</span>
                 </p>
               </div>
             )}
