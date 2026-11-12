@@ -17,7 +17,16 @@ import { fetchPolymarketOdds, matchMarket } from "./polymarket";
 import { fetchCityWeather } from "./weather";
 import { fullMarkov, matchWinProbA, solveSet } from "./markov";
 import { removeMargin, reverseAnalysis } from "./solver";
-import { buildSlips, evaluateArchetypes, isDualEligible, supervisorGate, enforceApprovalQuota, DUAL_LEG_MARKET_ODDS } from "./supervisor";
+import {
+  buildSlips,
+  dutchStakes,
+  dualStakeFor,
+  evaluateArchetypes,
+  isDualEligible,
+  supervisorGate,
+  enforceApprovalQuota,
+  DUAL_LEG_MARKET_ODDS,
+} from "./supervisor";
 import type { QuotaTelemetry } from "./supervisor";
 import { canonicalMatchString, sha256 } from "./hash";
 import { extractSettleableResult, runSettlement } from "./settlement";
@@ -29,6 +38,7 @@ import type {
   FeedPayload,
   LineItem,
   MarketOdds,
+  MixLeg,
   NewsItem,
   RankRow,
   SourceStatus,
@@ -495,24 +505,20 @@ async function processHistorySettlement(
 }
 
 // ─── v3.0 · Dual-Slip Accounting Sync ──────────────────────────────────────
-// 1) every DUAL leg rides the 50+50=100-unit match position scale
-//    (the v2.0 audit caught the 1-unit legs producing the 997.76 bank);
+// 1) every DUAL wing rides its official market price and its exact dutching
+//    stake (equal-profit split of the 100-unit match position);
 // 2) when a match is re-picked under the current archetype, its stale legs
 //    from an older build are removed — the record keeps EXACTLY the two
 //    complementary wings of the live archetype (never 4 legs per match).
 async function syncDualAccounting(items: LineItem[]) {
   try {
-    await db.tennisPick.updateMany({
-      where: { line: "DUAL" },
-      data: { stake: 50 },
-    });
-    // v3.0 — re-price every stored DUAL wing to its market-band price so the
-    // whole 7-day record obeys one accounting identity (netMatchProfit =
-    // winningSlip × marketOdds − 100)
+    // v4.0 — every DUAL wing rides its official market price AND its exact
+    // dutching stake (equal-profit split of the 100-unit match budget);
+    // legacy v2/v3 legs keep their historical price + 50/50 split.
     for (const [leg, odds] of Object.entries(DUAL_LEG_MARKET_ODDS)) {
       await db.tennisPick.updateMany({
         where: { line: "DUAL", leg, odds: { not: odds } },
-        data: { odds },
+        data: { odds, stake: dualStakeFor(leg) },
       });
     }
     const byMatch = new Map<string, Set<string>>();
@@ -655,6 +661,13 @@ const SNIPER_MIN_ODDS = 4.2;
 const SNIPER_MAX_ODDS = 7.5;
 const SNIPER_GUARANTEE = 5;
 
+/** ESPN match page for the click-to-verify hash modal (v4.0). */
+function espnMatchUrl(eventKey: string): string | undefined {
+  return /^\d+$/.test(eventKey)
+    ? `https://www.espn.com/tennis/match/_/gameId/${eventKey}`
+    : undefined;
+}
+
 function baseItem(m: AnalyzedMatch): Omit<
   LineItem,
   "line" | "leg" | "desc" | "descEn" | "odds" | "prob" | "stake"
@@ -675,17 +688,30 @@ function baseItem(m: AnalyzedMatch): Omit<
     timing: m.timing,
     hashPre: m.hashPre,
     archetype: m.archetype,
+    // ─── v4.0 · Rich Telemetry Flashcards ──────────────────────────────
+    eventKey: m.eventKey,
+    playerAShort: m.playerA.shortName,
+    playerBShort: m.playerB.shortName,
+    flagA: m.playerA.flagUrl,
+    flagB: m.playerB.flagUrl,
+    seedA: m.playerA.seed,
+    seedB: m.playerB.seed,
+    holdA: m.markov.gA,
+    holdB: m.markov.gB,
+    bpsA: m.markov.bpsA,
+    bpsB: m.markov.bpsB,
   };
 }
 
 /** The two complementary DUAL legs of an approved match (archetype-aware).
- *  v3.0 — Match-Level Dual-Slip Accounting: the two wings are ONE position
- *  on the match; total investment = Stake_A + Stake_B = 100 units (50/50). */
+ *  v4.0 — Official Atomic Markets: each wing is ONE standard single-button
+ *  bookmaker market; the 100-unit match budget is split by equal-profit
+ *  dutching (stake ∝ 1/odds) so every outcome pays the same return. */
 function dualItemsOf(m: AnalyzedMatch): LineItem[] {
   if (!m.slips.A || !m.slips.B) return [];
   const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
   const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
-  const DUAL_STAKE_PER_LEG = 50; // 50 + 50 = 100 units per match (doc formula)
+  const { stakeA, stakeB } = dutchStakes(m.slips.A.odds, m.slips.B.odds);
   return [
     {
       ...baseItem(m),
@@ -695,9 +721,13 @@ function dualItemsOf(m: AnalyzedMatch): LineItem[] {
       descEn: m.slips.A.textEn,
       odds: m.slips.A.odds,
       prob: m.slips.A.prob,
-      stake: DUAL_STAKE_PER_LEG,
+      stake: stakeA,
+      stakePct: stakeA,
       slipProbA: m.slips.A.prob,
       slipProbB: m.slips.B.prob,
+      marketEn: m.slips.A.marketEn,
+      marketFa: m.slips.A.marketFa,
+      espnUrl: espnMatchUrl(m.eventKey),
       meta: JSON.stringify({
         kind: "dualA",
         arch: m.archetype?.code,
@@ -706,6 +736,8 @@ function dualItemsOf(m: AnalyzedMatch): LineItem[] {
         archCoverage: m.archetype?.coverage,
         archAdaptive: m.archetype?.adaptive,
         favName,
+        marketEn: m.slips.A.marketEn,
+        stakePct: stakeA,
         eventKey: m.eventKey,
       }),
     },
@@ -717,14 +749,20 @@ function dualItemsOf(m: AnalyzedMatch): LineItem[] {
       descEn: m.slips.B.textEn,
       odds: m.slips.B.odds,
       prob: m.slips.B.prob,
-      stake: DUAL_STAKE_PER_LEG,
+      stake: stakeB,
+      stakePct: stakeB,
       slipProbA: m.slips.A.prob,
       slipProbB: m.slips.B.prob,
+      marketEn: m.slips.B.marketEn,
+      marketFa: m.slips.B.marketFa,
+      espnUrl: espnMatchUrl(m.eventKey),
       meta: JSON.stringify({
         kind: "dualB",
         arch: m.archetype?.code,
         favName,
         dogName,
+        marketEn: m.slips.B.marketEn,
+        stakePct: stakeB,
         eventKey: m.eventKey,
       }),
     },
@@ -777,6 +815,8 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
   // generated over sliding windows of the strongest favorites; the primary
   // odds window is 2.80x–5.80x and a fallback window (2.20x–7.20x) fills the
   // guarantee so the tab can never be empty.
+  // v4.0 — every combo is rendered as an official Multi-Match Parlay Slip
+  // whose bases are Match Winner markets, with a 25-unit suggested stake.
   const approved = analyzed.filter(
     (m) => !m.veto.vetoed && m.state !== "post" && m.favWinProb > 0.55
   );
@@ -788,26 +828,49 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
     if (legs.length < 2) return null;
     let prob = 1;
     let odds = 1;
-    const names: string[] = [];
     const favorites: { name: string; eventKey: string }[] = [];
+    // v4.0 — each base of the parlay is the OFFICIAL single-button market
+    // «Match Winner — {favorite}», listed leg-by-leg on the slip card
+    const legRows: MixLeg[] = [];
     for (const l of legs) {
       const fav = l.favorite === "A" ? l.playerA.name : l.playerB.name;
+      const dog = l.favorite === "A" ? l.playerB.name : l.playerA.name;
+      const legOdds = Math.round((1 / Math.max(l.favWinProb, 0.01)) * 100) / 100;
       prob *= l.favWinProb;
       odds *= 1 / l.favWinProb;
-      names.push(`${fav} WIN`);
       favorites.push({ name: fav, eventKey: l.eventKey });
+      legRows.push({
+        favName: fav,
+        dogName: dog,
+        favShort: l.favorite === "A" ? l.playerA.shortName : l.playerB.shortName,
+        dogShort: l.favorite === "A" ? l.playerB.shortName : l.playerA.shortName,
+        tournament: l.tournament,
+        round: l.round,
+        tour: l.tour,
+        surface: l.surface,
+        startTime: l.startTime,
+        marketEn: `MATCH WINNER — ${fav.toUpperCase()}`,
+        marketFa: `برد مسابقه: ${fav}`,
+        odds: legOdds,
+        eventKey: l.eventKey,
+      });
     }
+    const size = legs.length;
+    const marketEn = legRows.map((r) => r.marketEn).join(" + ");
     return {
       ...baseItem(legs[0]),
       line: "COMBO",
       leg: legTag,
-      desc: `${legTag.startsWith("COMBO-3") ? "میکس ۳ تایی" : "میکس ۲ تایی"} سلاطین سرویس: ${names.join(" × ")}`,
-      descEn: names.join(" × "),
+      desc: `برگه میکس رسمی ${size === 3 ? "۳" : "۲"} تایی — برد مسابقه: ${legRows.map((r) => r.favName).join(" × ")}`,
+      descEn: marketEn,
       odds: Math.round(odds * 100) / 100,
       prob,
-      stake: 1,
+      stake: 25,
       timing: legs[0].timing,
-      meta: JSON.stringify({ kind: "combo", favorites, size: legs.length }),
+      marketEn,
+      marketFa: `برگه میکس رسمی ${size} تایی — برد مسابقه (Match Winner) برای ${legRows.map((r) => r.favName).join("، ")}`,
+      legs: legRows,
+      meta: JSON.stringify({ kind: "combo", favorites, size }),
     };
   };
 
@@ -870,35 +933,41 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
     const s1A = solveSet(m.markov.gA, m.markov.gB, "A").winA;
     const sFavSet1 = fav === "A" ? s1A : 1 - s1A;
     const sFavSet = Math.sqrt(Math.max(m.favWinProb, 0.01));
-    const candidates: { key: string; desc: string; descEn: string; prob: number }[] = [
+    // v4.0 — official single-button market naming for every sniper signal
+    const candidates: { key: string; desc: string; descEn: string; marketEn: string; prob: number }[] = [
       {
         key: "comeback",
-        desc: `${favName} ست اول را می‌بازد و ۲-۱ کامبک می‌کند`,
-        descEn: `${favName} LOSES SET 1 & WINS 2-1 COMEBACK`,
+        desc: `باخت ست اول و برد مسابقه توسط فاوریت ${favName} (Set Betting: Favorite Wins 2-1)`,
+        descEn: `SET BETTING — ${favName.toUpperCase()} WINS 2-1 (LOSES SET 1)`,
+        marketEn: "SET BETTING — FAVORITE WINS 2-1",
         prob: (1 - sFavSet1) * sFavSet * sFavSet,
       },
       {
         key: "tiebreak",
-        desc: `تای‌بریک در ست اول (${m.playerA.shortName} × ${m.playerB.shortName})`,
-        descEn: `TIEBREAK IN SET 1 (${m.playerA.shortName} × ${m.playerB.shortName})`,
+        desc: `تای‌بریک در ست اول: بله (1st Set Tie-Break: Yes — Over 12.5 Games Set 1)`,
+        descEn: `1ST SET TIE-BREAK: YES — OVER 12.5 GAMES SET 1 (${m.playerA.shortName} × ${m.playerB.shortName})`,
+        marketEn: "1ST SET TIE-BREAK — YES",
         prob: m.markov.tb1,
       },
       {
         key: "over105",
-        desc: `بیش از 10.5 گیم در ست اول (${m.playerA.shortName} × ${m.playerB.shortName})`,
-        descEn: `OVER 10.5 GAMES 1ST SET (${m.playerA.shortName} × ${m.playerB.shortName})`,
+        desc: `مجموع گیم‌های ست اول: بالای ۱۰.۵ گیم (First Set Games: Over 10.5)`,
+        descEn: `FIRST SET GAMES — OVER 10.5 (${m.playerA.shortName} × ${m.playerB.shortName})`,
+        marketEn: "FIRST SET GAMES — OVER 10.5",
         prob: m.markov.over105Set1,
       },
       {
         key: "dog20",
-        desc: `برد ۲-۰ ${dogName} (سوئیپ آندرداگ)`,
-        descEn: `${dogName} WINS 2-0 (UNDERDOG SWEEP)`,
+        desc: `نتیجه دقیق ست‌ها: برد ۲-۰ ${dogName} (Set Betting: Underdog Wins 2-0)`,
+        descEn: `SET BETTING — ${dogName.toUpperCase()} WINS 2-0`,
+        marketEn: `SET BETTING — ${dogName.toUpperCase()} WINS 2-0`,
         prob: fav === "A" ? m.markov.p02 : m.markov.p20,
       },
       {
         key: "set3",
-        desc: `رفتن مسابقه به ست سوم (${m.playerA.shortName} × ${m.playerB.shortName})`,
-        descEn: `MATCH TO A DECIDING SET 3 (${m.playerA.shortName} × ${m.playerB.shortName})`,
+        desc: `مجموع ست‌های بازی: بالای ۲.۵ ست (Total Sets: Over 2.5 Sets)`,
+        descEn: `TOTAL SETS — OVER 2.5 SETS (${m.playerA.shortName} × ${m.playerB.shortName})`,
+        marketEn: "TOTAL SETS — OVER 2.5 SETS",
         prob: m.markov.p21 + m.markov.p12,
       },
     ];
@@ -915,6 +984,9 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
           odds,
           prob: c.prob,
           stake: 1,
+          marketEn: c.marketEn,
+          marketFa: c.desc,
+          espnUrl: espnMatchUrl(m.eventKey),
           meta: JSON.stringify({
             kind: "sniper",
             snipeKind: c.key,

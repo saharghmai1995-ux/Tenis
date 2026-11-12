@@ -62,12 +62,12 @@ function toPosterData(match: AnalyzedMatch, mode: PosterMode, preview: boolean):
     slipA: match.slips.A
       ? { textEn: match.slips.A.textEn, odds: match.slips.A.odds }
       : preview && p20Fav > 0.02
-        ? { textEn: `${favName} WINS 2-0 SETS`, odds: Number((1 / p20Fav).toFixed(2)) }
+        ? { textEn: `${favName.toUpperCase()} WINS 2-0 (SET BETTING)`, odds: Number((1 / p20Fav).toFixed(2)) }
         : undefined,
     slipB: match.slips.B
       ? { textEn: match.slips.B.textEn, odds: match.slips.B.odds }
       : preview && over25 > 0.02
-        ? { textEn: "OVER 2.5 SETS", odds: Number((1 / over25).toFixed(2)) }
+        ? { textEn: "TOTAL SETS — OVER 2.5 SETS", odds: Number((1 / over25).toFixed(2)) }
         : undefined,
     hashPre: match.hashPre,
     timingLabel: match.timing ? TIMING_EN[match.timing.code] : undefined,

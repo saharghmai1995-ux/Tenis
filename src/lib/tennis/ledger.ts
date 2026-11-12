@@ -70,9 +70,9 @@ interface PickMeta {
 }
 
 const ARCH_FALLBACK: Record<string, { labelFa: string; labelEn: string }> = {
-  ARCH1: { labelFa: "الگوی ۱ — تسلط فاوریت", labelEn: "Dominant Favorite" },
-  ARCH2: { labelFa: "الگوی ۲ — نبرد نزدیک ستارگان", labelEn: "Competitive Clash" },
-  ARCH3: { labelFa: "الگوی ۳ — سپر دوئل سرویس‌زنان", labelEn: "Serve-Bot Tie-Break Shield" },
+  ARCH1: { labelFa: "الگوی رسمی ۱ — تسلط ست‌ها", labelEn: "Set Mastery" },
+  ARCH2: { labelFa: "الگوی رسمی ۲ — تفکیک دقیق ست‌ها", labelEn: "Exact Set Split" },
+  ARCH3: { labelFa: "الگوی رسمی ۳ — گیم‌های سرویس‌زنان", labelEn: "Serve-Bot Games" },
 };
 
 function espnUrlOf(eventKey: string): string | undefined {
@@ -88,8 +88,24 @@ function wingProfitOf(status: string, odds: number, stake: number): number {
   return 0;
 }
 
+// v4.0 — explicit wing label map for the official atomic legs (+ legacy codes)
+const LEG_LABEL: Record<string, string> = {
+  "SB-F20": "تیپ A",
+  "TS-O25": "تیپ B",
+  "SB-P1-20": "تیپ A",
+  "SB-P1-21": "تیپ B",
+  "TG-O225": "تیپ A",
+  "GH-F45": "تیپ B",
+  "A": "تیپ A",
+  "A-O195": "تیپ A",
+  "A-O225": "تیپ A",
+  "B": "تیپ B",
+  "B-ALT": "تیپ B",
+  "B-U225": "تیپ B",
+};
+
 function legLabelOf(leg: string): string {
-  return leg.startsWith("B") ? "تیپ B" : "تیپ A";
+  return LEG_LABEL[leg] ?? (leg.startsWith("B") ? "تیپ B" : "تیپ A");
 }
 
 function buildLeg(p: PickWithMatch): LedgerLeg {
@@ -207,7 +223,7 @@ export async function buildLedgerPayload(
               adaptive: a.meta.archAdaptive,
             }
           : undefined,
-      legs: a.legs.sort((x, y) => x.leg.localeCompare(y.leg)),
+      legs: a.legs.sort((x, y) => x.label.localeCompare(y.label)),
       winnerLeg: a.winner?.leg,
       status,
       stake: a.stake,

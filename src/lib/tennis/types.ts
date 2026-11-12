@@ -12,14 +12,16 @@ export type ArchetypeCode = "ARCH1" | "ARCH2" | "ARCH3";
 /** Exact pair-loss / coverage metrics computed from the Bo3 joint Markov distribution. */
 export interface ArchMetrics {
   set1Fav: number;        // P(favorite wins set 1)
-  favWinOver195: number;  // ARCH2-A: favorite wins AND total games ≥ 20
-  fav20Under195: number;  // ARCH2-B tail: favorite 2-0 in ≤ 19 total games
-  dogSet1: number;        // ARCH2-B head: underdog wins set 1
-  over225: number;        // ARCH3-A: total games ≥ 23
-  fav20Under225: number;  // ARCH3-B: favorite 2-0 in ≤ 22 total games
+  favWinOver195: number;  // legacy v2.0 metric (kept for telemetry)
+  fav20Under195: number;  // legacy v2.0 metric (kept for telemetry)
+  dogSet1: number;        // legacy v2.0 metric (kept for telemetry)
+  over225: number;        // ARCH3-A: total games ≥ 23 (Total Games — Over 22.5)
+  fav20Under225: number;  // legacy v2.0 metric (kept for telemetry)
+  /** v4.0 — P(favorite wins the match with ≥ 5 games margin) — settles Game Handicap −4.5 */
+  fav20Margin5: number;
   pairLoss1: number;      // ARCH1 simultaneous-loss = P(underdog 2-0)
-  pairLoss2: number;      // ARCH2 simultaneous-loss (exact uncovered mass)
-  pairLoss3: number;      // ARCH3 simultaneous-loss (exact uncovered mass)
+  pairLoss2: number;      // v4.0 ARCH2 simultaneous-loss = P(player 1 loses the match)
+  pairLoss3: number;      // v4.0 ARCH3 simultaneous-loss = P(≤22 games AND NOT fav wins by ≥5)
 }
 
 export interface ArchetypeInfo {
@@ -127,6 +129,8 @@ export interface MatchJointCell {
   games: number[];
   prob: number;
   set1A?: boolean; // v2.0 — whether player A won set 1 along this terminal path
+  /** v4.0 — player A total games minus player B total games along this terminal path */
+  margin: number;
 }
 
 export interface MarkovResult {
@@ -146,6 +150,9 @@ export interface MarkovResult {
   // Match-level games distribution
   ou215: number; // match over 21.5 games
   slipBCombined: number; // +1.5 sets underdog AND over 20.5 games (exact from DP)
+  /** v4.0 — exact expected Break-Point-Saved % of each server (i.i.d. point model DP) */
+  bpsA: number;
+  bpsB: number;
   // v2.0 · favorite-oriented archetype metrics (exact, from joint DP)
   arch: ArchMetrics;
 }
@@ -173,12 +180,17 @@ export interface ReverseAnalysis {
 }
 
 export interface Slip {
-  leg: string; // A | B | A-O195 | B-ALT | A-O225 | B-U225 (archetype legs, v2.0)
+  /** v4.0 atomic leg codes: SB-F20 | TS-O25 | SB-P1-20 | SB-P1-21 | TG-O225 | GH-F45 */
+  leg: string;
   text: string;
   textEn: string;
   odds: number;
   prob: number;
   targetWindow?: [number, number];
+  /** v4.0 — Official single-button market name (English), printed on the flashcard */
+  marketEn: string;
+  /** v4.0 — Full Persian translation of the bet */
+  marketFa: string;
 }
 
 export interface VetoInfo {
@@ -210,6 +222,23 @@ export interface AnalyzedMatch extends EspnMatch {
   dbId?: string;
 }
 
+/** v4.0 — one base of a Multi-Match Parlay Slip (Tab 2 mix card). */
+export interface MixLeg {
+  favName: string;
+  dogName: string;
+  favShort: string;
+  dogShort: string;
+  tournament: string;
+  round: string;
+  tour: Tour;
+  surface: Surface;
+  startTime?: string;
+  marketEn: string; // MATCH WINNER — {fav}
+  marketFa: string;
+  odds: number;
+  eventKey: string;
+}
+
 export interface LineItem {
   matchId: string;
   line: ProductionLine;
@@ -236,6 +265,26 @@ export interface LineItem {
   slipProbA?: number;
   slipProbB?: number;
   archetype?: ArchetypeInfo; // v2.0
+  // ─── v4.0 · Rich Telemetry Flashcards ──────────────────────────────────────
+  eventKey?: string; // ESPN event key — direct espn.com/tennis verification link
+  playerAShort?: string;
+  playerBShort?: string;
+  flagA?: string;
+  flagB?: string;
+  seedA?: number;
+  seedB?: number;
+  holdA?: number; // Service Hold % (model)
+  holdB?: number;
+  bpsA?: number; // Break Point Saved % (exact i.i.d. DP)
+  bpsB?: number;
+  /** Official single-button market name (English) — MARKET: … row on the card */
+  marketEn?: string;
+  /** Full Persian translation of the bet */
+  marketFa?: string;
+  /** Dutching share of the 100-unit match budget (%) */
+  stakePct?: number;
+  /** Parlay bases (Tab 2 mix cards) */
+  legs?: MixLeg[];
 }
 
 export interface LedgerRow {

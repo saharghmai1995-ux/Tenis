@@ -1,24 +1,42 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
+  BadgeCheck,
+  CalendarClock,
+  Copy,
   Crosshair,
   Crown,
+  ExternalLink,
   Gem,
+  Link2,
   Lock,
   Rocket,
   ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Target,
+  Wallet,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { TiltCard } from "@/components/tennis/spatial-tilt";
 import { dedupeByKey } from "@/lib/tennis/dedupe";
+import { legLabelOf } from "@/lib/tennis/supervisor";
 import type { AnalyzedMatch, FeedPayload, LineItem, Surface } from "@/lib/tennis/types";
+
+// ─── v4.0 surface identity (official broadcast badge colors) ───────────────
 
 const SURFACE_DOT: Record<Surface, string> = {
   HARD: "bg-cyan-400",
@@ -26,10 +44,10 @@ const SURFACE_DOT: Record<Surface, string> = {
   GRASS: "bg-emerald-400",
 };
 
-const SURFACE_LABEL: Record<Surface, string> = {
-  HARD: "هارد",
-  CLAY: "خاک",
-  GRASS: "چمن",
+const SURFACE_LABEL: Record<Surface, { en: string; fa: string; chip: string }> = {
+  HARD: { en: "HARD COURT", fa: "هاردکورت", chip: "text-cyan-300 border-cyan-400/40 bg-cyan-400/10" },
+  CLAY: { en: "CLAY COURT", fa: "خاک رس", chip: "text-orange-300 border-orange-400/40 bg-orange-400/10" },
+  GRASS: { en: "GRASS COURT", fa: "چمن", chip: "text-emerald-300 border-emerald-400/40 bg-emerald-400/10" },
 };
 
 const ARCH_STYLE: Record<string, string> = {
@@ -38,133 +56,607 @@ const ARCH_STYLE: Record<string, string> = {
   ARCH3: "border-emerald-400/40 bg-emerald-400/10 text-emerald-300",
 };
 
+function flagSrc(url: string | undefined): string | null {
+  if (!url) return null;
+  return `/api/tennis/img?url=${encodeURIComponent(url)}`;
+}
+
 function SurfaceDot({ surface }: { surface: Surface }) {
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span className={`inline-block h-2 w-2 rounded-full ${SURFACE_DOT[surface]}`} />
+        <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${SURFACE_DOT[surface]}`} />
       </TooltipTrigger>
-      <TooltipContent className="text-xs">{SURFACE_LABEL[surface]}کورت</TooltipContent>
+      <TooltipContent className="text-xs">{SURFACE_LABEL[surface].fa}کورت</TooltipContent>
     </Tooltip>
   );
 }
 
-function startLabel(item: LineItem): string {
-  if (!item.startTime) return "";
-  const t = new Date(item.startTime).getTime();
-  if (!Number.isFinite(t)) return "";
-  const diff = t - Date.now();
-  if (item.state === "in") return "در حال بازی";
-  if (diff < 0) return "شروع‌شده";
-  const mins = Math.round(diff / 60000);
-  return mins >= 60
-    ? `شروع ~${Math.floor(mins / 60)}ساعت ${mins % 60}دقیقه بعد`
-    : `شروع ~${mins} دقیقه بعد`;
+function SurfaceBadge({ surface }: { surface: Surface }) {
+  const s = SURFACE_LABEL[surface];
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[10px] font-extrabold tracking-wider ${s.chip}`}
+      dir="ltr"
+    >
+      <span className={`inline-block h-2 w-2 rounded-full ${SURFACE_DOT[surface]}`} />
+      {s.en}
+    </span>
+  );
 }
 
-function LineCard({
-  item,
-  variant,
-}: {
-  item: LineItem;
-  variant: "A" | "B" | "combo" | "sniper";
-}) {
-  const accent =
-    variant === "A"
-      ? "border-amber-300/25 bg-amber-300/[0.06]"
-      : variant === "B"
-        ? "border-emerald-400/25 bg-emerald-400/[0.06]"
-        : variant === "combo"
-          ? "border-cyan-400/25 bg-cyan-400/[0.05]"
-          : "border-rose-400/25 bg-rose-400/[0.05]";
-  const icon =
-    variant === "A" ? (
-      <Target className="h-4 w-4 text-amber-300" />
-    ) : variant === "B" ? (
-      <Gem className="h-4 w-4 text-emerald-300" />
-    ) : variant === "combo" ? (
-      <Sparkles className="h-4 w-4 text-cyan-300" />
-    ) : (
-      <Crosshair className="h-4 w-4 text-rose-300" />
-    );
+// ─── v4.0 Persian date/time + countdown (تاریخ و ساعت دقیق شروع) ───────────
 
+const faDate = (iso: string): string => {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return new Intl.DateTimeFormat("fa-IR", {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+  }).format(d);
+};
+
+const faTime = (iso: string): string => {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return new Intl.DateTimeFormat("fa-IR", {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(d);
+};
+
+function countdownLabel(iso: string, now: number): string {
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return "";
+  const diff = t - now;
+  if (diff <= 0) return "شروع‌شده / در جریان";
+  const mins = Math.floor(diff / 60000);
+  const secs = Math.floor((diff % 60000) / 1000);
+  if (mins >= 60) {
+    return `شروع تا ${Math.floor(mins / 60)} ساعت و ${mins % 60} دقیقه دیگر`;
+  }
+  return `شروع تا ${mins}:${String(secs).padStart(2, "0")} دیگر`;
+}
+
+function MatchClock({ item }: { item: LineItem }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  if (!item.startTime) return <span className="text-[11px] text-muted-foreground">{item.timing.label}</span>;
   return (
-    <TiltCard className={`rise-in rounded-2xl border ${accent}`}>
-      <div className="p-4">
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex items-center gap-2">
-          {icon}
-          <div>
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-              {item.tour} · {item.round}
-            </div>
-            <div className="flex items-center gap-1.5 text-sm font-bold">
-              <SurfaceDot surface={item.surface} />
-              {item.playerA} <span className="text-muted-foreground">×</span> {item.playerB}
-            </div>
+    <span className="inline-flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-white/75">
+      <CalendarClock className="h-3.5 w-3.5 text-white/50" />
+      <span className="font-bold text-white/90">
+        {faDate(item.startTime)} — ساعت {faTime(item.startTime)}
+      </span>
+      {item.state === "pre" && (
+        <span className="mono-num rounded-md border border-amber-300/30 bg-amber-300/10 px-1.5 py-0.5 text-[10px] text-amber-200" dir="ltr">
+          {countdownLabel(item.startTime, now)}
+        </span>
+      )}
+      {item.state === "in" && (
+        <span className="rounded-md border border-rose-400/30 bg-rose-400/10 px-1.5 py-0.5 text-[10px] font-bold text-rose-200">
+          در حال بازی
+        </span>
+      )}
+    </span>
+  );
+}
+
+// ─── v4.0 player profile strip (flag · rank · seed · Hold% · BP Saved%) ────
+
+function MiniBar({ label, value }: { label: string; value: number }) {
+  const pct = Math.min(100, Math.max(2, value * 100));
+  return (
+    <div className="flex items-center gap-1.5 text-[9px] text-muted-foreground" dir="ltr">
+      <span className="w-20 shrink-0 truncate">{label}</span>
+      <div className="h-1.5 flex-1 rounded-full bg-white/10">
+        <div
+          className={`h-full rounded-full ${value >= 0.8 ? "bg-emerald-400" : value >= 0.6 ? "bg-amber-300" : "bg-rose-400"}`}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <span className="mono-num w-9 text-right">{Math.round(value * 100)}%</span>
+    </div>
+  );
+}
+
+function PlayerProfile({
+  name,
+  short,
+  flag,
+  rank,
+  seed,
+  hold,
+  bps,
+  tour,
+  favorite,
+}: {
+  name: string;
+  short?: string;
+  flag?: string;
+  rank?: number;
+  seed?: number;
+  hold?: number;
+  bps?: number;
+  tour: string;
+  favorite: boolean;
+}) {
+  const src = flagSrc(flag);
+  return (
+    <div className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] p-2.5">
+      <div className="flex items-center gap-2">
+        {src ? (
+          <img
+            src={src}
+            alt={`پرچم ${short ?? name}`}
+            className="h-6 w-6 shrink-0 rounded-md border border-white/15 object-cover"
+            loading="lazy"
+          />
+        ) : (
+          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-white/15 bg-white/5 text-[9px] font-bold text-white/60">
+            {(short ?? name).slice(0, 2).toUpperCase()}
+          </span>
+        )}
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <span className="truncate text-xs font-extrabold text-white">{name}</span>
+            {favorite && <Crown className="h-3 w-3 shrink-0 text-amber-300" />}
           </div>
-        </div>
-        <div className="text-left">
-          {/* v3.0 — odds live in a dark capsule, mono tabular-nums */}
-          <div className="num-capsule text-xl font-extrabold text-white">
-            {item.odds.toFixed(2)}
-            <span className="text-xs text-muted-foreground">x</span>
-          </div>
-          <div className="mono-num mt-1 text-[10px] text-muted-foreground" dir="ltr">
-            P={Math.round(item.prob * 100)}%
+          <div className="mono-num mt-0.5 flex items-center gap-1.5 text-[9px] text-muted-foreground" dir="ltr">
+            <span className="font-bold text-white/70">
+              {tour} {rank ? `#${rank}` : "—"}
+            </span>
+            {seed ? <span className="rounded bg-white/10 px-1">Seed #{seed}</span> : null}
           </div>
         </div>
       </div>
-      <p className="mt-2.5 text-[13px] leading-6">{item.desc}</p>
-      <div className="mt-2.5 flex flex-wrap items-center gap-2">
-        <Badge variant="outline" className="border-white/10 bg-white/5 text-[10px] text-muted-foreground">
-          {item.tournament}
-        </Badge>
-        <Badge variant="outline" className="border-white/10 bg-white/5 text-[10px] text-muted-foreground">
-          {startLabel(item)}
-        </Badge>
-        {item.archetype && (
+      <div className="mt-1.5 space-y-1">
+        {hold !== undefined && <MiniBar label="Service Hold %" value={hold} />}
+        {bps !== undefined && <MiniBar label="Break Pt Saved %" value={bps} />}
+      </div>
+    </div>
+  );
+}
+
+// ─── v4.0 standard 4-row Type A / Type B market box ────────────────────────
+
+function MarketBox({
+  tone,
+  wingLabel,
+  item,
+}: {
+  tone: "A" | "B" | "single";
+  wingLabel: string;
+  item: LineItem;
+}) {
+  const accent =
+    tone === "A"
+      ? "border-amber-300/30 bg-amber-300/[0.07]"
+      : tone === "B"
+        ? "border-emerald-400/30 bg-emerald-400/[0.07]"
+        : "border-rose-400/30 bg-rose-400/[0.06]";
+  const toneText =
+    tone === "A" ? "text-amber-300" : tone === "B" ? "text-emerald-300" : "text-rose-300";
+  const stake = item.stakePct ?? item.stake;
+  return (
+    <div className={`rounded-xl border p-3 ${accent}`}>
+      {/* row 1 — official English market name */}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className={`text-[10px] font-black ${toneText}`}>{wingLabel}</span>
+        <span className="mono-num text-[11px] font-extrabold tracking-wide text-white" dir="ltr">
+          MARKET: {item.marketEn ?? item.descEn}
+        </span>
+      </div>
+      {/* row 2 — exact Persian bet translation */}
+      <p className="mt-1.5 text-[13px] font-bold leading-6 text-white/95">
+        {item.marketFa ?? item.desc}
+      </p>
+      {/* row 3 — odds + Markov probability */}
+      <div className="mono-num mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
+        <span>
+          ضریب: <span className="num-capsule font-extrabold text-white">{item.odds.toFixed(2)}x</span>
+        </span>
+        <span className="text-white/25">|</span>
+        <span>
+          احتمال زنجیره مارکوف:{" "}
+          <span className="num-capsule text-white">{(item.prob * 100).toFixed(1)}%</span>
+        </span>
+        {item.targetWindow && (
           <Tooltip>
             <TooltipTrigger asChild>
-              <Badge
-                variant="outline"
-                className={`gap-1 text-[10px] font-bold ${ARCH_STYLE[item.archetype.code] ?? "border-white/10 bg-white/5 text-muted-foreground"}`}
-              >
-                👑 {item.archetype.labelFa}
-                {item.archetype.adaptive && " (سازگار)"}
-                <span className="mono-num">· {(item.archetype.coverage * 100).toFixed(1)}%</span>
-              </Badge>
+              <span className="cursor-help text-[10px] text-cyan-300/80" dir="ltr">
+                window [{item.targetWindow[0].toFixed(2)}–{item.targetWindow[1].toFixed(2)}]
+              </span>
             </TooltipTrigger>
-            <TooltipContent className="text-xs">
-              {item.archetype.labelEn} — پوشش کل فضای پیشامد{" "}
-              <span className="mono-num">{(item.archetype.coverage * 100).toFixed(1)}%</span> · ریسک باخت
-              همزمان <span className="mono-num">{(item.archetype.pairLoss * 100).toFixed(1)}%</span>
+            <TooltipContent className="text-[10px]">
+              پنجره قیمت رسمی این مارکت در سایت‌های شرط‌بندی
             </TooltipContent>
           </Tooltip>
         )}
-        {item.timing.optimal && (
-          <Badge className="border-0 bg-amber-300 text-[10px] font-bold text-black">
-            <Rocket className="h-3 w-3" /> {item.timing.code === "T30" ? "T-30m Pre-Warmup" : "In-Play After Early Break"}
-          </Badge>
-        )}
-        {item.hashPre && (
-          <Badge variant="outline" className="mono-num gap-1 border-cyan-400/30 bg-cyan-400/5 text-[10px] text-cyan-300" dir="ltr">
-            <Lock className="h-3 w-3" /> {item.hashPre.slice(0, 10)}
-          </Badge>
-        )}
-        {/* v3.0 — stake rides a mono capsule, Persian label rides font-sans */}
-        <span className="ms-auto flex items-center gap-1.5 text-[10px] text-muted-foreground">
-          استیک:
-          <span className="num-capsule text-[10px]">{item.stake}</span>
-          واحد
+      </div>
+      {/* row 4 — exact dutching stake of the 100-unit match budget */}
+      <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-white/80">
+        <Wallet className="h-3.5 w-3.5 text-amber-300" />
+        <span>
+          مبلغ شرط:{" "}
+          <span className="num-capsule font-extrabold text-amber-200">{stake}</span> واحد
+          {item.stakePct !== undefined && (
+            <>
+              {" "}(
+              <span className="mono-num">{Number(stake).toFixed(1)}%</span> از بودجه این بازی)
+            </>
+          )}
         </span>
       </div>
+    </div>
+  );
+}
+
+// ─── v4.0 retirement/settlement rule badge (تسویه مصدومیت) ─────────────────
+
+function RetirementRuleBadge() {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-flex items-center gap-1.5 rounded-lg border border-sky-400/30 bg-sky-400/[0.07] px-2.5 py-1 text-[10px] font-bold text-sky-200">
+          <ShieldCheck className="h-3.5 w-3.5" />
+          قانون تسویه: نیازمند اتمام کامل مسابقه (Full Match Completion — در صورت انصراف، فسخ ۱.۰۰)
+        </span>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-[260px] text-[10px] leading-5">
+        اگر بازیکن پیش از پایان مسابقه انصراف دهد (Retirement)، همه تیپ‌های این کارت با ضریب
+        ۱.۰۰ فسخ می‌شوند و هیچ سودی زیان ندارد — مطابق قانون استاندارد بوک‌میکرهای تنیس.
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+// ─── v4.0 click-to-verify SHA-256 hash chip + modal ────────────────────────
+
+function espnUrlOf(eventKey?: string, espnUrl?: string): string | null {
+  if (espnUrl) return espnUrl;
+  if (eventKey && /^\d+$/.test(eventKey)) {
+    return `https://www.espn.com/tennis/match/_/gameId/${eventKey}`;
+  }
+  return "https://www.espn.com/tennis/";
+}
+
+function HashVerifyChip({
+  hash,
+  eventKey,
+  espnUrl,
+  matchLabel,
+}: {
+  hash: string;
+  eventKey?: string;
+  espnUrl?: string;
+  matchLabel: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const link = espnUrlOf(eventKey, espnUrl);
+
+  const copyHash = async () => {
+    try {
+      await navigator.clipboard.writeText(hash);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      /* clipboard unavailable */
+    }
+  };
+
+  return (
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            onClick={() => setOpen(true)}
+            aria-label="راستی‌آزمایی هش SHA-256"
+            className="mono-num inline-flex items-center gap-1 rounded-lg border border-cyan-400/30 bg-cyan-400/[0.07] px-2 py-1 text-[10px] text-cyan-300 transition-colors hover:bg-cyan-400/15"
+            dir="ltr"
+          >
+            <Lock className="h-3 w-3" />
+            {hash.slice(0, 10).toUpperCase()}
+          </button>
+        </TooltipTrigger>
+        <TooltipContent className="text-[10px]">
+          قفل SHA-256 پیش از مسابقه — کلیک برای راستی‌آزمایی
+        </TooltipContent>
+      </Tooltip>
+
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent
+          onClick={(e) => e.stopPropagation()}
+          className="max-w-lg border-white/10 bg-[oklch(0.16_0.01_270)]"
+        >
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-sm">
+              <BadgeCheck className="h-4 w-4 text-cyan-300" />
+              راستی‌آزمایی قفل SHA-256 پیش از مسابقه
+            </DialogTitle>
+            <DialogDescription className="text-[11px] leading-5">
+              این هش پیش از شروع مسابقه روی کارت حک شده و متن مارکت‌ها و ضرایب را قفل می‌کند —
+              پس از تسویه، هیچ عددی قابل دستکاری نیست.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="rounded-xl border border-white/10 bg-white/[0.04] p-3">
+              <div className="text-[10px] text-muted-foreground">{matchLabel}</div>
+              <p
+                className="mono-num mt-1.5 break-all rounded-lg bg-black/40 p-2.5 text-[11px] leading-5 text-cyan-200"
+                dir="ltr"
+              >
+                {hash}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={copyHash}
+                className="border-white/15 bg-white/[0.04] text-xs text-white hover:bg-white/10 hover:text-white"
+              >
+                <Copy className="h-3.5 w-3.5" />
+                {copied ? "کپی شد" : "کپی هش"}
+              </Button>
+              <a href={link} target="_blank" rel="noreferrer" className="inline-flex">
+                <Button
+                  type="button"
+                  size="sm"
+                  className="bg-cyan-500/90 text-xs text-black hover:bg-cyan-400"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  صفحه رسمی بازی در ESPN Tennis
+                </Button>
+              </a>
+            </div>
+            <p className="text-[10px] leading-5 text-muted-foreground">
+              لینک بازی در <span dir="ltr" className="font-mono">espn.com/tennis</span> برای
+              تطبیق نتیجه نهایی و تسویه قانونی (قانون اتمام کامل مسابقه) درج شده است.
+            </p>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+// ─── shared flashcard header (tournament + metadata + both player profiles) ─
+
+function FlashHeader({ item, matchLabel }: { item: LineItem; matchLabel?: string }) {
+  return (
+    <div className="space-y-2.5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <SurfaceBadge surface={item.surface} />
+          <span className="text-[10px] font-bold tracking-wide text-white/70" dir="ltr">
+            {item.tour} · {item.round}
+          </span>
+          <Badge variant="outline" className="border-white/10 bg-white/5 text-[10px] text-muted-foreground">
+            {item.tournament}
+          </Badge>
+        </div>
+        {item.timing.optimal && (
+          <Badge className="border-0 bg-amber-300 text-[10px] font-bold text-black">
+            <Rocket className="h-3 w-3" />
+            {item.timing.code === "T30" ? "T-30m Pre-Warmup" : "In-Play After Early Break"}
+          </Badge>
+        )}
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <MatchClock item={item} />
+        {matchLabel && (
+          <span className="text-[11px] font-bold text-white/85">{matchLabel}</span>
+        )}
+      </div>
+
+      <div className="flex flex-col gap-2 sm:flex-row">
+        <PlayerProfile
+          name={item.playerA}
+          short={item.playerAShort}
+          flag={item.flagA}
+          rank={item.rankA}
+          seed={item.seedA}
+          hold={item.holdA}
+          bps={item.bpsA}
+          tour={item.tour}
+          favorite={item.favorite === "A"}
+        />
+        <PlayerProfile
+          name={item.playerB}
+          short={item.playerBShort}
+          flag={item.flagB}
+          rank={item.rankB}
+          seed={item.seedB}
+          hold={item.holdB}
+          bps={item.bpsB}
+          tour={item.tour}
+          favorite={item.favorite === "B"}
+        />
+      </div>
+    </div>
+  );
+}
+
+function ArchBadge({ item }: { item: LineItem }) {
+  if (!item.archetype) return null;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge
+          variant="outline"
+          className={`gap-1 text-[10px] font-bold ${ARCH_STYLE[item.archetype.code] ?? "border-white/10 bg-white/5 text-muted-foreground"}`}
+        >
+          <Crown className="h-3 w-3" />
+          {item.archetype.labelFa}
+          {item.archetype.adaptive && " (سازگار)"}
+          <span className="mono-num">· {(item.archetype.coverage * 100).toFixed(1)}%</span>
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent className="text-xs">
+        {item.archetype.labelEn} — پوشش کل فضای پیشامد{" "}
+        <span className="mono-num">{(item.archetype.coverage * 100).toFixed(1)}%</span> · ریسک باخت
+        همزمان <span className="mono-num">{(item.archetype.pairLoss * 100).toFixed(1)}%</span>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function FlashFooter({ item, matchLabel }: { item: LineItem; matchLabel: string }) {
+  return (
+    <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-white/10 pt-2.5">
+      <RetirementRuleBadge />
+      {item.hashPre && (
+        <HashVerifyChip
+          hash={item.hashPre}
+          eventKey={item.eventKey}
+          espnUrl={item.espnUrl}
+          matchLabel={matchLabel}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── v4.0 Tab-1 dual flashcard: one card per match, Type A + Type B boxes ──
+
+function DualFlashcard({ pair }: { pair: { A: LineItem; B: LineItem } }) {
+  const { A, B } = pair;
+  const matchLabel = `${A.playerA} × ${A.playerB}`;
+  return (
+    <TiltCard className="rise-in rounded-2xl border border-white/12 bg-white/[0.03]">
+      <div className="p-4">
+        <FlashHeader item={A} matchLabel={matchLabel} />
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <ArchBadge item={A} />
+        </div>
+        <div className="mt-3 space-y-2.5">
+          <MarketBox tone="A" wingLabel="تیپ A — دکمه رسمی سایت بت" item={A} />
+          <MarketBox tone="B" wingLabel="تیپ B — دکمه مکمل رسمی" item={B} />
+        </div>
+        <FlashFooter item={A} matchLabel={matchLabel} />
+      </div>
+    </TiltCard>
+  );
+}
+
+// ─── v4.0 Tab-2 Multi-Match Parlay Slip card (legs table + combined odds) ──
+
+function legTime(iso: string | undefined): string {
+  if (!iso) return "—";
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return "—";
+  return faTime(iso);
+}
+
+function ParlaySlipCard({ item }: { item: LineItem }) {
+  const legs = item.legs ?? [];
+  const size = legs.length || 2;
+  const matchLabel = legs.map((l) => `${l.favShort ?? l.favName} × ${l.dogShort ?? l.dogName}`).join(" | ");
+  return (
+    <TiltCard className="rise-in rounded-2xl border border-cyan-400/25 bg-cyan-400/[0.04]">
+      <div className="p-4">
+        {/* official parlay slip header */}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="inline-flex items-center gap-1.5 text-xs font-black text-cyan-200">
+            <Link2 className="h-4 w-4" />
+            برگه میکس رسمی {size === 3 ? "۳" : "۲"} تایی
+            <span className="mono-num text-[10px] font-bold text-cyan-300/80" dir="ltr">
+              (Multi-Match Parlay Slip)
+            </span>
+          </span>
+          <span className="mono-num rounded-lg border border-cyan-400/30 bg-cyan-400/10 px-2 py-1 text-base font-extrabold text-white" dir="ltr">
+            {item.odds.toFixed(2)}x
+          </span>
+        </div>
+
+        {/* legs table — every base listed separately */}
+        <div className="scroll-slim mt-3 max-h-96 space-y-2 overflow-y-auto pe-1">
+          {legs.map((leg, i) => (
+            <div key={`${leg.eventKey}-${i}`} className="rounded-xl border border-white/10 bg-white/[0.04] p-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="mono-num text-[10px] font-black text-cyan-300" dir="ltr">
+                  LEG {i + 1}
+                </span>
+                <span className="text-[11px] font-bold text-white/90">
+                  {leg.favName} <span className="text-white/40">×</span> {leg.dogName}
+                </span>
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-muted-foreground">
+                <SurfaceDot surface={leg.surface} />
+                <span>{leg.tournament}</span>
+                <span dir="ltr">· {leg.tour} {leg.round}</span>
+                <span>· ساعت {legTime(leg.startTime)}</span>
+              </div>
+              <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2">
+                <span className="mono-num text-[10px] font-bold text-white/75" dir="ltr">
+                  MARKET: {leg.marketEn}
+                </span>
+                <span className="mono-num text-[11px] font-extrabold text-amber-200" dir="ltr">
+                  @{leg.odds.toFixed(2)}
+                </span>
+              </div>
+              <div className="mt-0.5 text-[10px] text-muted-foreground">{leg.marketFa}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* combined odds + suggested stake */}
+        <div className="mt-3 grid grid-cols-3 gap-2">
+          <div className="rounded-xl border border-white/10 bg-white/[0.04] p-2 text-center">
+            <div className="mono-num text-sm font-extrabold text-white" dir="ltr">
+              {item.odds.toFixed(2)}x
+            </div>
+            <div className="mt-0.5 text-[9px] text-muted-foreground">ضریب کل میکس (Combined Odds)</div>
+          </div>
+          <div className="rounded-xl border border-white/10 bg-white/[0.04] p-2 text-center">
+            <div className="mono-num text-sm font-extrabold text-white" dir="ltr">
+              {(item.prob * 100).toFixed(1)}%
+            </div>
+            <div className="mt-0.5 text-[9px] text-muted-foreground">احتمال زنجیره مارکوف</div>
+          </div>
+          <div className="rounded-xl border border-amber-300/30 bg-amber-300/10 p-2 text-center">
+            <div className="mono-num text-sm font-extrabold text-amber-200" dir="ltr">
+              {item.stake} واحد
+            </div>
+            <div className="mt-0.5 text-[9px] text-amber-200/70">مبلغ استیک پیشنهادی</div>
+          </div>
+        </div>
+
+        <FlashFooter item={item} matchLabel={matchLabel || item.descEn} />
+      </div>
+    </TiltCard>
+  );
+}
+
+// ─── v4.0 Tab-3 sniper flashcard (single official market) ──────────────────
+
+function SniperFlashcard({ item }: { item: LineItem }) {
+  const matchLabel = `${item.playerA} × ${item.playerB}`;
+  return (
+    <TiltCard className="rise-in rounded-2xl border border-rose-400/25 bg-rose-400/[0.04]">
+      <div className="p-4">
+        <FlashHeader item={item} matchLabel={matchLabel} />
+        <div className="mt-3">
+          <MarketBox tone="single" wingLabel="تک‌تیرانداز — دکمه رسمی ضریب بالا" item={item} />
+        </div>
+        <FlashFooter item={item} matchLabel={matchLabel} />
       </div>
     </TiltCard>
   );
 }
 
 // ─── Near-gate strip: live 3-archetype candidacy for unapproved matches ────
+
 function NearGateStrip({ matches }: { matches: AnalyzedMatch[] }) {
   const candidates = useMemo(() => {
     return matches
@@ -218,15 +710,15 @@ function NearGateStrip({ matches }: { matches: AnalyzedMatch[] }) {
                 <span className="w-24">Hold fav</span>
                 <div className="h-1.5 flex-1 rounded-full bg-white/10">
                   <div
-                    className={`h-full rounded-full ${hold >= 0.85 ? "bg-emerald-400" : "bg-amber-400"}`}
+                    className={`h-full rounded-full ${hold >= 0.84 ? "bg-emerald-400" : "bg-amber-400"}`}
                     style={{ width: `${Math.min(100, (hold / 0.95) * 100)}%` }}
                   />
                 </div>
-                <span className={`mono-num ${hold >= 0.85 ? "text-emerald-300" : ""}`}>{Math.round(hold * 100)}%</span>
+                <span className={`mono-num ${hold >= 0.84 ? "text-emerald-300" : ""}`}>{Math.round(hold * 100)}%</span>
               </div>
               <p className="pt-0.5 leading-4 text-muted-foreground/80">
                 خارج از پنجره الگوها — پنجره رقابتی{" "}
-                <span className="mono-num">56% ≤ S_fav &lt; 68%</span>
+                <span className="mono-num">54% ≤ S_A &lt; 64%</span>
               </p>
             </div>
           </div>
@@ -236,9 +728,25 @@ function NearGateStrip({ matches }: { matches: AnalyzedMatch[] }) {
   );
 }
 
+// ─── Production lines (3 tabs) ─────────────────────────────────────────────
+
 export function ProductionLines({ feed }: { feed: FeedPayload }) {
   const [booster, setBooster] = useState(true);
   const { dual, combo2, combo3, sniper, shadow } = feed.lines;
+
+  // v4.0 — the two complementary wings are ONE flashcard per match. Wing
+  // classification uses the official atomic leg map (TS-O25 / GH-F45 are
+  // تیپ B even though they do not start with "B").
+  const dualPairs = useMemo(() => {
+    const byMatch = new Map<string, { A?: LineItem; B?: LineItem }>();
+    for (const item of dual) {
+      const cur = byMatch.get(item.matchId) ?? {};
+      if (legLabelOf(item.leg) === "تیپ B") cur.B = item;
+      else cur.A = item;
+      byMatch.set(item.matchId, cur);
+    }
+    return [...byMatch.values()].filter((p): p is { A: LineItem; B: LineItem } => !!p.A && !!p.B);
+  }, [dual]);
 
   // v2.0 bug fix — the shadow ledger is grouped ONE row per match (the v1.0
   // audit saw every match listed twice). Legs stay separate for settlement;
@@ -264,7 +772,8 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
             <Rocket className="h-4 w-4 text-amber-300" />
             خطوط تولید سیگنال (۳ لاین مستقل)
             <span className="text-[11px] font-normal text-muted-foreground">
-              — سوپروایزر ۳ الگویی با سهمیه تایید ۶۵٪ · خروجی امروز: {Math.ceil(dual.length / 2)} مسابقه زوج‌تیپ ({dual.length} بال) · {combo2.length + combo3.length} میکس ·{" "}
+              — مارکت‌های اتمی رسمی ATP/WTA · سوپروایزر ۳ الگویی با سهمیه تایید ۶۵٪ · خروجی امروز: {dualPairs.length} مسابقه زوج‌تیپ ({dual.length} بال) ·{" "}
+              {combo2.length + combo3.length} برگه میکس ·{" "}
               {sniper.length} اسنایپر · {shadow.length} وتو
             </span>
           </CardTitle>
@@ -273,10 +782,10 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
           <Tabs defaultValue="dual">
             <TabsList className="grid w-full grid-cols-3 bg-white/5">
               <TabsTrigger value="dual" className="gap-1.5 text-xs">
-                <Target className="h-3.5 w-3.5" /> زوج‌تیپ الگویی
+                <Target className="h-3.5 w-3.5" /> زوج‌تیپ اتمی رسمی
               </TabsTrigger>
               <TabsTrigger value="combo" className="gap-1.5 text-xs">
-                <Sparkles className="h-3.5 w-3.5" /> میکس سلاطین سرویس
+                <Sparkles className="h-3.5 w-3.5" /> برگه میکس رسمی
               </TabsTrigger>
               <TabsTrigger value="sniper" className="gap-1.5 text-xs">
                 <Crosshair className="h-3.5 w-3.5" /> تک‌تیرانداز
@@ -297,21 +806,21 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
                 <Switch checked={booster} onCheckedChange={setBooster} aria-label="شتاب‌دهنده" />
               </div>
 
-              {dual.length === 0 ? (
+              {dualPairs.length === 0 ? (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center">
                   <ShieldAlert className="mx-auto h-8 w-8 text-amber-300/60" />
                   <p className="mt-3 text-sm font-bold">هیچ الگویی امروز صلاحیت نگرفت</p>
                   <p className="mx-auto mt-1 max-w-md text-xs leading-6 text-muted-foreground">
-                    سوپروایزر v2.0 هر مسابقه را با ۳ الگوی متعامد ارزیابی می‌کند
-                    (تسلط فاوریت / نبرد نزدیک / سپر سرویس‌زنان) و فقط وقتی ریسک باخت
+                    سوپروایزر هر مسابقه را با ۳ الگوی رسمی اتمی ارزیابی می‌کند
+                    (تسلط ست‌ها / تفکیک دقیق ست‌ها / گیم‌های سرویس‌زنان) و فقط وقتی ریسک باخت
                     همزمان زیر <span className="mono-num">9.5%</span> باشد تایید می‌کند.
-                    بازی‌های رقابتی تراز اول با «الگوی ۲» تایید و تسویه می‌شوند — نه وتو.
+                    باقی کارت امروز با سهمیه ۶۵٪ و برچسب «سازگار» صادر می‌شود.
                   </p>
                 </div>
               ) : (
                 <div className="grid gap-3 xl:grid-cols-2">
-                  {dual.map((item) => (
-                    <LineCard key={`${item.matchId}-${item.leg}`} item={item} variant={item.leg.startsWith("B") ? "B" : "A"} />
+                  {dualPairs.map((pair) => (
+                    <DualFlashcard key={pair.A.matchId} pair={pair} />
                   ))}
                 </div>
               )}
@@ -343,12 +852,12 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
             <TabsContent value="combo" className="mt-4 space-y-3">
               {[...combo2, ...combo3].length === 0 ? (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  میکس با پنجره هدف <span className="mono-num">2.80x–5.80x</span> یافت نشد — سلاطین سرویس امروز در تداخل رنکینگ هستند.
+                  برگه میکسی با پنجره هدف <span className="mono-num">2.80x–5.80x</span> یافت نشد — سلاطین سرویس امروز در تداخل رنکینگ هستند.
                 </div>
               ) : (
                 <div className="grid gap-3 xl:grid-cols-2">
                   {[...combo2, ...combo3].map((item) => (
-                    <LineCard key={`${item.matchId}-${item.leg}`} item={item} variant="combo" />
+                    <ParlaySlipCard key={`${item.matchId}-${item.leg}`} item={item} />
                   ))}
                 </div>
               )}
@@ -362,7 +871,7 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
               ) : (
                 <div className="grid gap-3 xl:grid-cols-2">
                   {sniper.map((item) => (
-                    <LineCard key={`${item.matchId}-${item.leg}`} item={item} variant="sniper" />
+                    <SniperFlashcard key={`${item.matchId}-${item.leg}`} item={item} />
                   ))}
                 </div>
               )}

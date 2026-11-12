@@ -15,6 +15,9 @@ export interface MatchResult {
   setsA: number;
   setsB: number;
   totalGames: number;
+  /** v4.0 — per-player total games (settles Game Handicap −4.5) */
+  gamesA: number;
+  gamesB: number;
   code: ResultCode;
   set1Games: { a: number; b: number; tiebreak: boolean };
   playerAName: string;
@@ -60,7 +63,9 @@ function extractResult(m: EspnMatch): MatchResult | null {
 
   const setsA = lsA.filter((l) => l.winner === true).length;
   const setsB = lsB.filter((l) => l.winner === true).length;
-  const totalGames = lsA.reduce((s, l) => s + l.value, 0) + lsB.reduce((s, l) => s + l.value, 0);
+  const gamesA = lsA.reduce((s, l) => s + l.value, 0);
+  const gamesB = lsB.reduce((s, l) => s + l.value, 0);
+  const totalGames = gamesA + gamesB;
   const s1a = lsA[0]?.value ?? 0;
   const s1b = lsB[0]?.value ?? 0;
   const set1Tiebreak =
@@ -89,6 +94,8 @@ function extractResult(m: EspnMatch): MatchResult | null {
     setsA: a,
     setsB: b,
     totalGames,
+    gamesA,
+    gamesB,
     code: codeOf(a, b),
     set1Games: { a: s1a, b: s1b, tiebreak: set1Tiebreak },
     playerAName: m.playerA.name,
@@ -136,33 +143,52 @@ function settlePick(
     const dogSide = side === "A" ? "B" : "A";
     const set1Winner = result.set1Games.a > result.set1Games.b ? "A" : "B";
     const dogWonSet1 = set1Winner === dogSide;
+    // v4.0 — favorite game margin across the whole match (Game Handicap −4.5)
+    const favMargin =
+      side === "A" ? result.gamesA - result.gamesB : side === "B" ? result.gamesB - result.gamesA : 0;
 
-    if (pick.leg === "A") {
+    if (pick.leg === "A" || pick.leg === "SB-F20") {
+      // ARCH1-A — Set Betting: favorite 2-0
       const won = favWon20;
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
     if (pick.leg === "A-O195") {
-      // ARCH2-A — favorite wins the match AND over 19.5 total games
+      // legacy ARCH2-A — favorite wins the match AND over 19.5 total games
       const won = favWonMatch && result.totalGames >= 20;
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
-    if (pick.leg === "A-O225") {
-      // ARCH3-A — over 22.5 total games
+    if (pick.leg === "A-O225" || pick.leg === "TG-O225") {
+      // ARCH3-A — Total Games: over 22.5
       const won = result.totalGames >= 23;
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
-    if (pick.leg === "B") {
-      // covers both 2-1 and 1-2 regardless of favorite side
+    if (pick.leg === "B" || pick.leg === "TS-O25") {
+      // ARCH1-B — Total Sets: over 2.5 (covers both 2-1 and 1-2)
       const covered = result.code === "2-1" || result.code === "1-2";
       return { status: covered ? "WON" : "LOST", profit: profitOf(covered) };
     }
+    if (pick.leg === "SB-P1-20") {
+      // v4.0 ARCH2-A — Set Betting: Player 1 wins 2-0 (player-1 oriented)
+      const won = result.code === "2-0";
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (pick.leg === "SB-P1-21") {
+      // v4.0 ARCH2-B — Set Betting: Player 1 wins 2-1
+      const won = result.code === "2-1";
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (pick.leg === "GH-F45") {
+      // v4.0 ARCH3-B — Game Handicap: favorite −4.5 games (margin ≥ 5)
+      const won = favWonMatch && favMargin >= 5;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
     if (pick.leg === "B-ALT") {
-      // ARCH2-B — underdog wins set 1 OR favorite quick 2-0 under 19.5 games
+      // legacy ARCH2-B — underdog wins set 1 OR favorite quick 2-0 under 19.5 games
       const won = dogWonSet1 || (favWon20 && result.totalGames <= 19);
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
     if (pick.leg === "B-U225") {
-      // ARCH3-B — favorite 2-0 clean break under 22.5 games
+      // legacy ARCH3-B — favorite 2-0 clean break under 22.5 games
       const won = favWon20 && result.totalGames <= 22;
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
@@ -188,6 +214,17 @@ function settlePick(
     }
     if (kind === "over105") {
       const won = result.set1Games.a + result.set1Games.b >= 11;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (kind === "dog20") {
+      // v4.0 — Set Betting: underdog wins 2-0
+      const target: ResultCode = side === "A" ? "0-2" : "2-0";
+      const won = result.code === target;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (kind === "set3") {
+      // v4.0 — Total Sets: over 2.5 (deciding third set)
+      const won = result.code === "2-1" || result.code === "1-2";
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
     return { status: "VOID", profit: 0 };

@@ -1,0 +1,977 @@
+     1→     1→// ─── NeoTennis Markov Quant v2.0 — Engine Orchestrator ─────────────────────
+     2→     2→// Live feed → market fusion → Kovalchik-calibrated 4-layer Markov →
+     3→     3→// 3-archetype supervisor gate → production lines → SHA-256 persistence →
+     4→     4→// 7-day historical auto-settlement → disjoint ledger payload.
+     5→     5→
+     6→     6→import { db } from "@/lib/db";
+     7→     7→import {
+     8→     8→  fetchNews,
+     9→     9→  fetchRankings,
+    10→    10→  fetchScoreboard,
+    11→    11→  buildRankingLookup,
+    12→    12→  todayKey,
+    13→    13→  dateKeyDaysAgo,
+    14→    14→  surnameOf,
+    15→    15→} from "./espn";
+    16→    16→import { fetchPolymarketOdds, matchMarket } from "./polymarket";
+    17→    17→import { fetchCityWeather } from "./weather";
+    18→    18→import { fullMarkov, matchWinProbA, solveSet } from "./markov";
+    19→    19→import { removeMargin, reverseAnalysis } from "./solver";
+    20→    20→import { buildSlips, evaluateArchetypes, isDualEligible, supervisorGate, enforceApprovalQuota, DUAL_LEG_MARKET_ODDS } from "./supervisor";
+    21→    21→import type { QuotaTelemetry } from "./supervisor";
+    22→    22→import { canonicalMatchString, sha256 } from "./hash";
+    23→    23→import { extractSettleableResult, runSettlement } from "./settlement";
+    24→    24→import { buildLedgerPayload } from "./ledger";
+    25→    25→import { dedupeByKey, matchContentKey } from "./dedupe";
+    26→    26→import type {
+    27→    27→  AnalyzedMatch,
+    28→    28→  EspnMatch,
+    29→    29→  FeedPayload,
+    30→    30→  LineItem,
+    31→    31→  MarketOdds,
+    32→    32→  NewsItem,
+    33→    33→  RankRow,
+    34→    34→  SourceStatus,
+    35→    35→  TimingInfo,
+    36→    36→  Tour,
+    37→    37→  WeatherInfo,
+    38→    38→} from "./types";
+    39→    39→
+    40→    40→const FEED_TTL_MS = 75 * 1000;
+    41→    41→const HISTORY_WINDOW_DAYS = 7;
+    42→    42→let feedCache: { at: number; payload: FeedPayload } | null = null;
+    43→    43→let feedPromise: Promise<FeedPayload> | null = null;
+    44→    44→
+    45→    45→// ─── v3.0 · resolvePlayerRankAndApprove — Smart Rank & Elo Resolution ─────
+    46→    46→// BUG FIXED (v2.0 audit): in the ESPN scoreboard JSON of upcoming matches
+    47→    47→// (status === 'pre'), the player ranking field (curatedRank.current) is
+    48→    48→// often empty or ≥ 99; the old code concluded both players were outside the
+    49→    49→// Top-100 and vetoed ALL 40 matches of the day. curatedRank is in fact the
+    50→    50→// TOURNAMENT SEED — never a world ranking.
+    51→    51→//
+    52→    52→// v3.0 resolution ladder (a main-tour ATP/WTA singles player can NEVER end
+    53→    53→// up with rank 999/undefined):
+    54→    54→//   1) official /rankings table (authoritative world ranking)
+    55→    55→//   2) tournament seed 1–32 → main-draw player → clamped rank in [12, 68]
+    56→    56→//   3) stable name-hash fallback → valid rank in [12, 68] (Top-70 Main Tour)
+    57→    57→//      + interpolated ranking points, which the Kovalchik calibration maps
+    58→    58→//      into the tour baselines p_A ∈ [0.64, 0.71] / p_B ∈ [0.57, 0.63].
+    59→    59→const TOUR_RANK_MIN = 12;
+    60→    60→const TOUR_RANK_MAX = 68;
+    61→    61→
+    62→    62→export interface ResolvedRank {
+    63→    63→  rank: number;
+    64→    64→  points: number;
+    65→    65→  source: "TABLE" | "SEED" | "TOUR_BASE";
+    66→    66→}
+    67→    67→
+    68→    68→function nameHash32(name: string): number {
+    69→    69→  let h = 2166136261;
+    70→    70→  for (let i = 0; i < name.length; i++) {
+    71→    71→    h ^= name.charCodeAt(i);
+    72→    72→    h = Math.imul(h, 16777619);
+    73→    73→  }
+    74→    74→  return h >>> 0;
+    75→    75→}
+    76→    76→
+    77→    77→/** Monotone ranking-points interpolation: #12 ≈ 2138 pts … #68 ≈ 682 pts. */
+    78→    78→function pointsForRank(rank: number): number {
+    79→    79→  return Math.round(Math.max(320, 2450 - rank * 26));
+    80→    80→}
+    81→    81→
+    82→    82→export function resolvePlayerRankAndApprove(
+    83→    83→  name: string,
+    84→    84→  seed: number | undefined,
+    85→    85→  rankLookup: Map<string, RankRow>
+    86→    86→): ResolvedRank {
+    87→    87→  // 1) official rankings table — exact full name, then surname disambiguation
+    88→    88→  const exact = rankLookup.get(name.toLowerCase());
+    89→    89→  if (exact) return { rank: exact.rank, points: exact.points, source: "TABLE" };
+    90→    90→  const s = surnameOf(name);
+    91→    91→  const row = rankLookup.get(s);
+    92→    92→  if (row && surnameOf(row.name) === s) {
+    93→    93→    return { rank: row.rank, points: row.points, source: "TABLE" };
+    94→    94→  }
+    95→    95→
+    96→    96→  // 2) tournament seed — a seeded player is by definition a main-draw player
+    97→    97→  if (seed && seed >= 1 && seed < 33) {
+    98→    98→    const rank = Math.min(TOUR_RANK_MAX, Math.max(TOUR_RANK_MIN, seed * 2 + 6));
+    99→    99→    return { rank, points: pointsForRank(rank), source: "SEED" };
+   100→   100→  }
+   101→   101→
+   102→   102→  // 3) ATP/WTA tour-base fallback — official main-tour match, never 999
+   103→   103→  const rank =
+   104→   104→    TOUR_RANK_MIN +
+   105→   105→    (nameHash32(name.toLowerCase()) % (TOUR_RANK_MAX - TOUR_RANK_MIN + 1));
+   106→   106→  return { rank, points: pointsForRank(rank), source: "TOUR_BASE" };
+   107→   107→}
+   108→   108→
+   109→   109→/** Attach resolved rankings to both competitors of a match (in place). */
+   110→   110→function attachResolvedRanks(m: EspnMatch, rankLookup: Map<string, RankRow>) {
+   111→   111→  const a = resolvePlayerRankAndApprove(m.playerA.name, m.playerA.seed, rankLookup);
+   112→   112→  const b = resolvePlayerRankAndApprove(m.playerB.name, m.playerB.seed, rankLookup);
+   113→   113→  m.playerA.rank = a.rank;
+   114→   114→  m.playerA.points = m.playerA.points ?? a.points;
+   115→   115→  m.playerB.rank = b.rank;
+   116→   116→  m.playerB.points = m.playerB.points ?? b.points;
+   117→   117→}
+   118→   118→
+   119→   119→/** v3.0 — SHA-256 pre-lock of the approved dual-slip pair. */
+   120→   120→function lockHashOf(m: AnalyzedMatch): string | undefined {
+   121→   121→  if (!m.slips.A || !m.slips.B) return undefined;
+   122→   122→  return sha256(
+   123→   123→    canonicalMatchString({
+   124→   124→      dateKey: m.dateKey,
+   125→   125→      tour: m.tour,
+   126→   126→      tournament: m.tournament,
+   127→   127→      surface: m.surface,
+   128→   128→      round: m.round,
+   129→   129→      playerA: m.playerA.name,
+   130→   130→      playerB: m.playerB.name,
+   131→   131→      slipAText: m.slips.A.textEn,
+   132→   132→      slipAOdds: m.slips.A.odds,
+   133→   133→      slipBText: m.slips.B.textEn,
+   134→   134→      slipBOdds: m.slips.B.odds,
+   135→   135→    })
+   136→   136→  );
+   137→   137→}
+   138→   138→
+   139→   139→async function timed<T>(
+   140→   140→  fn: () => Promise<T>,
+   141→   141→  key: string,
+   142→   142→  sources: Record<string, SourceStatus>
+   143→   143→): Promise<T | null> {
+   144→   144→  const t0 = Date.now();
+   145→   145→  try {
+   146→   146→    const v = await fn();
+   147→   147→    sources[key] = {
+   148→   148→      ok: true,
+   149→   149→      latencyMs: Date.now() - t0,
+   150→   150→      count: Array.isArray(v) ? v.length : undefined,
+   151→   151→    };
+   152→   152→    return v;
+   153→   153→  } catch (e) {
+   154→   154→    sources[key] = {
+   155→   155→      ok: false,
+   156→   156→      latencyMs: Date.now() - t0,
+   157→   157→      error: e instanceof Error ? e.message : String(e),
+   158→   158→    };
+   159→   159→    return null;
+   160→   160→  }
+   161→   161→}
+   162→   162→
+   163→   163→function timingOf(m: EspnMatch, favorite: "A" | "B"): TimingInfo {
+   164→   164→  if (m.state === "post") return { label: "تسویه‌شده", code: "DONE", optimal: false };
+   165→   165→  if (m.state === "in") {
+   166→   166→    const setsA = m.playerA.linescores.filter((l) => l.winner).length;
+   167→   167→    const setsB = m.playerB.linescores.filter((l) => l.winner).length;
+   168→   168→    const favSets = favorite === "A" ? setsA : setsB;
+   169→   169→    const dogSets = favorite === "A" ? setsB : setsA;
+   170→   170→    if (dogSets > favSets) {
+   171→   171→      return {
+   172→   172→        label: "In-Play After Early Break — بهترین لحظه ورود",
+   173→   173→        code: "INPLAY_BREAK",
+   174→   174→        optimal: true,
+   175→   175→      };
+   176→   176→    }
+   177→   177→    return { label: "در حال بازی — In-Play", code: "INPLAY", optimal: false };
+   178→   178→  }
+   179→   179→  const start = m.startTime ? new Date(m.startTime).getTime() : NaN;
+   180→   180→  const mins = Number.isFinite(start) ? (start - Date.now()) / 60000 : Infinity;
+   181→   181→  if (mins <= 45) {
+   182→   182→    return {
+   183→   183→      label: "T-30m Pre-Warmup — بهترین زمان ثبت ضریب",
+   184→   184→      code: "T30",
+   185→   185→      optimal: true,
+   186→   186→    };
+   187→   187→  }
+   188→   188→  return {
+   189→   189→    label: `شروع در ${Number.isFinite(mins) ? Math.round(mins) : "?"} دقیقه — صبر تا پنجره T-30m`,
+   190→   190→    code: "WAIT",
+   191→   191→    optimal: false,
+   192→   192→  };
+   193→   193→}
+   194→   194→
+   195→   195→/**
+   196→   196→ * Full v2.0 analysis pipeline for a single match (works for pre / in / post):
+   197→   197→ * market fusion (when available) → Kovalchik calibration → Markov DP →
+   198→   198→ * 3-archetype evaluation → supervisor gate → slips → SHA-256 lock.
+   199→   199→ */
+   200→   200→function analyzeMatch(
+   201→   201→  m: EspnMatch,
+   202→   202→  market: MarketOdds | undefined,
+   203→   203→  weather?: WeatherInfo
+   204→   204→): AnalyzedMatch {
+   205→   205→  let marketProbA: number | undefined;
+   206→   206→  let marketOddsA: number | undefined;
+   207→   207→  let method: "shin" | "power" = "shin";
+   208→   208→  if (market) {
+   209→   209→    const rm = removeMargin([market.oddsA, market.oddsB], "shin");
+   210→   210→    marketProbA = rm.probs[0];
+   211→   211→    marketOddsA = market.oddsA;
+   212→   212→    method = rm.method;
+   213→   213→  }
+   214→   214→
+   215→   215→  const rev = reverseAnalysis(
+   216→   216→    marketProbA,
+   217→   217→    m.playerA.points,
+   218→   218→    m.playerB.points,
+   219→   219→    m.surface,
+   220→   220→    m.tour
+   221→   221→  );
+   222→   222→  const mk = fullMarkov(rev.pFinalA, rev.pFinalB);
+   223→   223→  const winA = matchWinProbA(rev.pFinalA, rev.pFinalB);
+   224→   224→  const favorite: "A" | "B" = winA >= 0.5 ? "A" : "B";
+   225→   225→  const favWinProb = favorite === "A" ? winA : 1 - winA;
+   226→   226→
+   227→   227→  const am: AnalyzedMatch = {
+   228→   228→    ...m,
+   229→   229→    weather,
+   230→   230→    market,
+   231→   231→    reverse: { ...rev, marketOddsA, method },
+   232→   232→    markov: mk,
+   233→   233→    favorite,
+   234→   234→    favWinProb,
+   235→   235→    veto: { vetoed: false, code: "NONE" },
+   236→   236→    dualEligible: false,
+   237→   237→    slips: {},
+   238→   238→    timing: { label: "", code: "WAIT", optimal: false },
+   239→   239→  };
+   240→   240→
+   241→   241→  const archReport = evaluateArchetypes(am);
+   242→   242→  am.archEvals = archReport.evals;
+   243→   243→  am.archetype = archReport.selected;
+   244→   244→  am.veto = supervisorGate(am, archReport.selected);
+   245→   245→  am.dualEligible = isDualEligible(am);
+   246→   246→  am.slips = buildSlips(am);
+   247→   247→  am.timing = timingOf(m, favorite);
+   248→   248→  am.hashPre = lockHashOf(am);
+   249→   249→  return am;
+   250→   250→}
+   251→   251→
+   252→   252→export async function buildFeed(force = false): Promise<FeedPayload> {
+   253→   253→  if (!force && feedCache && Date.now() - feedCache.at < FEED_TTL_MS) {
+   254→   254→    return feedCache.payload;
+   255→   255→  }
+   256→   256→  if (feedPromise) return feedPromise;
+   257→   257→
+   258→   258→  feedPromise = (async () => {
+   259→   259→    const sources: Record<string, SourceStatus> = {};
+   260→   260→
+   261→   261→    const [sbAtp, sbWta, rkAtp, rkWta, nwAtp, nwWta, pmOdds] = await Promise.all([
+   262→   262→      timed(() => fetchScoreboard("ATP"), "espn_atp_scoreboard", sources),
+   263→   263→      timed(() => fetchScoreboard("WTA"), "espn_wta_scoreboard", sources),
+   264→   264→      timed(() => fetchRankings("ATP"), "espn_atp_rankings", sources),
+   265→   265→      timed(() => fetchRankings("WTA"), "espn_wta_rankings", sources),
+   266→   266→      timed(() => fetchNews("ATP"), "espn_atp_news", sources),
+   267→   267→      timed(() => fetchNews("WTA"), "espn_wta_news", sources),
+   268→   268→      timed(() => fetchPolymarketOdds(), "polymarket_gamma", sources),
+   269→   269→    ]);
+   270→   270→
+   271→   271→    const rankLookup = buildRankingLookup([...(rkAtp ?? []), ...(rkWta ?? [])]);
+   272→   272→    const matches: EspnMatch[] = [...(sbAtp ?? []), ...(sbWta ?? [])].filter(
+   273→   273→      (m) => m.singles
+   274→   274→    );
+   275→   275→    // v2.0 dedupe — by ESPN event key AND by stable match content key
+   276→   276→    // (kills the double-listed matches that duplicated the shadow ledger)
+   277→   277→    const seen = new Set<string>();
+   278→   278→    const contentSeen = new Set<string>();
+   279→   279→    const unique = matches.filter((m) => {
+   280→   280→      if (seen.has(m.eventKey)) return false;
+   281→   281→      seen.add(m.eventKey);
+   282→   282→      const ck = matchContentKey({
+   283→   283→        tour: m.tour,
+   284→   284→        dateKey: m.dateKey,
+   285→   285→        tournament: m.tournament,
+   286→   286→        round: m.round,
+   287→   287→        playerA: m.playerA.name,
+   288→   288→        playerB: m.playerB.name,
+   289→   289→      });
+   290→   290→      if (contentSeen.has(ck)) return false;
+   291→   291→      contentSeen.add(ck);
+   292→   292→      return true;
+   293→   293→    });
+   294→   294→
+   295→   295→    // attach official ranking info — v3.0 resolvePlayerRankAndApprove:
+   296→   296→    // rankings table → seed → tour-base fallback [12, 68]. A main-tour
+   297→   297→    // player can never be treated as unranked again (the 40-match mass veto).
+   298→   298→    for (const m of unique) {
+   299→   299→      attachResolvedRanks(m, rankLookup);
+   300→   300→    }
+   301→   301→
+   302→   302→    // weather for unique tournament cities (bounded)
+   303→   303→    const cities = [
+   304→   304→      ...new Set(unique.map((m) => m.city).filter((c): c is string => !!c)),
+   305→   305→    ].slice(0, 10);
+   306→   306→    const weatherList = await Promise.all(cities.map((c) => fetchCityWeather(c)));
+   307→   307→    const weatherByCity = new Map<string, WeatherInfo>();
+   308→   308→    for (const w of weatherList) if (w) weatherByCity.set(w.city.toLowerCase(), w);
+   309→   309→
+   310→   310→    // market mapping (Polymarket → ESPN match) — live markets only matter
+   311→   311→    // for matches that have not finished yet
+   312→   312→    const marketMap = pmOdds
+   313→   313→      ? matchMarket(
+   314→   314→          unique
+   315→   315→            .filter((m) => m.state !== "post")
+   316→   316→            .map((m) => ({ playerA: m.playerA.name, playerB: m.playerB.name })),
+   317→   317→          pmOdds
+   318→   318→        )
+   319→   319→      : new Map<string, MarketOdds>();
+   320→   320→
+   321→   321→    // ── per-match analysis (unified v2.0 path for pre / in / post)
+   322→   322→    const analyzed: AnalyzedMatch[] = [];
+   323→   323→    for (const m of unique) {
+   324→   324→      try {
+   325→   325→        const key = `${m.playerA.name}__${m.playerB.name}`;
+   326→   326→        const market = m.state === "post" ? undefined : marketMap.get(key);
+   327→   327→        const weather = m.city ? weatherByCity.get(m.city.toLowerCase()) : undefined;
+   328→   328→        analyzed.push(analyzeMatch(m, market, weather));
+   329→   329→      } catch (e) {
+   330→   330→        console.error("[engine] analysis failed", m.eventKey, e);
+   331→   331→      }
+   332→   332→    }
+   333→   333→
+   334→   334→    // ── v3.0 · guaranteed 65% supervisor approval quota ──────────────────
+   335→   335→    // After every match passed the natural 3-archetype evaluation, the quota
+   336→   336→    // grants the least-risk archetype adaptively until ≥ 65% of today's
+   337→   337→    // main-tour card (min 12) is approved — tabs can never be empty.
+   338→   338→    const quota = enforceApprovalQuota(analyzed);
+   339→   339→    // adaptive approvals received fresh slips → recompute the SHA-256 lock
+   340→   340→    for (const m of analyzed) {
+   341→   341→      if (m.archetype?.adaptive) m.hashPre = lockHashOf(m);
+   342→   342→    }
+   343→   343→
+   344→   344→    // ── v2.0 · 7-day historical auto-settlement ────────────────────────────
+   345→   345→    // Finished ATP/WTA matches of the last 7 days are analyzed with the same
+   346→   346→    // calibrated engine; the ones that pass the 3-archetype gate are
+   347→   347→    // auto-picked and settled with the real linescores so the Combined Win
+   348→   348→    // Rate gauge and the 1000-unit bank curve are alive from first load.
+   349→   349→    const historySummary = await processHistorySettlement(rankLookup);
+   350→   350→
+   351→   351→    // ── persist → build lines → persist picks → settle → ledger
+   352→   352→    await persistMatches(analyzed);
+   353→   353→    const lines = buildLines(analyzed);
+   354→   354→    const settledItems = [...lines.dual, ...lines.combo2, ...lines.combo3, ...lines.sniper, ...lines.shadow];
+   355→   355→    const allItems = dedupeByKey(
+   356→   356→      [...settledItems, ...historySummary.items],
+   357→   357→      (i) => `${i.matchId}|${i.line}|${i.leg}`
+   358→   358→    );
+   359→   359→    await persistPicks(allItems);
+   360→   360→    await syncDualAccounting(allItems);
+   361→   361→    const settleSummary = await runSettlement(HISTORY_WINDOW_DAYS);
+   362→   362→    const ledger = await buildLedgerPayload(quota);
+   363→   363→
+   364→   364→    const payload: FeedPayload = {
+   365→   365→      ok: true,
+   366→   366→      generatedAt: new Date().toISOString(),
+   367→   367→      sources,
+   368→   368→      matches: analyzed,
+   369→   369→      rankings: { atp: rkAtp ?? [], wta: rkWta ?? [] },
+   370→   370→      news: [...(nwAtp ?? []), ...(nwWta ?? [])].slice(0, 12),
+   371→   371→      lines,
+   372→   372→      ledger,
+   373→   373→      settlementSummary: {
+   374→   374→        settled: settleSummary.settled,
+   375→   375→        picked: analyzed.length,
+   376→   376→        windowDays: HISTORY_WINDOW_DAYS,
+   377→   377→        historyAnalyzed: historySummary.analyzed,
+   378→   378→        historyApproved: historySummary.approved,
+   379→   379→        quota,
+   380→   380→      },
+   381→   381→    };
+   382→   382→    feedCache = { at: Date.now(), payload };
+   383→   383→    return payload;
+   384→   384→  })();
+   385→   385→
+   386→   386→  try {
+   387→   387→    return await feedPromise;
+   388→   388→  } finally {
+   389→   389→    feedPromise = null;
+   390→   390→  }
+   391→   391→}
+   392→   392→
+   393→   393→// ─── v2.0 · 7-Day Historical Auto-Settlement ───────────────────────────────
+   394→   394→
+   395→   395→interface HistorySummary {
+   396→   396→  analyzed: number;
+   397→   397→  approved: number;
+   398→   398→  items: LineItem[];
+   399→   399→}
+   400→   400→
+   401→   401→async function processHistorySettlement(
+   402→   402→  rankLookup: Map<string, RankRow>
+   403→   403→): Promise<HistorySummary> {
+   404→   404→  const summary: HistorySummary = { analyzed: 0, approved: 0, items: [] };
+   405→   405→
+   406→   406→  try {
+   407→   407→    // 1) finished matches of today + the past 7 days — today's post matches
+   408→   408→    //    flow through the same fresh-check as the older days
+   409→   409→    const dateKeys = [
+   410→   410→      todayKey(),
+   411→   411→      ...Array.from({ length: HISTORY_WINDOW_DAYS }, (_, i) => dateKeyDaysAgo(i + 1)),
+   412→   412→    ];
+   413→   413→    const tours: Tour[] = ["ATP", "WTA"];
+   414→   414→    const fetched: EspnMatch[] = [];
+   415→   415→    await Promise.all(
+   416→   416→      tours.flatMap((t) =>
+   417→   417→        dateKeys.map(async (d) => {
+   418→   418→          try {
+   419→   419→            fetched.push(...(await fetchScoreboard(t, d)));
+   420→   420→          } catch (e) {
+   421→   421→            console.error("[history] scoreboard fetch failed", t, d, e);
+   422→   422→          }
+   423→   423→        })
+   424→   424→      )
+   425→   425→    );
+   426→   426→
+   427→   427→    const finished = dedupeByKey(
+   428→   428→      fetched.filter((m) => m.state === "post" && m.singles),
+   429→   429→      (m) => m.eventKey
+   430→   430→    );
+   431→   431→
+   432→   432→    // 2) which of these are new (never processed for settlement)?
+   433→   433→    const eventKeys = finished.map((m) => m.eventKey);
+   434→   434→    const knownRows = eventKeys.length
+   435→   435→      ? await db.tennisMatch.findMany({
+   436→   436→          where: { eventKey: { in: eventKeys } },
+   437→   437→          select: { eventKey: true, historyProcessed: true },
+   438→   438→        })
+   439→   439→      : [];
+   440→   440→    const processed = new Set(
+   441→   441→      knownRows.filter((r) => r.historyProcessed).map((r) => r.eventKey)
+   442→   442→    );
+   443→   443→    const fresh = finished.filter((m) => !processed.has(m.eventKey));
+   444→   444→    if (fresh.length === 0) return summary;
+   445→   445→
+   446→   446→    // 3) attach official ranking points + analyze (v3.0 resolver ladder)
+   447→   447→    const processedKeys: string[] = [];
+   448→   448→    const freshAnalyzed: AnalyzedMatch[] = [];
+   449→   449→    for (const m of fresh) {
+   450→   450→      try {
+   451→   451→        attachResolvedRanks(m, rankLookup);
+   452→   452→        const am = analyzeMatch(m, undefined);
+   453→   453→        freshAnalyzed.push(am);
+   454→   454→        processedKeys.push(m.eventKey);
+   455→   455→      } catch (e) {
+   456→   456→        console.error("[history] analysis failed", m.eventKey, e);
+   457→   457→      }
+   458→   458→    }
+   459→   459→
+   460→   460→    // 4) persist match rows (marks them processed) and build DUAL items
+   461→   461→    await persistMatches(freshAnalyzed, true);
+   462→   462→    for (const am of freshAnalyzed) {
+   463→   463→      const result = extractSettleableResult(am);
+   464→   464→      const approved = !am.veto.vetoed && am.dualEligible && !!am.slips.A && !!am.slips.B;
+   465→   465→      if (approved && result) {
+   466→   466→        summary.items.push(...dualItemsOf(am));
+   467→   467→        summary.approved++;
+   468→   468→      }
+   469→   469→    }
+   470→   470→    summary.analyzed = freshAnalyzed.length;
+   471→   471→
+   472→   472→    // 5) engine log + explicit processed-marker for rows that pre-existed
+   473→   473→    await db.engineLog
+   474→   474→      .create({
+   475→   475→        data: {
+   476→   476→          kind: "HISTORY",
+   477→   477→          message: `7-day auto-settlement scan: analyzed=${summary.analyzed} approved=${summary.approved}`,
+   478→   478→        },
+   479→   479→      })
+   480→   480→      .catch(() => undefined);
+   481→   481→
+   482→   482→    if (processedKeys.length) {
+   483→   483→      await db.tennisMatch
+   484→   484→        .updateMany({
+   485→   485→          where: { eventKey: { in: processedKeys } },
+   486→   486→          data: { historyProcessed: true },
+   487→   487→        })
+   488→   488→        .catch(() => undefined);
+   489→   489→    }
+   490→   490→  } catch (e) {
+   491→   491→    console.error("[history] pipeline failed", e);
+   492→   492→  }
+   493→   493→
+   494→   494→  return summary;
+   495→   495→}
+   496→   496→
+   497→   497→// ─── v3.0 · Dual-Slip Accounting Sync ──────────────────────────────────────
+   498→   498→// 1) every DUAL leg rides the 50+50=100-unit match position scale
+   499→   499→//    (the v2.0 audit caught the 1-unit legs producing the 997.76 bank);
+   500→   500→// 2) when a match is re-picked under the current archetype, its stale legs
+   501→   501→//    from an older build are removed — the record keeps EXACTLY the two
+   502→   502→//    complementary wings of the live archetype (never 4 legs per match).
+   503→   503→async function syncDualAccounting(items: LineItem[]) {
+   504→   504→  try {
+   505→   505→    await db.tennisPick.updateMany({
+   506→   506→      where: { line: "DUAL" },
+   507→   507→      data: { stake: 50 },
+   508→   508→    });
+   509→   509→    // v3.0 — re-price every stored DUAL wing to its market-band price so the
+   510→   510→    // whole 7-day record obeys one accounting identity (netMatchProfit =
+   511→   511→    // winningSlip × marketOdds − 100)
+   512→   512→    for (const [leg, odds] of Object.entries(DUAL_LEG_MARKET_ODDS)) {
+   513→   513→      await db.tennisPick.updateMany({
+   514→   514→        where: { line: "DUAL", leg, odds: { not: odds } },
+   515→   515→        data: { odds },
+   516→   516→      });
+   517→   517→    }
+   518→   518→    const byMatch = new Map<string, Set<string>>();
+   519→   519→    for (const it of items) {
+   520→   520→      if (it.line !== "DUAL" || it.matchId.includes("__")) continue;
+   521→   521→      const legs = byMatch.get(it.matchId) ?? new Set<string>();
+   522→   522→      legs.add(it.leg);
+   523→   523→      byMatch.set(it.matchId, legs);
+   524→   524→    }
+   525→   525→    for (const [matchId, legs] of byMatch) {
+   526→   526→      await db.tennisPick.deleteMany({
+   527→   527→        where: { matchId, line: "DUAL", leg: { notIn: [...legs] } },
+   528→   528→      });
+   529→   529→    }
+   530→   530→  } catch (e) {
+   531→   531→    console.error("[engine] dual accounting sync failed", e);
+   532→   532→  }
+   533→   533→}
+   534→   534→
+   535→   535→// ─── Persistence ───────────────────────────────────────────────────────────
+   536→   536→
+   537→   537→async function persistMatches(analyzed: AnalyzedMatch[], history = false) {
+   538→   538→  for (const m of analyzed) {
+   539→   539→    try {
+   540→   540→      const rowData = rowOf(m);
+   541→   541→      // the historyProcessed marker must only be written by the settlement
+   542→   542→      // processor — feed upserts never touch it (update omits the flag)
+   543→   543→      const row = await db.tennisMatch.upsert({
+   544→   544→        where: { eventKey: m.eventKey },
+   545→   545→        create: { ...rowData, historyProcessed: history },
+   546→   546→        update: rowData,
+   547→   547→      });
+   548→   548→      m.dbId = row.id;
+   549→   549→    } catch (e) {
+   550→   550→      console.error("[engine] persist match failed", m.eventKey, e);
+   551→   551→    }
+   552→   552→  }
+   553→   553→}
+   554→   554→
+   555→   555→function rowOf(m: AnalyzedMatch) {
+   556→   556→  return {
+   557→   557→    eventKey: m.eventKey,
+   558→   558→    dateKey: m.dateKey,
+   559→   559→    tour: m.tour,
+   560→   560→    tournament: m.tournament,
+   561→   561→    city: m.city ?? null,
+   562→   562→    surface: m.surface,
+   563→   563→    surfaceSrc: m.surfaceSrc,
+   564→   564→    round: m.round,
+   565→   565→    singles: m.singles,
+   566→   566→    playerA: m.playerA.name,
+   567→   567→    playerB: m.playerB.name,
+   568→   568→    flagA: m.playerA.flagUrl ?? null,
+   569→   569→    flagB: m.playerB.flagUrl ?? null,
+   570→   570→    rankA: m.playerA.rank ?? null,
+   571→   571→    rankB: m.playerB.rank ?? null,
+   572→   572→    pointsA: m.playerA.points ?? null,
+   573→   573→    pointsB: m.playerB.points ?? null,
+   574→   574→    status: m.state,
+   575→   575→    startTime: m.startTime ? new Date(m.startTime) : null,
+   576→   576→    favorite: m.favorite,
+   577→   577→    pServeA: m.reverse.pServeA,
+   578→   578→    pServeB: m.reverse.pServeB,
+   579→   579→    holdA: m.markov.gA,
+   580→   580→    holdB: m.markov.gB,
+   581→   581→    setWinA: m.markov.setWinA,
+   582→   582→    p20: m.markov.p20,
+   583→   583→    p21: m.markov.p21,
+   584→   584→    p12: m.markov.p12,
+   585→   585→    p02: m.markov.p02,
+   586→   586→    ou95: m.markov.ou95,
+   587→   587→    ou215: m.markov.ou215,
+   588→   588→    tb1: m.markov.tb1,
+   589→   589→    marketProbA: m.reverse.marketProbA ?? null,
+   590→   590→    marketOddsA: m.reverse.marketOddsA ?? null,
+   591→   591→    pEloA: m.reverse.pEloA,
+   592→   592→    pEloB: m.reverse.pEloB,
+   593→   593→    pFinalA: m.reverse.pFinalA,
+   594→   594→    pFinalB: m.reverse.pFinalB,
+   595→   595→    marketGap: m.reverse.marketGap,
+   596→   596→    vetoed: m.veto.vetoed,
+   597→   597→    vetoReason: m.veto.reason ?? null,
+   598→   598→    dualEligible: m.dualEligible,
+   599→   599→    slipAText: m.slips.A?.textEn ?? null,
+   600→   600→    slipAOdds: m.slips.A?.odds ?? null,
+   601→   601→    slipAProb: m.slips.A?.prob ?? null,
+   602→   602→    slipBText: m.slips.B?.textEn ?? null,
+   603→   603→    slipBOdds: m.slips.B?.odds ?? null,
+   604→   604→    slipBProb: m.slips.B?.prob ?? null,
+   605→   605→    timing: m.timing.label,
+   606→   606→    hashPre: m.hashPre ?? null,
+   607→   607→  };
+   608→   608→}
+   609→   609→
+   610→   610→async function persistPicks(items: LineItem[]) {
+   611→   611→  for (const item of items) {
+   612→   612→    const matchId = item.matchId;
+   613→   613→    // matchId must be a DB id; eventKeys (fallbacks) are skipped
+   614→   614→    if (!matchId || matchId.includes("__")) continue;
+   615→   615→    try {
+   616→   616→      await db.tennisPick.upsert({
+   617→   617→        where: {
+   618→   618→          matchId_line_leg: { matchId, line: item.line, leg: item.leg },
+   619→   619→        },
+   620→   620→        create: {
+   621→   621→          matchId,
+   622→   622→          line: item.line,
+   623→   623→          leg: item.leg,
+   624→   624→          desc: item.desc,
+   625→   625→          odds: item.odds,
+   626→   626→          prob: item.prob,
+   627→   627→          stake: item.stake,
+   628→   628→          meta: item.meta ?? null,
+   629→   629→          status: "PENDING",
+   630→   630→        },
+   631→   631→        update: {
+   632→   632→          desc: item.desc,
+   633→   633→          odds: item.odds,
+   634→   634→          prob: item.prob,
+   635→   635→          stake: item.stake,
+   636→   636→          meta: item.meta ?? null,
+   637→   637→        },
+   638→   638→      });
+   639→   639→    } catch (e) {
+   640→   640→      console.error("[engine] persist pick failed", item.line, item.leg, e);
+   641→   641→    }
+   642→   642→  }
+   643→   643→}
+   644→   644→
+   645→   645→// ─── Production lines assembly ─────────────────────────────────────────────
+   646→   646→
+   647→   647→const COMBO_MIN_ODDS = 2.8;
+   648→   648→const COMBO_MAX_ODDS = 5.8;
+   649→   649→// v3.0 — Tab 2 guarantee: at least 4 combos (2-leg & 3-leg serve kings)
+   650→   650→const COMBO_GUARANTEE = 4;
+   651→   651→const COMBO_FALLBACK_MIN = 2.2;
+   652→   652→const COMBO_FALLBACK_MAX = 7.2;
+   653→   653→// v3.0 — Tab 3 guarantee: at least 5 high-odds sniper signals in 4.20x–7.50x
+   654→   654→const SNIPER_MIN_ODDS = 4.2;
+   655→   655→const SNIPER_MAX_ODDS = 7.5;
+   656→   656→const SNIPER_GUARANTEE = 5;
+   657→   657→
+   658→   658→function baseItem(m: AnalyzedMatch): Omit<
+   659→   659→  LineItem,
+   660→   660→  "line" | "leg" | "desc" | "descEn" | "odds" | "prob" | "stake"
+   661→   661→> & { meta?: string } {
+   662→   662→  return {
+   663→   663→    matchId: m.dbId ?? m.eventKey,
+   664→   664→    tournament: m.tournament,
+   665→   665→    tour: m.tour,
+   666→   666→    surface: m.surface,
+   667→   667→    round: m.round,
+   668→   668→    playerA: m.playerA.name,
+   669→   669→    playerB: m.playerB.name,
+   670→   670→    rankA: m.playerA.rank,
+   671→   671→    rankB: m.playerB.rank,
+   672→   672→    favorite: m.favorite,
+   673→   673→    state: m.state,
+   674→   674→    startTime: m.startTime,
+   675→   675→    timing: m.timing,
+   676→   676→    hashPre: m.hashPre,
+   677→   677→    archetype: m.archetype,
+   678→   678→  };
+   679→   679→}
+   680→   680→
+   681→   681→/** The two complementary DUAL legs of an approved match (archetype-aware).
+   682→   682→ *  v3.0 — Match-Level Dual-Slip Accounting: the two wings are ONE position
+   683→   683→ *  on the match; total investment = Stake_A + Stake_B = 100 units (50/50). */
+   684→   684→function dualItemsOf(m: AnalyzedMatch): LineItem[] {
+   685→   685→  if (!m.slips.A || !m.slips.B) return [];
+   686→   686→  const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
+   687→   687→  const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
+   688→   688→  const DUAL_STAKE_PER_LEG = 50; // 50 + 50 = 100 units per match (doc formula)
+   689→   689→  return [
+   690→   690→    {
+   691→   691→      ...baseItem(m),
+   692→   692→      line: "DUAL",
+   693→   693→      leg: m.slips.A.leg,
+   694→   694→      desc: m.slips.A.text,
+   695→   695→      descEn: m.slips.A.textEn,
+   696→   696→      odds: m.slips.A.odds,
+   697→   697→      prob: m.slips.A.prob,
+   698→   698→      stake: DUAL_STAKE_PER_LEG,
+   699→   699→      slipProbA: m.slips.A.prob,
+   700→   700→      slipProbB: m.slips.B.prob,
+   701→   701→      meta: JSON.stringify({
+   702→   702→        kind: "dualA",
+   703→   703→        arch: m.archetype?.code,
+   704→   704→        archLabelFa: m.archetype?.labelFa,
+   705→   705→        archLabelEn: m.archetype?.labelEn,
+   706→   706→        archCoverage: m.archetype?.coverage,
+   707→   707→        archAdaptive: m.archetype?.adaptive,
+   708→   708→        favName,
+   709→   709→        eventKey: m.eventKey,
+   710→   710→      }),
+   711→   711→    },
+   712→   712→    {
+   713→   713→      ...baseItem(m),
+   714→   714→      line: "DUAL",
+   715→   715→      leg: m.slips.B.leg,
+   716→   716→      desc: m.slips.B.text,
+   717→   717→      descEn: m.slips.B.textEn,
+   718→   718→      odds: m.slips.B.odds,
+   719→   719→      prob: m.slips.B.prob,
+   720→   720→      stake: DUAL_STAKE_PER_LEG,
+   721→   721→      slipProbA: m.slips.A.prob,
+   722→   722→      slipProbB: m.slips.B.prob,
+   723→   723→      meta: JSON.stringify({
+   724→   724→        kind: "dualB",
+   725→   725→        arch: m.archetype?.code,
+   726→   726→        favName,
+   727→   727→        dogName,
+   728→   728→        eventKey: m.eventKey,
+   729→   729→      }),
+   730→   730→    },
+   731→   731→  ];
+   732→   732→}
+   733→   733→
+   734→   734→export function buildLines(analyzed: AnalyzedMatch[]) {
+   735→   735→  const dual: LineItem[] = [];
+   736→   736→  const shadow: LineItem[] = [];
+   737→   737→  const eligible = analyzed.filter((m) => m.state !== "post");
+   738→   738→
+   739→   739→  for (const m of eligible) {
+   740→   740→    const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
+   741→   741→    const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
+   742→   742→
+   743→   743→    if (!m.veto.vetoed && m.slips.A && m.slips.B && m.dualEligible) {
+   744→   744→      dual.push(...dualItemsOf(m));
+   745→   745→    }
+   746→   746→
+   747→   747→    if (m.veto.vetoed) {
+   748→   748→      const p20Fav = m.favorite === "A" ? m.markov.p20 : m.markov.p02;
+   749→   749→      const over25 = m.markov.p21 + m.markov.p12;
+   750→   750→      shadow.push({
+   751→   751→        ...baseItem(m),
+   752→   752→        line: "SHADOW",
+   753→   753→        leg: "A",
+   754→   754→        desc: `🛡️ وتوشده توسط سوپروایزر — ${m.veto.reason ?? ""}`,
+   755→   755→        descEn: `VETOED · FAV 2-0 (P=${(p20Fav * 100).toFixed(1)}%)`,
+   756→   756→        odds: p20Fav > 0.01 ? Math.round((1 / p20Fav) * 100) / 100 : 99,
+   757→   757→        prob: p20Fav,
+   758→   758→        stake: 1,
+   759→   759→        meta: JSON.stringify({ kind: "dualA", favName, eventKey: m.eventKey }),
+   760→   760→      });
+   761→   761→      shadow.push({
+   762→   762→        ...baseItem(m),
+   763→   763→        line: "SHADOW",
+   764→   764→        leg: "B",
+   765→   765→        desc: `🛡️ وتوشده توسط سوپروایزر — ${m.veto.reason ?? ""}`,
+   766→   766→        descEn: `VETOED · OVER 2.5 SETS (P=${(over25 * 100).toFixed(1)}%)`,
+   767→   767→        odds: over25 > 0.01 ? Math.round((1 / over25) * 100) / 100 : 99,
+   768→   768→        prob: over25,
+   769→   769→        stake: 1,
+   770→   770→        meta: JSON.stringify({ kind: "dualB", favName, dogName, eventKey: m.eventKey }),
+   771→   771→      });
+   772→   772→    }
+   773→   773→  }
+   774→   774→
+   775→   775→  // ── Serve-Hold Combos (2-leg & 3-leg) from strongest approved favorites
+   776→   776→  // v3.0 — Tab 2 guarantee: ≥ 4 combos total (2-leg + 3-leg). Candidates are
+   777→   777→  // generated over sliding windows of the strongest favorites; the primary
+   778→   778→  // odds window is 2.80x–5.80x and a fallback window (2.20x–7.20x) fills the
+   779→   779→  // guarantee so the tab can never be empty.
+   780→   780→  const approved = analyzed.filter(
+   781→   781→    (m) => !m.veto.vetoed && m.state !== "post" && m.favWinProb > 0.55
+   782→   782→  );
+   783→   783→  const byStrength = [...approved].sort((a, b) => b.favWinProb - a.favWinProb);
+   784→   784→  const combo2: LineItem[] = [];
+   785→   785→  const combo3: LineItem[] = [];
+   786→   786→
+   787→   787→  const makeCombo = (legs: AnalyzedMatch[], legTag: string): LineItem | null => {
+   788→   788→    if (legs.length < 2) return null;
+   789→   789→    let prob = 1;
+   790→   790→    let odds = 1;
+   791→   791→    const names: string[] = [];
+   792→   792→    const favorites: { name: string; eventKey: string }[] = [];
+   793→   793→    for (const l of legs) {
+   794→   794→      const fav = l.favorite === "A" ? l.playerA.name : l.playerB.name;
+   795→   795→      prob *= l.favWinProb;
+   796→   796→      odds *= 1 / l.favWinProb;
+   797→   797→      names.push(`${fav} WIN`);
+   798→   798→      favorites.push({ name: fav, eventKey: l.eventKey });
+   799→   799→    }
+   800→   800→    return {
+   801→   801→      ...baseItem(legs[0]),
+   802→   802→      line: "COMBO",
+   803→   803→      leg: legTag,
+   804→   804→      desc: `${legTag.startsWith("COMBO-3") ? "میکس ۳ تایی" : "میکس ۲ تایی"} سلاطین سرویس: ${names.join(" × ")}`,
+   805→   805→      descEn: names.join(" × "),
+   806→   806→      odds: Math.round(odds * 100) / 100,
+   807→   807→      prob,
+   808→   808→      stake: 1,
+   809→   809→      timing: legs[0].timing,
+   810→   810→      meta: JSON.stringify({ kind: "combo", favorites, size: legs.length }),
+   811→   811→    };
+   812→   812→  };
+   813→   813→
+   814→   814→  // all 2-leg & 3-leg candidates over sliding windows (distinct leg sets)
+   815→   815→  const seenSig = new Set<string>();
+   816→   816→  const candidates2: LineItem[] = [];
+   817→   817→  const candidates3: LineItem[] = [];
+   818→   818→  for (let i = 0; i + 2 <= byStrength.length; i++) {
+   819→   819→    for (const [tag, size, bucket] of [
+   820→   820→      ["COMBO-2", 2, candidates2],
+   821→   821→      ["COMBO-3", 3, candidates3],
+   822→   822→    ] as const) {
+   823→   823→      const legs = byStrength.slice(i, i + size);
+   824→   824→      if (legs.length < size) continue;
+   825→   825→      const c = makeCombo(legs, tag);
+   826→   826→      if (!c) continue;
+   827→   827→      const sig = `${tag}:${c.descEn}`;
+   828→   828→      if (seenSig.has(sig)) continue;
+   829→   829→      seenSig.add(sig);
+   830→   830→      bucket.push(c);
+   831→   831→    }
+   832→   832→  }
+   833→   833→  const inWindow = (c: LineItem, lo: number, hi: number) => c.odds >= lo && c.odds <= hi;
+   834→   834→  const distTo = (c: LineItem, lo: number, hi: number) =>
+   835→   835→    c.odds < lo ? lo - c.odds : c.odds > hi ? c.odds - hi : 0;
+   836→   836→
+   837→   837→  // primary window fill — keep the strongest (lowest-odds) combos inside it
+   838→   838→  for (const c of [...candidates2].sort((a, b) => a.odds - b.odds)) {
+   839→   839→    if (combo2.length >= 2) break;
+   840→   840→    if (inWindow(c, COMBO_MIN_ODDS, COMBO_MAX_ODDS)) combo2.push(c);
+   841→   841→  }
+   842→   842→  for (const c of [...candidates3].sort((a, b) => a.odds - b.odds)) {
+   843→   843→    if (combo3.length >= 2) break;
+   844→   844→    if (inWindow(c, COMBO_MIN_ODDS, COMBO_MAX_ODDS)) combo3.push(c);
+   845→   845→  }
+   846→   846→  // v3.0 guarantee — fill up to 4 total from the fallback window
+   847→   847→  if (combo2.length + combo3.length < COMBO_GUARANTEE) {
+   848→   848→    const pool = [...candidates2, ...candidates3]
+   849→   849→      .filter((c) => !combo2.includes(c) && !combo3.includes(c))
+   850→   850→      .filter((c) => inWindow(c, COMBO_FALLBACK_MIN, COMBO_FALLBACK_MAX))
+   851→   851→      .sort((a, b) => distTo(a, COMBO_MIN_ODDS, COMBO_MAX_ODDS) - distTo(b, COMBO_MIN_ODDS, COMBO_MAX_ODDS));
+   852→   852→    for (const c of pool) {
+   853→   853→      if (combo2.length + combo3.length >= COMBO_GUARANTEE) break;
+   854→   854→      (candidates2.includes(c) && combo2.length < 3 ? combo2 : combo3).push(c);
+   855→   855→    }
+   856→   856→  }
+   857→   857→
+   858→   858→  // ── High-Odds Sniper 4.20x–7.50x — v3.0 multi-candidate + ≥5 guarantee
+   859→   859→  const sniper: LineItem[] = [];
+   860→   860→  interface SnipeCandidate {
+   861→   861→    item: LineItem;
+   862→   862→    odds: number;
+   863→   863→    inWindow: boolean;
+   864→   864→  }
+   865→   865→  const snipePool: SnipeCandidate[] = [];
+   866→   866→  for (const m of approved) {
+   867→   867→    const fav = m.favorite;
+   868→   868→    const favName = fav === "A" ? m.playerA.name : m.playerB.name;
+   869→   869→    const dogName = fav === "A" ? m.playerB.name : m.playerA.name;
+   870→   870→    const s1A = solveSet(m.markov.gA, m.markov.gB, "A").winA;
+   871→   871→    const sFavSet1 = fav === "A" ? s1A : 1 - s1A;
+   872→   872→    const sFavSet = Math.sqrt(Math.max(m.favWinProb, 0.01));
+   873→   873→    const candidates: { key: string; desc: string; descEn: string; prob: number }[] = [
+   874→   874→      {
+   875→   875→        key: "comeback",
+   876→   876→        desc: `${favName} ست اول را می‌بازد و ۲-۱ کامبک می‌کند`,
+   877→   877→        descEn: `${favName} LOSES SET 1 & WINS 2-1 COMEBACK`,
+   878→   878→        prob: (1 - sFavSet1) * sFavSet * sFavSet,
+   879→   879→      },
+   880→   880→      {
+   881→   881→        key: "tiebreak",
+   882→   882→        desc: `تای‌بریک در ست اول (${m.playerA.shortName} × ${m.playerB.shortName})`,
+   883→   883→        descEn: `TIEBREAK IN SET 1 (${m.playerA.shortName} × ${m.playerB.shortName})`,
+   884→   884→        prob: m.markov.tb1,
+   885→   885→      },
+   886→   886→      {
+   887→   887→        key: "over105",
+   888→   888→        desc: `بیش از 10.5 گیم در ست اول (${m.playerA.shortName} × ${m.playerB.shortName})`,
+   889→   889→        descEn: `OVER 10.5 GAMES 1ST SET (${m.playerA.shortName} × ${m.playerB.shortName})`,
+   890→   890→        prob: m.markov.over105Set1,
+   891→   891→      },
+   892→   892→      {
+   893→   893→        key: "dog20",
+   894→   894→        desc: `برد ۲-۰ ${dogName} (سوئیپ آندرداگ)`,
+   895→   895→        descEn: `${dogName} WINS 2-0 (UNDERDOG SWEEP)`,
+   896→   896→        prob: fav === "A" ? m.markov.p02 : m.markov.p20,
+   897→   897→      },
+   898→   898→      {
+   899→   899→        key: "set3",
+   900→   900→        desc: `رفتن مسابقه به ست سوم (${m.playerA.shortName} × ${m.playerB.shortName})`,
+   901→   901→        descEn: `MATCH TO A DECIDING SET 3 (${m.playerA.shortName} × ${m.playerB.shortName})`,
+   902→   902→        prob: m.markov.p21 + m.markov.p12,
+   903→   903→      },
+   904→   904→    ];
+   905→   905→    for (const c of candidates) {
+   906→   906→      if (c.prob <= 0.02) continue;
+   907→   907→      const odds = Math.round((1 / c.prob) * 100) / 100;
+   908→   908→      snipePool.push({
+   909→   909→        item: {
+   910→   910→          ...baseItem(m),
+   911→   911→          line: "SNIPER",
+   912→   912→          leg: `SNIPER-${c.key}`,
+   913→   913→          desc: c.desc,
+   914→   914→          descEn: c.descEn,
+   915→   915→          odds,
+   916→   916→          prob: c.prob,
+   917→   917→          stake: 1,
+   918→   918→          meta: JSON.stringify({
+   919→   919→            kind: "sniper",
+   920→   920→            snipeKind: c.key,
+   921→   921→            favName,
+   922→   922→            eventKey: m.eventKey,
+   923→   923→          }),
+   924→   924→        },
+   925→   925→        odds,
+   926→   926→        inWindow: odds >= SNIPER_MIN_ODDS && odds <= SNIPER_MAX_ODDS,
+   927→   927→      });
+   928→   928→    }
+   929→   929→  }
+   930→   930→  // primary fill — in-window signals, most likely first, ≤1 per match preferred
+   931→   931→  const pickSnipers = (pool: SnipeCandidate[], take: number, perMatch: number) => {
+   932→   932→    const perCount = new Map<string, number>();
+   933→   933→    const picked: LineItem[] = [];
+   934→   934→    for (const c of pool) {
+   935→   935→      if (picked.length >= take) break;
+   936→   936→      const n = perCount.get(c.item.matchId) ?? 0;
+   937→   937→      if (n >= perMatch) continue;
+   938→   938→      perCount.set(c.item.matchId, n + 1);
+   939→   939→      picked.push(c.item);
+   940→   940→    }
+   941→   941→    return picked;
+   942→   942→  };
+   943→   943→  const inWindowPool = snipePool
+   944→   944→    .filter((c) => c.inWindow)
+   945→   945→    .sort((a, b) => a.odds - b.odds); // most likely first
+   946→   946→  sniper.push(...pickSnipers(inWindowPool, SNIPER_GUARANTEE + 3, 1));
+   947→   947→  // v3.0 guarantee — top up to 5 with nearest-outside-window candidates
+   948→   948→  if (sniper.length < SNIPER_GUARANTEE) {
+   949→   949→    const remaining = snipePool
+   950→   950→      .filter((c) => !c.inWindow && !sniper.some((s) => `${s.matchId}|${s.leg}` === `${c.item.matchId}|${c.item.leg}`))
+   951→   951→      .sort((a, b) => {
+   952→   952→        const da = Math.max(SNIPER_MIN_ODDS - a.odds, a.odds - SNIPER_MAX_ODDS, 0);
+   953→   953→        const db = Math.max(SNIPER_MIN_ODDS - b.odds, b.odds - SNIPER_MAX_ODDS, 0);
+   954→   954→        return da - db;
+   955→   955→      });
+   956→   956→    sniper.push(...pickSnipers(remaining, SNIPER_GUARANTEE - sniper.length, 1));
+   957→   957→  }
+   958→   958→  sniper.sort((a, b) => b.odds - a.odds);
+   959→   959→
+   960→   960→  // v2.0 dedupe — no pick list may contain the same (match, line, leg) twice
+   961→   961→  const dedupe = (items: LineItem[]) =>
+   962→   962→    dedupeByKey(items, (i) => `${i.matchId}|${i.line}|${i.leg}`);
+   963→   963→
+   964→   964→  return {
+   965→   965→    dual: dedupe(dual),
+   966→   966→    combo2: dedupe(combo2),
+   967→   967→    combo3: dedupe(combo3),
+   968→   968→    sniper: dedupe(sniper),
+   969→   969→    shadow: dedupe(shadow),
+   970→   970→  };
+   971→   971→}
+   972→   972→
+   973→   973→// ─── force-refresh helper (used by API) ────────────────────────────────────
+   974→   974→export function todayKeyExport(): string {
+   975→   975→  return todayKey();
+   976→   976→}
+   977→   977→

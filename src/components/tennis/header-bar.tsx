@@ -74,14 +74,14 @@ export function HeaderBar({ onRefresh, refreshing, lastUpdated, sources }: Heade
                 NeoTennis Markov Quant
               </span>
               <Badge className="border-0 bg-amber-300/15 px-1.5 py-0 text-[9px] font-bold text-amber-300">
-                v3.0
+                v4.0
               </Badge>
               <Badge variant="outline" className="gap-1 border-cyan-400/30 bg-cyan-400/5 px-1.5 py-0 text-[9px] font-bold text-cyan-300">
-                3D Hawk-Eye
+                Official Atomic Markets
               </Badge>
             </h1>
             <p className="mono-num text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-              3D Hawk-Eye Telemetry · Match-Level Ledger · Spatial Glass Edition · @aineobet Tennis Division
+              Official Atomic ATP/WTA Markets · Pro Broadcast Flashcards · Parlay Slips · @aineobet Tennis Division
             </p>
           </div>
         </div>

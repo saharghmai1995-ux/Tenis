@@ -132,6 +132,46 @@ function fitText(
   return px;
 }
 
+/**
+ * v4.0 slip-box text layout — word-wraps the market text into up to `maxLines`
+ * lines instead of shrinking it into an unreadable 13px sliver. Tries the
+ * largest size first and only steps down while everything still fits.
+ */
+function wrapFit(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  maxWidth: number,
+  startPx: number,
+  weight: string,
+  minPx: number,
+  maxLines = 2
+): string[] {
+  const words = text.split(/\s+/).filter(Boolean);
+  for (let px = startPx; px >= minPx; px -= 2) {
+    ctx.font = font(weight, px);
+    const lines: string[] = [];
+    let cur = "";
+    let ok = true;
+    for (const wd of words) {
+      const cand = cur ? `${cur} ${wd}` : wd;
+      if (ctx.measureText(cand).width <= maxWidth) {
+        cur = cand;
+      } else {
+        if (cur) lines.push(cur);
+        cur = wd;
+        if (ctx.measureText(wd).width > maxWidth) {
+          ok = false;
+          break;
+        }
+      }
+    }
+    if (cur) lines.push(cur);
+    if (ok && lines.length <= maxLines) return lines;
+  }
+  ctx.font = font(weight, minPx);
+  return [text];
+}
+
 /** Same as fitText but accounts for letter tracking. */
 function fitTracked(
   ctx: CanvasRenderingContext2D,
@@ -520,7 +560,7 @@ function drawPlayerLabel(
 ): void {
   const maxW = 440;
   const name = player.name.toUpperCase();
-  fitText(ctx, name, maxW, 42, "800");
+  fitText(ctx, name, maxW, 42, "800", false, 26);
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillStyle = "#ffffff";
@@ -536,11 +576,11 @@ function drawPlayerLabel(
       : player.seed !== undefined
         ? `SEED #${player.seed}`
         : "UNRANKED";
-  ctx.font = font("700", 19, true);
+  ctx.font = font("700", 21, true);
   const tw = measureTracked(ctx, badge, 3);
   const pw = tw + 38;
-  const ph = 36;
-  const py = nameY + 46;
+  const ph = 38;
+  const py = nameY + 48;
   roundRectPath(ctx, cx - pw / 2, py - ph / 2, pw, ph, ph / 2);
   ctx.fillStyle = "rgba(255,255,255,0.10)";
   ctx.fill();
@@ -591,7 +631,7 @@ function drawSurfaceChip(ctx: CanvasRenderingContext2D, surface: PosterSurface, 
 function drawTournamentStrip(ctx: CanvasRenderingContext2D, data: PosterData): void {
   ctx.textBaseline = "middle";
   const tournament = data.tournament.toUpperCase();
-  fitTracked(ctx, tournament, 860, 36, "800", 4);
+  fitTracked(ctx, tournament, 860, 36, "800", 4, false, 20);
   ctx.fillStyle = "rgba(255,255,255,0.95)";
   ctx.shadowColor = "rgba(255,255,255,0.4)";
   ctx.shadowBlur = 10;
@@ -599,7 +639,7 @@ function drawTournamentStrip(ctx: CanvasRenderingContext2D, data: PosterData): v
   ctx.shadowBlur = 0;
 
   const round = data.round.toUpperCase();
-  fitTracked(ctx, round, 720, 25, "700", 4, true);
+  fitTracked(ctx, round, 720, 26, "700", 4, true, 17);
   ctx.fillStyle = "rgba(255,255,255,0.62)";
   drawTracked(ctx, round, W / 2, 492, 4);
 
@@ -713,7 +753,7 @@ function drawTimingChip(ctx: CanvasRenderingContext2D, label: string, cx: number
   ctx.restore();
 }
 
-// ─── Slip boxes (glassmorphism) ─────────────────────────────────────────────
+// ─── Slip boxes (glassmorphism — v4.0 readable typography) ────────────────
 
 interface SlipBoxOpts {
   x: number;
@@ -739,30 +779,36 @@ function drawSlipBox(ctx: CanvasRenderingContext2D, opts: SlipBoxOpts): void {
 
   ctx.textBaseline = "middle";
 
-  // Label (always sharp)
-  ctx.font = font("700", 19, true);
+  // Label (always sharp) — v4.0: larger 22px label
+  ctx.font = font("700", 22, true);
   ctx.fillStyle = "rgba(255,255,255,0.72)";
   ctx.textAlign = "left";
-  drawTrackedLeft(ctx, label, x + pad, y + 28, 4);
+  drawTrackedLeft(ctx, label, x + pad, y + 32, 4);
 
   // Content (blurred in teaser mode)
   if (blurred) ctx.filter = "blur(7px)";
 
-  const maxTextW = w - pad * 2 - 210;
-  fitText(ctx, slip.textEn, maxTextW, 38, "800");
+  // v4.0 FIX — the slip text used to shrink to 13px on long official market
+  // names. It now word-wraps into up to 2 lines at a much larger size
+  // (36px → 26px floor) so the bet stays readable on every device.
+  const maxTextW = w - pad * 2 - 230;
+  const lines = wrapFit(ctx, slip.textEn, maxTextW, 36, "800", 26, 2);
   ctx.fillStyle = "#ffffff";
-  ctx.fillText(slip.textEn, x + pad, y + 72);
+  ctx.textAlign = "left";
+  ctx.fillText(lines[0], x + pad, y + 76);
+  if (lines[1]) ctx.fillText(lines[1], x + pad, y + 114);
 
-  ctx.font = font("800", 34, true);
+  // Odds — v4.0: 34px → 44px bold gold capsule text
+  ctx.font = font("800", 44, true);
   ctx.textAlign = "right";
   ctx.fillStyle = GOLD;
-  ctx.fillText(`@ ${slip.odds.toFixed(2)}`, x + w - pad, y + 72);
+  ctx.fillText(`@${slip.odds.toFixed(2)}`, x + w - pad, y + 82);
   ctx.textAlign = "left";
 
   const impliedPct = Math.max(0, Math.min(100, 100 / Math.max(slip.odds, 1.01)));
-  ctx.font = font("600", 20, true);
-  ctx.fillStyle = "rgba(255,255,255,0.68)";
-  ctx.fillText(`P ≈ ${impliedPct.toFixed(1)}%`, x + pad, y + 106);
+  ctx.font = font("600", 23, true);
+  ctx.fillStyle = "rgba(255,255,255,0.72)";
+  ctx.fillText(`P ≈ ${impliedPct.toFixed(1)}%`, x + pad, y + h - 26);
 
   ctx.filter = "none";
 }
@@ -891,24 +937,25 @@ export async function drawPoster(canvas: HTMLCanvasElement, data: PosterData): P
 
   // 5. MODEL P chip
   if (typeof data.marketProbAFav === "number" && Number.isFinite(data.marketProbAFav)) {
-    drawModelChip(ctx, Math.max(0, Math.min(1, data.marketProbAFav)), W / 2, 818);
+    drawModelChip(ctx, Math.max(0, Math.min(1, data.marketProbAFav)), W / 2, 800);
   }
 
-  // 6. Slip boxes
+  // 6. Slip boxes — v4.0: taller boxes (170px) so the official market text
+  // renders at readable sizes instead of a shrunken 13px single line
   const boxX = 90;
   const boxW = W - 180;
-  const boxH = 140;
+  const boxH = 170;
   if (data.slipA) {
-    drawSlipBox(ctx, { x: boxX, y: 868, w: boxW, h: boxH, label: "SLIP A", slip: data.slipA, blurred: false });
+    drawSlipBox(ctx, { x: boxX, y: 848, w: boxW, h: boxH, label: "SLIP A", slip: data.slipA, blurred: false });
   }
   if (data.slipB) {
     const teaser = data.mode === "teaser";
-    const by = 1028;
+    const by = 1038;
     drawSlipBox(ctx, { x: boxX, y: by, w: boxW, h: boxH, label: "SLIP B", slip: data.slipB, blurred: teaser });
     if (teaser) {
       // Dark backing panel + padlock + "UNLOCK IN VIP"
       const panelW = 250;
-      const panelH = 112;
+      const panelH = 118;
       const panelCy = by + boxH / 2 - 2;
       roundRectPath(ctx, W / 2 - panelW / 2, panelCy - panelH / 2, panelW, panelH, 20);
       ctx.fillStyle = "rgba(6,10,22,0.6)";
@@ -924,8 +971,8 @@ export async function drawPoster(canvas: HTMLCanvasElement, data: PosterData): P
     }
   }
 
-  // 7. Timing chip
-  if (data.timingLabel) drawTimingChip(ctx, data.timingLabel, W / 2, 1212);
+  // 7. Timing chip (aligned under the taller slip boxes)
+  if (data.timingLabel) drawTimingChip(ctx, data.timingLabel, W / 2, 1234);
 
   // 8. Footer telemetry
   drawFooter(ctx, data);

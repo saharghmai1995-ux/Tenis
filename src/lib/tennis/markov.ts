@@ -164,24 +164,32 @@ export function matchJointDist(
   const D1 = solveSet(gA, gB, "A").joint;
   const D2 = solveSet(gA, gB, "B").joint;
   const D3 = D1;
-  // bucket key: code | total games | set-1 winner — keeps the set-1
-  // orientation needed by the v2.0 archetype coverage mathematics
+  // bucket key: code | total games | margin | set-1 winner — keeps the set-1
+  // orientation needed by the v2.0 archetype coverage mathematics AND the
+  // v4.0 game-margin (handicap) orientation
   const buckets = new Map<
     string,
-    { code: ResultCode; games: number; set1A: boolean; prob: number }
+    { code: ResultCode; games: number; margin: number; set1A: boolean; prob: number }
   >();
 
-  const add = (code: ResultCode, games: number, set1A: boolean, prob: number) => {
-    const key = `${code}|${games}|${set1A ? "A" : "B"}`;
+  const add = (
+    code: ResultCode,
+    games: number,
+    margin: number,
+    set1A: boolean,
+    prob: number
+  ) => {
+    const key = `${code}|${games}|${margin}|${set1A ? "A" : "B"}`;
     const cell = buckets.get(key);
     if (cell) cell.prob += prob;
-    else buckets.set(key, { code, games, set1A, prob });
+    else buckets.set(key, { code, games, margin, set1A, prob });
   };
 
   for (const t1 of D1) {
     const w1A = t1.gamesA > t1.gamesB;
     const sa1 = w1A ? 1 : 0;
     const sb1 = w1A ? 0 : 1;
+    const m1 = t1.gamesA - t1.gamesB;
     // set 2
     for (const t2 of D2) {
       const w2A = t2.gamesA > t2.gamesB;
@@ -189,19 +197,20 @@ export function matchJointDist(
       const sb2 = sb1 + (w2A ? 0 : 1);
       const p12 = t1.prob * t2.prob;
       const g12 = t1.gamesA + t1.gamesB + t2.gamesA + t2.gamesB;
+      const m12 = m1 + (t2.gamesA - t2.gamesB);
       if (sa2 === 2) {
-        add("2-0", g12, w1A, p12);
+        add("2-0", g12, m12, w1A, p12);
         continue;
       }
       if (sb2 === 2) {
-        add("0-2", g12, w1A, p12);
+        add("0-2", g12, m12, w1A, p12);
         continue;
       }
       // set 3 decides
       for (const t3 of D3) {
         const w3A = t3.gamesA > t3.gamesB;
         const code: ResultCode = w3A ? "2-1" : "1-2";
-        add(code, g12 + t3.gamesA + t3.gamesB, w1A, p12 * t3.prob);
+        add(code, g12 + t3.gamesA + t3.gamesB, m12 + (t3.gamesA - t3.gamesB), w1A, p12 * t3.prob);
       }
     }
   }
@@ -209,7 +218,13 @@ export function matchJointDist(
   const cells: MatchJointCell[] = [];
   const dist = new Map<ResultCode, number[]>();
   for (const cell of buckets.values()) {
-    cells.push({ code: cell.code, games: [cell.games], prob: cell.prob, set1A: cell.set1A });
+    cells.push({
+      code: cell.code,
+      games: [cell.games],
+      prob: cell.prob,
+      set1A: cell.set1A,
+      margin: cell.margin,
+    });
     let arr = dist.get(cell.code);
     if (!arr) {
       arr = new Array(MAX_GAMES + 1).fill(0);
@@ -223,15 +238,15 @@ export function matchJointDist(
 // ─── v2.0 · Exact archetype metrics from the joint Bo3 distribution ────────
 /**
  * Computes every quantity the 3-archetype supervisor needs, directly from the
- * exact terminal-path distribution (outcome × total games × set-1 winner).
- * All outputs are favorite-oriented (`fav` side).
+ * exact terminal-path distribution (outcome × total games × margin × set-1
+ * winner). All outputs are favorite-oriented (`fav` side).
  *
- * Uncovered (simultaneous-loss) spaces:
- *  · ARCH1 — underdog wins 2-0 straight sets.
- *  · ARCH2 — favorite 2-1 escape in ≤ 19 games (the only 2-1 total below the
- *            19.5 floor is the 6-4 6-4 6-4 triple) UNION dog wins the match
- *            1-2 after losing set 1.
- *  · ARCH3 — underdog wins the match in ≤ 22 total games.
+ * v4.0 uncovered (simultaneous-loss) spaces of the official atomic legs:
+ *  · ARCH1 — Set Betting Fav 2-0 ∪ Total Sets O2.5 → uncovered = underdog 2-0.
+ *  · ARCH2 — Set Betting P1 2-0 ∪ Set Betting P1 2-1 → uncovered = player 1
+ *            loses the match (the two legs cover 100% of P1's win paths).
+ *  · ARCH3 — Total Games O22.5 ∪ Game Handicap Fav −4.5 → uncovered =
+ *            match ends ≤ 22 total games AND favorite does not win by ≥ 5.
  */
 export function archetypeMetrics(
   cells: MatchJointCell[],
@@ -247,6 +262,7 @@ export function archetypeMetrics(
   let fav20Under225 = 0;
   let dogSet1 = 0;
   let over225 = 0;
+  let fav20Margin5 = 0;
   let pairLoss3 = 0;
 
   for (const c of cells) {
@@ -256,6 +272,7 @@ export function archetypeMetrics(
       ? c.code === "2-0" || c.code === "2-1"
       : c.code === "0-2" || c.code === "1-2";
     const favWon20 = favIsA ? c.code === "2-0" : c.code === "0-2";
+    const favMargin = favIsA ? c.margin : -c.margin;
     const set1WonByFav = c.set1A === favIsA;
 
     if (favWonMatch && g >= 20) favWinOver195 += p;
@@ -263,7 +280,10 @@ export function archetypeMetrics(
     if (favWon20 && g <= 22) fav20Under225 += p;
     if (!set1WonByFav) dogSet1 += p;
     if (g >= 23) over225 += p;
-    if (!favWonMatch && g <= 22) pairLoss3 += p;
+    if (favWonMatch && favMargin >= 5) fav20Margin5 += p;
+    // ARCH3 pair loss (v4.0): both atomic legs lose when the match ends in
+    // ≤ 22 total games AND the favorite does not win by a ≥ 5-game margin
+    if (g <= 22 && !(favWonMatch && favMargin >= 5)) pairLoss3 += p;
   }
 
   // ARCH1 pair loss = underdog 2-0 (straight-set sweep of the favorite)
@@ -272,17 +292,12 @@ export function archetypeMetrics(
       .filter((c) => (favIsA ? c.code === "0-2" : c.code === "2-0"))
       .reduce((s, c) => s + c.prob, 0) / norm;
 
-  // ARCH2 pair loss = {fav 2-1 escape in ≤ 19 games} ∪ {dog wins 1-2 after fav took set 1}
-  let pairLoss2 = 0;
-  for (const c of cells) {
-    const g = c.games[0] ?? 0;
-    const p = c.prob / norm;
-    const favWonMatch21 = favIsA ? c.code === "2-1" : c.code === "1-2";
-    const dogWonMatch12 = favIsA ? c.code === "1-2" : c.code === "2-1";
-    const set1WonByFav = c.set1A === favIsA;
-    if (favWonMatch21 && g <= 19) pairLoss2 += p;
-    if (dogWonMatch12 && set1WonByFav) pairLoss2 += p;
-  }
+  // v4.0 ARCH2 pair loss = the two Set Betting legs (P1 2-0 + P1 2-1) cover
+  // 100% of player-1's win paths, so the uncovered space is P1 losing the match
+  const pairLoss2 =
+    cells
+      .filter((c) => (favIsA ? c.code === "0-2" || c.code === "1-2" : c.code === "2-0" || c.code === "2-1"))
+      .reduce((s, c) => s + c.prob, 0) / norm;
 
   return {
     set1Fav: favIsA ? set1WinA : 1 - set1WinA,
@@ -291,10 +306,91 @@ export function archetypeMetrics(
     dogSet1,
     over225,
     fav20Under225,
+    fav20Margin5,
     pairLoss1,
     pairLoss2,
     pairLoss3,
   };
+}
+
+// ─── v4.0 · Exact Break-Point-Saved % (i.i.d. point-model DP) ──────────────
+/**
+ * Expected share of break points SAVED (server goes on to hold the game)
+ * for a server who wins each point on serve with probability p.
+ * Computed exactly with a game-state DP:
+ *   · backward pass — P(hold | state (s,r)) with the closed-form deuce value
+ *     D = p²/(p²+q²); break-point states are (0-3), (1-3), (2-3) and the
+ *     advantage-returner state (3-4);
+ *   · forward pass — arrival mass of every state, with the deuce sub-chain
+ *     (3-3 → adv states ⇄ deuce) solved in closed form;
+ *   · BPS = Σ arrival × P(hold | that BP state) / Σ arrival.
+ */
+export function breakPointSavedProb(p: number): number {
+  const q = 1 - p;
+  if (p <= 0) return 0;
+  if (p >= 1) return 1;
+  const D = (p * p) / (p * p + q * q); // P(server wins game from deuce)
+
+  const memo = new Map<number, number>();
+  const holdFrom = (s: number, r: number): number => {
+    if (s >= 4 && s - r >= 2) return 1; // game won
+    if (r >= 4 && r - s >= 2) return 0; // game lost (broken)
+    if ((s === 3 && r === 3) || (s === 4 && r === 4)) return D; // deuce
+    const k = s * 10 + r;
+    const hit = memo.get(k);
+    if (hit !== undefined) return hit;
+    const winNext = s + 1 >= 4 && s + 1 - r >= 2 ? 1 : holdFrom(Math.min(s + 1, 4), r);
+    const loseNext = r + 1 >= 4 && r + 1 - s >= 2 ? 0 : holdFrom(s, Math.min(r + 1, 4));
+    const v = p * winNext + q * loseNext;
+    memo.set(k, v);
+    return v;
+  };
+
+  // forward arrival mass (states only grow s+r → process in ascending order)
+  const arrive = new Map<number, number>();
+  arrive.set(0, 1); // (0,0)
+  const isDeuce = (s: number, r: number) => (s === 3 && r === 3) || (s === 4 && r === 4);
+  for (let sum = 0; sum <= 8; sum++) {
+    for (let s = 0; s <= Math.min(sum, 4); s++) {
+      const r = sum - s;
+      if (r < 0 || r > 4) continue;
+      if (s >= 4 && s - r >= 2) continue; // absorbed hold
+      if (r >= 4 && r - s >= 2) continue; // absorbed break
+      if (isDeuce(s, r)) continue; // deuce sub-chain handled in closed form
+      const m = arrive.get(s * 10 + r);
+      if (!m) continue;
+      const winAbsorb = s + 1 >= 4 && s + 1 - r >= 2;
+      const loseAbsorb = r + 1 >= 4 && r + 1 - s >= 2;
+      if (!winAbsorb) {
+        const k = Math.min(s + 1, 4) * 10 + r;
+        arrive.set(k, (arrive.get(k) ?? 0) + m * p);
+      }
+      if (!loseAbsorb) {
+        const k = s * 10 + Math.min(r + 1, 4);
+        arrive.set(k, (arrive.get(k) ?? 0) + m * q);
+      }
+    }
+  }
+
+  // deuce sub-chain — x = arrival mass entering 3-3
+  const x = arrive.get(33) ?? 0;
+  const m44 = (2 * x * p * q) / (1 - 2 * p * q);
+  const m43 = p * (x + m44); // advantage server
+  const m34 = q * (x + m44); // advantage returner — an official break point
+
+  const bpArrival =
+    (arrive.get(3) ?? 0) + // (0,3)
+    (arrive.get(13) ?? 0) + // (1,3)
+    (arrive.get(23) ?? 0) + // (2,3)
+    m34;
+  if (bpArrival <= 1e-9) return 1; // no break point ever faced — vacuously saved
+
+  const saved =
+    (arrive.get(3) ?? 0) * holdFrom(0, 3) +
+    (arrive.get(13) ?? 0) * holdFrom(1, 3) +
+    (arrive.get(23) ?? 0) * holdFrom(2, 3) +
+    m34 * holdFrom(3, 4);
+  return saved / bpArrival;
 }
 
 // ─── Full Engine Pipeline: serve probs → all derived quantities ────────────
@@ -311,6 +407,9 @@ export interface FullMarkov {
   p02: number;
   ou215: number;
   slipBCombined: number;
+  /** v4.0 — exact expected Break-Point-Saved % per server */
+  bpsA: number;
+  bpsB: number;
   arch: ArchMetrics; // v2.0 — favorite-oriented archetype coverage metrics
 }
 
@@ -371,6 +470,8 @@ export function fullMarkov(pA: number, pB: number): FullMarkov {
     p02: bo3.p02,
     ou215: over215,
     slipBCombined,
+    bpsA: breakPointSavedProb(pA),
+    bpsB: breakPointSavedProb(pB),
     arch,
   };
 }
