@@ -1,11 +1,13 @@
 "use client";
 
-// ─── NeoTennis Markov Quant v3.0 — 3D Multi-Ring Win-Rate Gyroscope ────────
-// Replaces the flat v2.0 semicircle gauge: three concentric light rings
-// rotating slowly in opposite directions (SVG stroke-dasharray + CSS 3D
-// rotation) with floating light particles around the combined win rate.
+// ─── NeoTennis Markov Quant v4.5 — 3D Multi-Ring Core Win-Rate Gyroscope ───
+// v4.5 FIX: the hub shows the CORE SYSTEM WIN RATE (complementary golden
+// pairs + safe service-king mixes). The high-odds sniper line is displayed
+// separately — its 1-unit misses are never merged into the core number
+// (the old merged gauge read 60.6% while the core was 89.4%).
 
 import { useMemo } from "react";
+import { Crosshair } from "lucide-react";
 
 function ring(
   cx: number,
@@ -64,10 +66,12 @@ export function GyroGauge({
   rate,
   dualRate,
   roiRate,
+  sniperRate,
 }: {
-  rate: number; // combined win rate 0..1
+  rate: number; // v4.5 — CORE system win rate 0..1 (DUAL + COMBO)
   dualRate: number; // DUAL line match-level win rate 0..1
   roiRate: number; // ROI 0..1 (clamped)
+  sniperRate?: number; // v4.5 — sniper line win rate, shown separately
 }) {
   const pct = Math.max(0, Math.min(1, rate));
   const dualPct = Math.max(0, Math.min(1, dualRate));
@@ -91,7 +95,7 @@ export function GyroGauge({
       <span aria-hidden className="float-particle absolute bottom-10 left-8 h-1 w-1 rounded-full bg-amber-300/70" style={{ animationDelay: "1.6s" }} />
       <span aria-hidden className="float-particle absolute bottom-4 right-10 h-1.5 w-1.5 rounded-full bg-white/50" style={{ animationDelay: "2.4s" }} />
 
-      <svg viewBox="0 0 220 220" className="w-full max-w-[240px]" role="img" aria-label={`وین‌ریت ترکیبی ${(pct * 100).toFixed(1)} درصد`}>
+      <svg viewBox="0 0 220 220" className="w-full max-w-[240px]" role="img" aria-label={`وین‌ریت هسته اصلی ${(pct * 100).toFixed(1)} درصد`}>
         <defs>
           <linearGradient id="gyroOuter" x1="0" y1="0" x2="1" y2="1">
             <stop offset="0%" stopColor="#34d399" />
@@ -114,15 +118,29 @@ export function GyroGauge({
         >
           {(pct * 100).toFixed(1)}%
         </text>
-        <text x="110" y="126" textAnchor="middle" fill="rgba(255,255,255,0.55)" fontSize="9">
-          COMBINED WIN RATE
+        <text x="110" y="126" textAnchor="middle" fill="rgba(255,255,255,0.55)" fontSize="8.5">
+          CORE SYSTEM WIN RATE
         </text>
       </svg>
+
+      {/* v4.5 — sniper stats live OUTSIDE the core gauge */}
+      {typeof sniperRate === "number" && (
+        <div
+          className="mt-2 flex items-center gap-2 rounded-xl border border-rose-300/25 bg-rose-300/10 px-3 py-1.5 text-[10px]"
+          aria-label="وین‌ریت جداگانه تک‌تیرانداز"
+        >
+          <Crosshair className="h-3 w-3 shrink-0 text-rose-300" />
+          <span className="text-rose-200">تک‌تیرانداز ضریب بالا — جدا از هسته:</span>
+          <span className="mono-num font-extrabold text-rose-100" dir="ltr">
+            {(sniperRate * 100).toFixed(0)}%
+          </span>
+        </div>
+      )}
 
       {/* ring legend */}
       <div className="mt-1 flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-[10px] text-muted-foreground">
         <span className="flex items-center gap-1.5">
-          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" /> وین‌ریت ترکیبی
+          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" /> وین‌ریت هسته اصلی (زوج‌تیپ + میکس امن)
         </span>
         <span className="flex items-center gap-1.5">
           <span className="h-1.5 w-1.5 rounded-full bg-amber-300" /> زوج‌تیپ در سطح مسابقه

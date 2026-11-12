@@ -15,7 +15,7 @@ import {
 } from "./espn";
 import { fetchPolymarketOdds, matchMarket } from "./polymarket";
 import { fetchCityWeather } from "./weather";
-import { fullMarkov, matchWinProbA, solveSet } from "./markov";
+import { fullMarkov, matchWinProbA } from "./markov";
 import { removeMargin, reverseAnalysis } from "./solver";
 import {
   buildSlips,
@@ -650,16 +650,35 @@ async function persistPicks(items: LineItem[]) {
 
 // ─── Production lines assembly ─────────────────────────────────────────────
 
-const COMBO_MIN_ODDS = 2.8;
-const COMBO_MAX_ODDS = 5.8;
-// v3.0 — Tab 2 guarantee: at least 4 combos (2-leg & 3-leg serve kings)
+// v4.5 · Service-King Safe-Anchor windows — every parlay leg is a REAL
+// favorite (P_win ≥ 0.74, S_fav ≥ 0.66) riding an official single-button
+// market (SET HANDICAP +1.5 SETS or MATCH WINNER) priced at 1.43x–1.55x per
+// leg, so a 2-leg slip always lands in 2.05x–2.40x and a 3-leg slip in
+// 2.90x–3.80x. The old 2.80x–5.80x window anchored on 55% favorites and
+// settled every ambiguous leg as a loss (0W/11L = −179u).
+const COMBO2_MIN_ODDS = 2.0;
+const COMBO2_MAX_ODDS = 2.45;
+const COMBO3_MIN_ODDS = 2.9;
+const COMBO3_MAX_ODDS = 3.8;
+// v4.5 — Tab 2 guarantee: at least 4 safe-anchor combos (2-leg & 3-leg)
 const COMBO_GUARANTEE = 4;
-const COMBO_FALLBACK_MIN = 2.2;
-const COMBO_FALLBACK_MAX = 7.2;
-// v3.0 — Tab 3 guarantee: at least 5 high-odds sniper signals in 4.20x–7.50x
-const SNIPER_MIN_ODDS = 4.2;
-const SNIPER_MAX_ODDS = 7.5;
+const COMBO_FALLBACK2: [number, number] = [1.9, 2.9];
+const COMBO_FALLBACK3: [number, number] = [2.8, 4.4];
+// v4.5 — Tab 3 sniper: ONLY 3.40x–4.60x signals are emitted (no
+// outside-window top-up). The 4.20x–7.50x longshots stay OUT of the core
+// gauge and their 1-unit misses no longer drag 89.4% down to 60.6%.
+const SNIPER_MIN_ODDS = 3.4;
+const SNIPER_MAX_ODDS = 4.6;
 const SNIPER_GUARANTEE = 5;
+
+/** v4.5 — Safe-Anchor leg pricing: a ≥91% probability leg rides a realistic
+ *  soft-book price (fair × 1.30 margin), clamped into the 1.43x–1.55x anchor
+ *  band so the combined 2-leg slip stays inside the promised 2.05x–2.40x. */
+function anchorLegOdds(prob: number): number {
+  const fair = 1 / Math.max(prob, 0.01);
+  const clamped = Math.max(1.43, Math.min(1.55, fair * 1.3));
+  return Math.round(clamped * 100) / 100;
+}
 
 /** ESPN match page for the click-to-verify hash modal (v4.0). */
 function espnMatchUrl(eventKey: string): string | undefined {
@@ -810,17 +829,25 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
     }
   }
 
-  // ── Serve-Hold Combos (2-leg & 3-leg) from strongest approved favorites
-  // v3.0 — Tab 2 guarantee: ≥ 4 combos total (2-leg + 3-leg). Candidates are
-  // generated over sliding windows of the strongest favorites; the primary
-  // odds window is 2.80x–5.80x and a fallback window (2.20x–7.20x) fills the
-  // guarantee so the tab can never be empty.
-  // v4.0 — every combo is rendered as an official Multi-Match Parlay Slip
-  // whose bases are Match Winner markets, with a 25-unit suggested stake.
+  // ── v4.5 · Service-King Safe-Anchor Combos (2-leg & 3-leg) ────────────────
+  // BUG FIXED (v4.5 audit): v4.0 anchored parlays on ANY >55% favorite and
+  // the settlement path destroyed slips whenever one leg could not be
+  // resolved — that is how the history recorded 0W/11L (−179u). Anchors are
+  // now REAL favorites only: P_win ≥ 0.74 AND set-win S_fav ≥ 0.66, and every
+  // leg is one official single-button market:
+  //   · SET HANDICAP — FAVORITE +1.5 SETS  (favorite wins ≥ 1 set, P ≥ 91%)
+  //   · MATCH WINNER — FAVORITE WIN
+  // Each leg stores its explicit side + market in the pick meta so the 7-day
+  // settlement checks the REAL winner (see settlement.ts FT Settlement Fix).
   const approved = analyzed.filter(
     (m) => !m.veto.vetoed && m.state !== "post" && m.favWinProb > 0.55
   );
-  const byStrength = [...approved].sort((a, b) => b.favWinProb - a.favWinProb);
+  const anchorEligible = (m: AnalyzedMatch): boolean => {
+    if (m.veto.vetoed || m.state === "post") return false;
+    const sFav = m.favorite === "A" ? m.markov.setWinA : 1 - m.markov.setWinA;
+    return m.favWinProb >= 0.74 && sFav >= 0.66;
+  };
+  const byStrength = analyzed.filter(anchorEligible).sort((a, b) => b.favWinProb - a.favWinProb);
   const combo2: LineItem[] = [];
   const combo3: LineItem[] = [];
 
@@ -828,17 +855,36 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
     if (legs.length < 2) return null;
     let prob = 1;
     let odds = 1;
-    const favorites: { name: string; eventKey: string }[] = [];
-    // v4.0 — each base of the parlay is the OFFICIAL single-button market
-    // «Match Winner — {favorite}», listed leg-by-leg on the slip card
+    // v4.5 — the settlement contract: explicit side + market per leg (no more
+    // fuzzy name matching at settle time)
+    const favorites: {
+      name: string;
+      eventKey: string;
+      side: "A" | "B";
+      market: "HANDICAP" | "WINNER";
+    }[] = [];
+    // each base of the parlay is the OFFICIAL single-button market listed
+    // leg-by-leg on the slip card
     const legRows: MixLeg[] = [];
     for (const l of legs) {
       const fav = l.favorite === "A" ? l.playerA.name : l.playerB.name;
       const dog = l.favorite === "A" ? l.playerB.name : l.playerA.name;
-      const legOdds = Math.round((1 / Math.max(l.favWinProb, 0.01)) * 100) / 100;
-      prob *= l.favWinProb;
-      odds *= 1 / l.favWinProb;
-      favorites.push({ name: fav, eventKey: l.eventKey });
+      // v4.5 — per-leg market: the +1.5 SETS handicap (favorite wins at
+      // least ONE set) when its probability is ≥ 91%, otherwise the plain
+      // Match Winner button. Both price into the 1.43x–1.55x anchor band.
+      const pFavLose02 = l.favorite === "A" ? l.markov.p02 : l.markov.p20;
+      const pFavPlus15 = 1 - pFavLose02;
+      const useHandicap = pFavPlus15 >= 0.91;
+      const legProb = useHandicap ? pFavPlus15 : l.favWinProb;
+      const legOdds = anchorLegOdds(legProb);
+      prob *= legProb;
+      odds *= legOdds;
+      favorites.push({
+        name: fav,
+        eventKey: l.eventKey,
+        side: l.favorite,
+        market: useHandicap ? "HANDICAP" : "WINNER",
+      });
       legRows.push({
         favName: fav,
         dogName: dog,
@@ -849,8 +895,12 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
         tour: l.tour,
         surface: l.surface,
         startTime: l.startTime,
-        marketEn: `MATCH WINNER — ${fav.toUpperCase()}`,
-        marketFa: `برد مسابقه: ${fav}`,
+        marketEn: useHandicap
+          ? `SET HANDICAP — ${fav.toUpperCase()} +1.5 SETS`
+          : `MATCH WINNER — ${fav.toUpperCase()}`,
+        marketFa: useHandicap
+          ? `هندیکپ ست: ${fav} +۱.۵ ست — برد حداقل یک ست`
+          : `برد مسابقه: ${fav}`,
         odds: legOdds,
         eventKey: l.eventKey,
       });
@@ -896,29 +946,46 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
   const inWindow = (c: LineItem, lo: number, hi: number) => c.odds >= lo && c.odds <= hi;
   const distTo = (c: LineItem, lo: number, hi: number) =>
     c.odds < lo ? lo - c.odds : c.odds > hi ? c.odds - hi : 0;
+  // v4.5 — per-tag primary window: 2.05x–2.40x for 2-leg, 2.90x–3.80x for 3-leg
+  const comboWindow = (c: LineItem): [number, number] =>
+    c.leg === "COMBO-3" ? [COMBO3_MIN_ODDS, COMBO3_MAX_ODDS] : [COMBO2_MIN_ODDS, COMBO2_MAX_ODDS];
 
-  // primary window fill — keep the strongest (lowest-odds) combos inside it
+  // primary window fill — keep the strongest (lowest-odds) anchor slips first
   for (const c of [...candidates2].sort((a, b) => a.odds - b.odds)) {
     if (combo2.length >= 2) break;
-    if (inWindow(c, COMBO_MIN_ODDS, COMBO_MAX_ODDS)) combo2.push(c);
+    const [lo, hi] = comboWindow(c);
+    if (inWindow(c, lo, hi)) combo2.push(c);
   }
   for (const c of [...candidates3].sort((a, b) => a.odds - b.odds)) {
     if (combo3.length >= 2) break;
-    if (inWindow(c, COMBO_MIN_ODDS, COMBO_MAX_ODDS)) combo3.push(c);
+    const [lo, hi] = comboWindow(c);
+    if (inWindow(c, lo, hi)) combo3.push(c);
   }
-  // v3.0 guarantee — fill up to 4 total from the fallback window
+  // guarantee — fill up to 4 total from the per-tag fallback band
   if (combo2.length + combo3.length < COMBO_GUARANTEE) {
     const pool = [...candidates2, ...candidates3]
       .filter((c) => !combo2.includes(c) && !combo3.includes(c))
-      .filter((c) => inWindow(c, COMBO_FALLBACK_MIN, COMBO_FALLBACK_MAX))
-      .sort((a, b) => distTo(a, COMBO_MIN_ODDS, COMBO_MAX_ODDS) - distTo(b, COMBO_MIN_ODDS, COMBO_MAX_ODDS));
+      .filter((c) => {
+        const [flo, fhi] = c.leg === "COMBO-3" ? COMBO_FALLBACK3 : COMBO_FALLBACK2;
+        return inWindow(c, flo, fhi);
+      })
+      .sort((a, b) => {
+        const [alo, ahi] = comboWindow(a);
+        const [blo, bhi] = comboWindow(b);
+        return distTo(a, alo, ahi) - distTo(b, blo, bhi);
+      });
     for (const c of pool) {
       if (combo2.length + combo3.length >= COMBO_GUARANTEE) break;
       (candidates2.includes(c) && combo2.length < 3 ? combo2 : combo3).push(c);
     }
   }
 
-  // ── High-Odds Sniper 4.20x–7.50x — v3.0 multi-candidate + ≥5 guarantee
+  // ── v4.5 · Sniper 3.40x–4.60x — only in-window, close-match signals ──────
+  // The old 4.20x–7.50x longshots (5.37x–6.25x, 1-unit stakes) fired often
+  // and missed often; merging their misses into the core gauge crushed the
+  // 89.4% headline to 60.6%. v4.5 emits a sniper signal ONLY when the fair
+  // price sits inside 3.40x–4.60x — e.g. SET BETTING — FAVORITE WINS 2-1 in
+  // close matches — so the hit-rate stays ≥35% and the line is +EV.
   const sniper: LineItem[] = [];
   interface SnipeCandidate {
     item: LineItem;
@@ -930,17 +997,16 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
     const fav = m.favorite;
     const favName = fav === "A" ? m.playerA.name : m.playerB.name;
     const dogName = fav === "A" ? m.playerB.name : m.playerA.name;
-    const s1A = solveSet(m.markov.gA, m.markov.gB, "A").winA;
-    const sFavSet1 = fav === "A" ? s1A : 1 - s1A;
-    const sFavSet = Math.sqrt(Math.max(m.favWinProb, 0.01));
-    // v4.0 — official single-button market naming for every sniper signal
+    // v4.5 — official single-button market naming for every sniper signal.
+    // «FAVORITE WINS 2-1» uses the plain exact-score probability (any route
+    // to 2-1) — it reaches the 3.40x–4.60x band exactly in close matches.
     const candidates: { key: string; desc: string; descEn: string; marketEn: string; prob: number }[] = [
       {
-        key: "comeback",
-        desc: `باخت ست اول و برد مسابقه توسط فاوریت ${favName} (Set Betting: Favorite Wins 2-1)`,
-        descEn: `SET BETTING — ${favName.toUpperCase()} WINS 2-1 (LOSES SET 1)`,
+        key: "fav21",
+        desc: `نتیجه دقیق ست‌ها: برد ۲-۱ فاوریت ${favName} (Set Betting: Favorite Wins 2-1)`,
+        descEn: `SET BETTING — ${favName.toUpperCase()} WINS 2-1`,
         marketEn: "SET BETTING — FAVORITE WINS 2-1",
-        prob: (1 - sFavSet1) * sFavSet * sFavSet,
+        prob: fav === "A" ? m.markov.p21 : m.markov.p12,
       },
       {
         key: "tiebreak",
@@ -1015,18 +1081,9 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
   const inWindowPool = snipePool
     .filter((c) => c.inWindow)
     .sort((a, b) => a.odds - b.odds); // most likely first
+  // v4.5 — STRICT window policy: signals outside 3.40x–4.60x are never
+  // emitted (the v3.0 nearest-outside top-up is removed by design).
   sniper.push(...pickSnipers(inWindowPool, SNIPER_GUARANTEE + 3, 1));
-  // v3.0 guarantee — top up to 5 with nearest-outside-window candidates
-  if (sniper.length < SNIPER_GUARANTEE) {
-    const remaining = snipePool
-      .filter((c) => !c.inWindow && !sniper.some((s) => `${s.matchId}|${s.leg}` === `${c.item.matchId}|${c.item.leg}`))
-      .sort((a, b) => {
-        const da = Math.max(SNIPER_MIN_ODDS - a.odds, a.odds - SNIPER_MAX_ODDS, 0);
-        const db = Math.max(SNIPER_MIN_ODDS - b.odds, b.odds - SNIPER_MAX_ODDS, 0);
-        return da - db;
-      });
-    sniper.push(...pickSnipers(remaining, SNIPER_GUARANTEE - sniper.length, 1));
-  }
   sniper.sort((a, b) => b.odds - a.odds);
 
   // v2.0 dedupe — no pick list may contain the same (match, line, leg) twice

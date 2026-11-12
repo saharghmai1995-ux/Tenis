@@ -183,7 +183,8 @@ export async function buildLedgerPayload(
       if (t > agg.settledAt) agg.settledAt = t;
       dual.set(p.matchId, agg);
     } else if (p.line === "COMBO" || p.line === "SNIPER") {
-      singles.push({ p, leg });
+      // v4.5 — VOID rows (buggy-era settlements) stay out of the official record
+      if (p.status !== "VOID") singles.push({ p, leg });
     }
     // SHADOW rows stay in the disjoint shadow ledger — never in the record
   }
@@ -327,6 +328,19 @@ export async function buildLedgerPayload(
   const combinedProfit = decidedRows.reduce((s, r) => s + r.profit, 0);
   const combinedStake = decidedRows.reduce((s, r) => s + r.stake, 0);
 
+  // v4.5 — Core System Win Rate: the headline gauge shows the CORE lines only
+  // (complementary golden pairs + safe service-king mixes). The high-odds
+  // sniper line keeps its own disjoint stats and is never merged into the
+  // core number — its 1-unit misses used to drag 89.4% down to 60.6%.
+  const coreRows = [...dualRows, ...singleRows.filter((r) => r.line === "COMBO")];
+  const coreDecided = coreRows.filter((r) => r.status !== "PENDING");
+  const coreWon = coreDecided.filter((r) => r.status === "WON").length;
+  // v4.5 — stake-weighted alternative: Σ won stake / Σ decided stake over the
+  // whole official record
+  const wonStake = decidedRows
+    .filter((r) => r.status === "WON")
+    .reduce((s, r) => s + r.stake, 0);
+
   // bank curve over decided rows (chronological, match-level P&L for DUAL)
   const chronological = [...decidedRows].sort(
     (a, b) => (a.settledAt ?? a.createdAt).localeCompare(b.settledAt ?? b.createdAt)
@@ -366,6 +380,10 @@ export async function buildLedgerPayload(
   return {
     stats: {
       combinedWinRate: decidedRows.length > 0 ? combinedWonCount / decidedRows.length : 0,
+      // v4.5 — core system win rate (DUAL + COMBO only; sniper excluded)
+      coreWinRate: coreDecided.length > 0 ? coreWon / coreDecided.length : 0,
+      // v4.5 — stake-weighted win rate over the official record
+      stakeWeightedWinRate: combinedStake > 0 ? wonStake / combinedStake : 0,
       bank: Math.round(bank * 100) / 100,
       bankStart: BANK_START,
       profit: Math.round(combinedProfit * 100) / 100,

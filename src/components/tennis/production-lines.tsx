@@ -317,7 +317,7 @@ function RetirementRuleBadge() {
 
 // ─── v4.0 click-to-verify SHA-256 hash chip + modal ────────────────────────
 
-function espnUrlOf(eventKey?: string, espnUrl?: string): string | null {
+function espnUrlOf(eventKey?: string, espnUrl?: string): string {
   if (espnUrl) return espnUrl;
   if (eventKey && /^\d+$/.test(eventKey)) {
     return `https://www.espn.com/tennis/match/_/gameId/${eventKey}`;
@@ -579,33 +579,33 @@ function ParlaySlipCard({ item }: { item: LineItem }) {
           </span>
         </div>
 
-        {/* legs table — every base listed separately */}
+        {/* legs table — every base listed separately (v4.5: readable sizes) */}
         <div className="scroll-slim mt-3 max-h-96 space-y-2 overflow-y-auto pe-1">
           {legs.map((leg, i) => (
-            <div key={`${leg.eventKey}-${i}`} className="rounded-xl border border-white/10 bg-white/[0.04] p-2.5">
+            <div key={`${leg.eventKey}-${i}`} className="rounded-xl border border-white/10 bg-white/[0.04] p-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="mono-num text-[10px] font-black text-cyan-300" dir="ltr">
+                <span className="mono-num text-xs font-black text-cyan-300" dir="ltr">
                   LEG {i + 1}
                 </span>
-                <span className="text-[11px] font-bold text-white/90">
+                <span className="text-xs font-bold text-white">
                   {leg.favName} <span className="text-white/40">×</span> {leg.dogName}
                 </span>
               </div>
-              <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-muted-foreground">
+              <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-white/70">
                 <SurfaceDot surface={leg.surface} />
                 <span>{leg.tournament}</span>
                 <span dir="ltr">· {leg.tour} {leg.round}</span>
                 <span>· ساعت {legTime(leg.startTime)}</span>
               </div>
-              <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2">
-                <span className="mono-num text-[10px] font-bold text-white/75" dir="ltr">
+              <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+                <span className="mono-num text-[11px] font-bold text-white/85" dir="ltr">
                   MARKET: {leg.marketEn}
                 </span>
-                <span className="mono-num text-[11px] font-extrabold text-amber-200" dir="ltr">
+                <span className="mono-num text-sm font-extrabold text-amber-200" dir="ltr">
                   @{leg.odds.toFixed(2)}
                 </span>
               </div>
-              <div className="mt-0.5 text-[10px] text-muted-foreground">{leg.marketFa}</div>
+              <div className="mt-1 text-[11px] text-white/60">{leg.marketFa}</div>
             </div>
           ))}
         </div>
@@ -616,19 +616,19 @@ function ParlaySlipCard({ item }: { item: LineItem }) {
             <div className="mono-num text-sm font-extrabold text-white" dir="ltr">
               {item.odds.toFixed(2)}x
             </div>
-            <div className="mt-0.5 text-[9px] text-muted-foreground">ضریب کل میکس (Combined Odds)</div>
+            <div className="mt-0.5 text-[10px] text-white/65">ضریب کل میکس (Combined Odds)</div>
           </div>
           <div className="rounded-xl border border-white/10 bg-white/[0.04] p-2 text-center">
             <div className="mono-num text-sm font-extrabold text-white" dir="ltr">
               {(item.prob * 100).toFixed(1)}%
             </div>
-            <div className="mt-0.5 text-[9px] text-muted-foreground">احتمال زنجیره مارکوف</div>
+            <div className="mt-0.5 text-[10px] text-white/65">احتمال زنجیره مارکوف</div>
           </div>
           <div className="rounded-xl border border-amber-300/30 bg-amber-300/10 p-2 text-center">
             <div className="mono-num text-sm font-extrabold text-amber-200" dir="ltr">
               {item.stake} واحد
             </div>
-            <div className="mt-0.5 text-[9px] text-amber-200/70">مبلغ استیک پیشنهادی</div>
+            <div className="mt-0.5 text-[10px] text-amber-200/70">مبلغ استیک پیشنهادی</div>
           </div>
         </div>
 
@@ -852,7 +852,9 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
             <TabsContent value="combo" className="mt-4 space-y-3">
               {[...combo2, ...combo3].length === 0 ? (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  برگه میکسی با پنجره هدف <span className="mono-num">2.80x–5.80x</span> یافت نشد — سلاطین سرویس امروز در تداخل رنکینگ هستند.
+                  برگه میکس امنی با پنجره هدف <span className="mono-num">2.05x–2.40x</span> (۲تایی) یا{" "}
+                  <span className="mono-num">2.90x–3.80x</span> (۳تایی) یافت نشد — پایه‌های امن سلاطین سرویس
+                  (فاوریت با احتمال برد <span className="mono-num">≥74%</span>) امروز در تداخل رنکینگ هستند.
                 </div>
               ) : (
                 <div className="grid gap-3 xl:grid-cols-2">
@@ -866,7 +868,8 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
             <TabsContent value="sniper" className="mt-4 space-y-3">
               {sniper.length === 0 ? (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  تیر خالصی در پنجره هدف <span className="mono-num">4.20x–7.50x</span> پیدا نشد.
+                  تیر خالصی در پنجره هدف <span className="mono-num">3.40x–4.60x</span> پیدا نشد — اسنایپر فقط
+                  در بازی‌های نزدیک سیگنال صادر می‌کند (SET BETTING — FAVORITE WINS 2-1).
                 </div>
               ) : (
                 <div className="grid gap-3 xl:grid-cols-2">

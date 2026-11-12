@@ -84,6 +84,8 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
   const streakUp = stats.streak > 0;
   const best = stats.bestWin;
   const dualGroup = groups.find((g) => g.line === "DUAL");
+  const sniperGroup = groups.find((g) => g.line === "SNIPER");
+  const sniperDecided = sniperGroup ? sniperGroup.picks - sniperGroup.pending : 0;
 
   const kpis = [
     {
@@ -120,22 +122,31 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
   return (
     <section aria-label="مرکز فرماندهی وین‌ریت" className="space-y-4">
       <div className="grid gap-4 lg:grid-cols-3">
-        {/* v3.0 — 3D multi-ring gyroscope */}
+        {/* v4.5 — 3D multi-ring gyroscope · CORE win rate only */}
         <Card className="spatial-card neon-conic rise-in rounded-2xl">
           <CardHeader className="pb-0">
             <CardTitle className="flex items-center gap-2 text-sm font-bold">
               <Flame className="h-4 w-4 text-amber-300" />
-              گیج ژیروسکوپی سه‌بعدی وین‌ریت
+              گیج ژیروسکوپی وین‌ریت هسته اصلی
             </CardTitle>
           </CardHeader>
           <CardContent className="pt-2">
             <GyroGauge
-              rate={stats.combinedWinRate}
+              rate={stats.coreWinRate}
               dualRate={dualGroup ? dualGroup.winRate : 0}
               roiRate={Math.max(0, stats.roi)}
+              sniperRate={sniperGroup && sniperDecided > 0 ? sniperGroup.winRate : undefined}
             />
-            <p className="text-center text-[11px] text-muted-foreground">
-              تجمیع ۳ خط تولید — تسویه خودکار ۷ روزه ESPN — حسابداری در سطح مسابقه
+            <p className="text-center text-[11px] leading-5 text-muted-foreground">
+              وین‌ریت هسته اصلی = زوج‌تیپ طلایی مکمل + میکس‌های امن سلاطین سرویس —
+              تک‌تیرانداز ضریب بالا <span className="font-bold text-rose-300">جدا محاسبه می‌شود</span>
+            </p>
+            <p className="mt-1 text-center text-[10px] text-muted-foreground">
+              وین‌ریت وزن‌دار سرمایه: {" "}
+              <span className="mono-num text-amber-300" dir="ltr">
+                {(stats.stakeWeightedWinRate * 100).toFixed(1)}%
+              </span>{" "}
+              · تسویه خودکار ۷ روزه ESPN · حسابداری در سطح مسابقه
             </p>
             {ledger.quota && ledger.quota.poolSize > 0 && (
               <div className="mt-2 flex items-center justify-center gap-2 text-[10px] text-muted-foreground">

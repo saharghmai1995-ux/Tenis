@@ -17,7 +17,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "نئوتنیس مارکوف کوانت v4.0 | NeoTennis Markov Quant",
+  title: "نئوتنیس مارکوف کوانت v4.5 | NeoTennis Markov Quant",
   description:
     "ترمینال کمّی مهندسی تنیس حرفه‌ای ATP/WTA — رادار سه‌بعدی چشم شاهین، زنجیره مارکوف ۴ لایه، مهندسی معکوس ضرایب، سوپروایزر ۳ الگویی با سهمیه تایید ۶۵٪ و کارنامه SHA-256 در سطح مسابقه",
   keywords: [

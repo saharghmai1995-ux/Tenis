@@ -133,9 +133,11 @@ function fitText(
 }
 
 /**
- * v4.0 slip-box text layout — word-wraps the market text into up to `maxLines`
- * lines instead of shrinking it into an unreadable 13px sliver. Tries the
- * largest size first and only steps down while everything still fits.
+ * v4.5 slip-box text layout — word-wraps the market text into up to `maxLines`
+ * large lines instead of shrinking it into unreadable print. Tries the
+ * largest size first and only steps down while everything still fits. If no
+ * size fits within maxLines, the text is greedily wrapped at the floor size
+ * (never drawn as one overflowing line).
  */
 function wrapFit(
   ctx: CanvasRenderingContext2D,
@@ -168,8 +170,21 @@ function wrapFit(
     if (cur) lines.push(cur);
     if (ok && lines.length <= maxLines) return lines;
   }
+  // greedy wrap at the floor size — the fallback keeps every word on-canvas
   ctx.font = font(weight, minPx);
-  return [text];
+  const lines: string[] = [];
+  let cur = "";
+  for (const wd of words) {
+    const cand = cur ? `${cur} ${wd}` : wd;
+    if (!cur || ctx.measureText(cand).width <= maxWidth) {
+      cur = cand;
+    } else {
+      lines.push(cur);
+      cur = wd;
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines.slice(0, maxLines + 1);
 }
 
 /** Same as fitText but accounts for letter tracking. */
@@ -767,7 +782,7 @@ interface SlipBoxOpts {
 
 function drawSlipBox(ctx: CanvasRenderingContext2D, opts: SlipBoxOpts): void {
   const { x, y, w, h, label, slip, blurred } = opts;
-  const pad = 30;
+  const pad = 32;
 
   // Glass panel
   roundRectPath(ctx, x, y, w, h, 26);
@@ -779,36 +794,36 @@ function drawSlipBox(ctx: CanvasRenderingContext2D, opts: SlipBoxOpts): void {
 
   ctx.textBaseline = "middle";
 
-  // Label (always sharp) — v4.0: larger 22px label
-  ctx.font = font("700", 22, true);
+  // Label (always sharp) — v4.5: 24px tracked label
+  ctx.font = font("700", 24, true);
   ctx.fillStyle = "rgba(255,255,255,0.72)";
   ctx.textAlign = "left";
-  drawTrackedLeft(ctx, label, x + pad, y + 32, 4);
+  drawTrackedLeft(ctx, label, x + pad, y + 34, 4);
 
   // Content (blurred in teaser mode)
   if (blurred) ctx.filter = "blur(7px)";
 
-  // v4.0 FIX — the slip text used to shrink to 13px on long official market
-  // names. It now word-wraps into up to 2 lines at a much larger size
-  // (36px → 26px floor) so the bet stays readable on every device.
-  const maxTextW = w - pad * 2 - 230;
-  const lines = wrapFit(ctx, slip.textEn, maxTextW, 36, "800", 26, 2);
+  // v4.5 FIX — the slip market text renders BIG: up to 3 wrapped lines at
+  // 42px → 30px floor (v4.0 capped it at a 26px two-line floor that still
+  // read as tiny print on long official market names).
+  const maxTextW = w - pad * 2 - 250;
+  const lines = wrapFit(ctx, slip.textEn, maxTextW, 42, "800", 30, 3);
+  const lineYs = [y + 76, y + 120, y + 164];
   ctx.fillStyle = "#ffffff";
   ctx.textAlign = "left";
-  ctx.fillText(lines[0], x + pad, y + 76);
-  if (lines[1]) ctx.fillText(lines[1], x + pad, y + 114);
+  lines.slice(0, 3).forEach((ln, i) => ctx.fillText(ln, x + pad, lineYs[i]));
 
-  // Odds — v4.0: 34px → 44px bold gold capsule text
-  ctx.font = font("800", 44, true);
+  // Odds — v4.5: 52px bold gold in the right column
+  ctx.font = font("800", 52, true);
   ctx.textAlign = "right";
   ctx.fillStyle = GOLD;
-  ctx.fillText(`@${slip.odds.toFixed(2)}`, x + w - pad, y + 82);
-  ctx.textAlign = "left";
-
+  ctx.fillText(`@${slip.odds.toFixed(2)}`, x + w - pad, y + 84);
+  // implied probability directly under the odds (right column)
   const impliedPct = Math.max(0, Math.min(100, 100 / Math.max(slip.odds, 1.01)));
-  ctx.font = font("600", 23, true);
+  ctx.font = font("600", 26, true);
   ctx.fillStyle = "rgba(255,255,255,0.72)";
-  ctx.fillText(`P ≈ ${impliedPct.toFixed(1)}%`, x + pad, y + h - 26);
+  ctx.fillText(`P ≈ ${impliedPct.toFixed(1)}%`, x + w - pad, y + 136);
+  ctx.textAlign = "left";
 
   ctx.filter = "none";
 }
@@ -940,17 +955,17 @@ export async function drawPoster(canvas: HTMLCanvasElement, data: PosterData): P
     drawModelChip(ctx, Math.max(0, Math.min(1, data.marketProbAFav)), W / 2, 800);
   }
 
-  // 6. Slip boxes — v4.0: taller boxes (170px) so the official market text
-  // renders at readable sizes instead of a shrunken 13px single line
+  // 6. Slip boxes — v4.5: 186px-tall boxes so the official market text
+  // renders at 30–42px over up to 3 wrapped lines (never shrunken small print)
   const boxX = 90;
   const boxW = W - 180;
-  const boxH = 170;
+  const boxH = 186;
   if (data.slipA) {
-    drawSlipBox(ctx, { x: boxX, y: 848, w: boxW, h: boxH, label: "SLIP A", slip: data.slipA, blurred: false });
+    drawSlipBox(ctx, { x: boxX, y: 842, w: boxW, h: boxH, label: "SLIP A", slip: data.slipA, blurred: false });
   }
   if (data.slipB) {
     const teaser = data.mode === "teaser";
-    const by = 1038;
+    const by = 1046;
     drawSlipBox(ctx, { x: boxX, y: by, w: boxW, h: boxH, label: "SLIP B", slip: data.slipB, blurred: teaser });
     if (teaser) {
       // Dark backing panel + padlock + "UNLOCK IN VIP"
@@ -972,7 +987,7 @@ export async function drawPoster(canvas: HTMLCanvasElement, data: PosterData): P
   }
 
   // 7. Timing chip (aligned under the taller slip boxes)
-  if (data.timingLabel) drawTimingChip(ctx, data.timingLabel, W / 2, 1234);
+  if (data.timingLabel) drawTimingChip(ctx, data.timingLabel, W / 2, 1262);
 
   // 8. Footer telemetry
   drawFooter(ctx, data);

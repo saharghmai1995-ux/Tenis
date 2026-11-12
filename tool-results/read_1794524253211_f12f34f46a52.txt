@@ -1,0 +1,980 @@
+     1→// ─── NeoTennis Markov Quant — Procedural Poster Engine ─────────────────────
+     2→// Pure canvas drawing module (no React, no DOM assumptions beyond the
+     3→// HTMLCanvasElement passed in). Renders a 1080×1440 (3:4 Telegram standard)
+     4→// poster with 100% English typography, procedurally drawn 3D court
+     5→// background (per surface), neon player rings, glowing tennis ball and
+     6→// glassmorphism slip boxes. All randomness is seeded → same match renders
+     7→// pixel-identically.
+     8→
+     9→export type PosterSurface = "HARD" | "CLAY" | "GRASS";
+    10→
+    11→export interface PosterPlayer {
+    12→  name: string;
+    13→  shortName: string;
+    14→  flagUrl?: string; // espncdn flag — loaded via same-origin proxy /api/tennis/img
+    15→  rank?: number;
+    16→  seed?: number;
+    17→}
+    18→
+    19→export interface PosterData {
+    20→  playerA: PosterPlayer;
+    21→  playerB: PosterPlayer;
+    22→  tournament: string;
+    23→  round: string;
+    24→  surface: PosterSurface;
+    25→  favorite: "A" | "B";
+    26→  slipA?: { textEn: string; odds: number };
+    27→  slipB?: { textEn: string; odds: number };
+    28→  hashPre?: string; // SHA-256 hex — first 10 chars shown uppercase
+    29→  timingLabel?: string; // e.g. "T-30m Pre-Warmup" (English)
+    30→  marketProbAFav?: number; // market probability of the favorite (0..1)
+    31→  mode: "teaser" | "full"; // teaser = Slip B blurred + padlock
+    32→  preview?: boolean; // engineering-review render — draws a MODEL PREVIEW ribbon
+    33→}
+    34→
+    35→// ─── Internals ──────────────────────────────────────────────────────────────
+    36→
+    37→const W = 1080;
+    38→const H = 1440;
+    39→const FLAG_TIMEOUT_MS = 4500;
+    40→
+    41→const FONT_STACK = '"Segoe UI", "Helvetica Neue", Arial, sans-serif';
+    42→const MONO_STACK = '"JetBrains Mono", "SF Mono", Consolas, "Courier New", monospace';
+    43→
+    44→const GOLD = "#ffd166";
+    45→const OPTIC = "#dfff4f";
+    46→
+    47→interface CourtPalette {
+    48→  surroundTop: string;
+    49→  surroundBottom: string;
+    50→  courtTop: string;
+    51→  courtBottom: string;
+    52→  line: string;
+    53→  chipColor: string;
+    54→}
+    55→
+    56→const PALETTES: Record<PosterSurface, CourtPalette> = {
+    57→  HARD: {
+    58→    surroundTop: "#1e4d8f",
+    59→    surroundBottom: "#12356e",
+    60→    courtTop: "#0b1e3a",
+    61→    courtBottom: "#123a6b",
+    62→    line: "rgba(233,244,255,0.92)",
+    63→    chipColor: "#67e8f9",
+    64→  },
+    65→  CLAY: {
+    66→    surroundTop: "#7c2f16",
+    67→    surroundBottom: "#511f0e",
+    68→    courtTop: "#a63d1e",
+    69→    courtBottom: "#c65a2e",
+    70→    line: "rgba(250,236,220,0.9)",
+    71→    chipColor: "#fb923c",
+    72→  },
+    73→  GRASS: {
+    74→    surroundTop: "#0a4227",
+    75→    surroundBottom: "#06301c",
+    76→    courtTop: "#0e5c33",
+    77→    courtBottom: "#1d7a45",
+    78→    line: "rgba(232,255,240,0.9)",
+    79→    chipColor: "#34d399",
+    80→  },
+    81→};
+    82→
+    83→const SURFACE_CHIPS: Record<PosterSurface, { text: string; color: string }> = {
+    84→  HARD: { text: "HARD COURT", color: "#67e8f9" },
+    85→  CLAY: { text: "CLAY COURT", color: "#fb923c" },
+    86→  GRASS: { text: "GRASS COURT", color: "#34d399" },
+    87→};
+    88→
+    89→// ─── Deterministic RNG (mulberry32) ────────────────────────────────────────
+    90→
+    91→function hashStringToSeed(input: string): number {
+    92→  let h = 1779033703 ^ input.length;
+    93→  for (let i = 0; i < input.length; i++) {
+    94→    h = Math.imul(h ^ input.charCodeAt(i), 3432918353);
+    95→    h = (h << 13) | (h >>> 19);
+    96→  }
+    97→  return h >>> 0;
+    98→}
+    99→
+   100→function mulberry32(seed: number): () => number {
+   101→  let a = seed >>> 0;
+   102→  return () => {
+   103→    a = (a + 0x6d2b79f5) | 0;
+   104→    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+   105→    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+   106→    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+   107→  };
+   108→}
+   109→
+   110→// ─── Small canvas helpers ───────────────────────────────────────────────────
+   111→
+   112→function font(weight: string, px: number, mono = false): string {
+   113→  return `${weight} ${px}px ${mono ? MONO_STACK : FONT_STACK}`;
+   114→}
+   115→
+   116→/** Shrink font size until `text` fits `maxWidth`. Returns the final px size. */
+   117→function fitText(
+   118→  ctx: CanvasRenderingContext2D,
+   119→  text: string,
+   120→  maxWidth: number,
+   121→  startPx: number,
+   122→  weight: string,
+   123→  mono = false,
+   124→  minPx = 13
+   125→): number {
+   126→  let px = startPx;
+   127→  for (;;) {
+   128→    ctx.font = font(weight, px, mono);
+   129→    if (ctx.measureText(text).width <= maxWidth || px <= minPx) break;
+   130→    px -= 2;
+   131→  }
+   132→  return px;
+   133→}
+   134→
+   135→/**
+   136→ * v4.0 slip-box text layout — word-wraps the market text into up to `maxLines`
+   137→ * lines instead of shrinking it into an unreadable 13px sliver. Tries the
+   138→ * largest size first and only steps down while everything still fits.
+   139→ */
+   140→function wrapFit(
+   141→  ctx: CanvasRenderingContext2D,
+   142→  text: string,
+   143→  maxWidth: number,
+   144→  startPx: number,
+   145→  weight: string,
+   146→  minPx: number,
+   147→  maxLines = 2
+   148→): string[] {
+   149→  const words = text.split(/\s+/).filter(Boolean);
+   150→  for (let px = startPx; px >= minPx; px -= 2) {
+   151→    ctx.font = font(weight, px);
+   152→    const lines: string[] = [];
+   153→    let cur = "";
+   154→    let ok = true;
+   155→    for (const wd of words) {
+   156→      const cand = cur ? `${cur} ${wd}` : wd;
+   157→      if (ctx.measureText(cand).width <= maxWidth) {
+   158→        cur = cand;
+   159→      } else {
+   160→        if (cur) lines.push(cur);
+   161→        cur = wd;
+   162→        if (ctx.measureText(wd).width > maxWidth) {
+   163→          ok = false;
+   164→          break;
+   165→        }
+   166→      }
+   167→    }
+   168→    if (cur) lines.push(cur);
+   169→    if (ok && lines.length <= maxLines) return lines;
+   170→  }
+   171→  ctx.font = font(weight, minPx);
+   172→  return [text];
+   173→}
+   174→
+   175→/** Same as fitText but accounts for letter tracking. */
+   176→function fitTracked(
+   177→  ctx: CanvasRenderingContext2D,
+   178→  text: string,
+   179→  maxWidth: number,
+   180→  startPx: number,
+   181→  weight: string,
+   182→  tracking: number,
+   183→  mono = false,
+   184→  minPx = 12
+   185→): number {
+   186→  let px = startPx;
+   187→  for (;;) {
+   188→    ctx.font = font(weight, px, mono);
+   189→    if (measureTracked(ctx, text, tracking) <= maxWidth || px <= minPx) break;
+   190→    px -= 2;
+   191→  }
+   192→  return px;
+   193→}
+   194→
+   195→function measureTracked(ctx: CanvasRenderingContext2D, text: string, tracking: number): number {
+   196→  if (!text) return 0;
+   197→  let w = 0;
+   198→  for (const ch of text) w += ctx.measureText(ch).width + tracking;
+   199→  return w - tracking;
+   200→}
+   201→
+   202→function drawTracked(
+   203→  ctx: CanvasRenderingContext2D,
+   204→  text: string,
+   205→  cx: number,
+   206→  cy: number,
+   207→  tracking: number
+   208→): void {
+   209→  const total = measureTracked(ctx, text, tracking);
+   210→  let x = cx - total / 2;
+   211→  const prevAlign = ctx.textAlign;
+   212→  ctx.textAlign = "left";
+   213→  for (const ch of text) {
+   214→    ctx.fillText(ch, x, cy);
+   215→    x += ctx.measureText(ch).width + tracking;
+   216→  }
+   217→  ctx.textAlign = prevAlign;
+   218→}
+   219→
+   220→function drawTrackedLeft(
+   221→  ctx: CanvasRenderingContext2D,
+   222→  text: string,
+   223→  x: number,
+   224→  cy: number,
+   225→  tracking: number
+   226→): void {
+   227→  const prevAlign = ctx.textAlign;
+   228→  ctx.textAlign = "left";
+   229→  let cursor = x;
+   230→  for (const ch of text) {
+   231→    ctx.fillText(ch, cursor, cy);
+   232→    cursor += ctx.measureText(ch).width + tracking;
+   233→  }
+   234→  ctx.textAlign = prevAlign;
+   235→}
+   236→
+   237→function roundRectPath(
+   238→  ctx: CanvasRenderingContext2D,
+   239→  x: number,
+   240→  y: number,
+   241→  w: number,
+   242→  h: number,
+   243→  r: number
+   244→): void {
+   245→  const rr = Math.min(r, w / 2, h / 2);
+   246→  ctx.beginPath();
+   247→  ctx.moveTo(x + rr, y);
+   248→  ctx.lineTo(x + w - rr, y);
+   249→  ctx.arcTo(x + w, y, x + w, y + rr, rr);
+   250→  ctx.lineTo(x + w, y + h - rr);
+   251→  ctx.arcTo(x + w, y + h, x + w - rr, y + h, rr);
+   252→  ctx.lineTo(x + rr, y + h);
+   253→  ctx.arcTo(x, y + h, x, y + h - rr, rr);
+   254→  ctx.lineTo(x, y + rr);
+   255→  ctx.arcTo(x, y, x + rr, y, rr);
+   256→  ctx.closePath();
+   257→}
+   258→
+   259→function getInitials(name: string): string {
+   260→  const parts = name.trim().split(/\s+/).filter(Boolean);
+   261→  if (parts.length === 0) return "?";
+   262→  const initials = parts
+   263→    .slice(0, 2)
+   264→    .map((p) => p.charAt(0))
+   265→    .join("");
+   266→  return initials.toUpperCase() || "?";
+   267→}
+   268→
+   269→// ─── Flag loading (same-origin proxy, parallel, timeout fallback) ──────────
+   270→
+   271→function loadFlag(url: string): Promise<HTMLImageElement | null> {
+   272→  return new Promise((resolve) => {
+   273→    const img = new Image();
+   274→    let settled = false;
+   275→    let timer = 0;
+   276→    const finish = (result: HTMLImageElement | null): void => {
+   277→      if (settled) return;
+   278→      settled = true;
+   279→      if (timer) window.clearTimeout(timer);
+   280→      resolve(result);
+   281→    };
+   282→    timer = window.setTimeout(() => finish(null), FLAG_TIMEOUT_MS);
+   283→    img.onload = () => finish(img);
+   284→    img.onerror = () => finish(null);
+   285→    img.src = `/api/tennis/img?url=${encodeURIComponent(url)}`;
+   286→  });
+   287→}
+   288→
+   289→// ─── Court background ───────────────────────────────────────────────────────
+   290→
+   291→function drawCourt(ctx: CanvasRenderingContext2D, pal: CourtPalette): void {
+   292→  const cx = W / 2;
+   293→  const topY = 520;
+   294→  const botY = 1436;
+   295→  const topHW = 200; // half width at top baseline
+   296→  const botHW = 530; // half width at bottom baseline
+   297→  const span = botY - topY;
+   298→  const netFrac = 0.4;
+   299→  const singlesFrac = 0.75;
+   300→  const serviceGapFrac = 18 / 39; // net→service line : service line→baseline
+   301→
+   302→  const halfWAt = (y: number): number => topHW + (botHW - topHW) * ((y - topY) / span);
+   303→  const xAt = (side: 1 | -1, y: number, frac: number): number => cx + side * halfWAt(y) * frac;
+   304→
+   305→  // Surround
+   306→  const bg = ctx.createLinearGradient(0, 0, 0, H);
+   307→  bg.addColorStop(0, pal.surroundTop);
+   308→  bg.addColorStop(1, pal.surroundBottom);
+   309→  ctx.fillStyle = bg;
+   310→  ctx.fillRect(0, 0, W, H);
+   311→
+   312→  // Court trapezoid (wider at bottom → broadcast overhead perspective)
+   313→  const netY = topY + span * netFrac;
+   314→  const serviceTopY = netY - (netY - topY) * serviceGapFrac;
+   315→  const serviceBotY = netY + (botY - netY) * serviceGapFrac;
+   316→
+   317→  ctx.beginPath();
+   318→  ctx.moveTo(cx - topHW, topY);
+   319→  ctx.lineTo(cx + topHW, topY);
+   320→  ctx.lineTo(cx + botHW, botY);
+   321→  ctx.lineTo(cx - botHW, botY);
+   322→  ctx.closePath();
+   323→  const cg = ctx.createLinearGradient(0, topY, 0, botY);
+   324→  cg.addColorStop(0, pal.courtTop);
+   325→  cg.addColorStop(1, pal.courtBottom);
+   326→  ctx.fillStyle = cg;
+   327→  ctx.fill();
+   328→
+   329→  // Court shadow edge (subtle 3D depth along top edge)
+   330→  const edge = ctx.createLinearGradient(0, topY - 26, 0, topY + 30);
+   331→  edge.addColorStop(0, "rgba(0,0,0,0)");
+   332→  edge.addColorStop(0.75, "rgba(0,0,0,0.22)");
+   333→  edge.addColorStop(1, "rgba(0,0,0,0)");
+   334→  ctx.fillStyle = edge;
+   335→  ctx.fillRect(cx - topHW - 60, topY - 26, topHW * 2 + 120, 56);
+   336→
+   337→  // Lines — neon white, width grows toward the viewer
+   338→  ctx.save();
+   339→  ctx.strokeStyle = pal.line;
+   340→  ctx.shadowColor = "rgba(255,255,255,0.55)";
+   341→  ctx.shadowBlur = 7;
+   342→  ctx.lineCap = "butt";
+   343→
+   344→  const lwAt = (y: number): number => 3 + 3.6 * ((y - topY) / span);
+   345→  const seg = (x1: number, y1: number, x2: number, y2: number, yRef: number): void => {
+   346→    ctx.lineWidth = lwAt(yRef);
+   347→    ctx.beginPath();
+   348→    ctx.moveTo(x1, y1);
+   349→    ctx.lineTo(x2, y2);
+   350→    ctx.stroke();
+   351→  };
+   352→
+   353→  // Doubles sidelines + baselines
+   354→  seg(xAt(-1, topY, 1), topY, xAt(-1, botY, 1), botY, (topY + botY) / 2);
+   355→  seg(xAt(1, topY, 1), topY, xAt(1, botY, 1), botY, (topY + botY) / 2);
+   356→  seg(xAt(-1, topY, 1), topY, xAt(1, topY, 1), topY, topY);
+   357→  seg(xAt(-1, botY, 1), botY, xAt(1, botY, 1), botY, botY);
+   358→
+   359→  // Singles sidelines
+   360→  seg(xAt(-1, topY, singlesFrac), topY, xAt(-1, botY, singlesFrac), botY, (topY + botY) / 2);
+   361→  seg(xAt(1, topY, singlesFrac), topY, xAt(1, botY, singlesFrac), botY, (topY + botY) / 2);
+   362→
+   363→  // Service lines
+   364→  seg(xAt(-1, serviceTopY, singlesFrac), serviceTopY, xAt(1, serviceTopY, singlesFrac), serviceTopY, serviceTopY);
+   365→  seg(xAt(-1, serviceBotY, singlesFrac), serviceBotY, xAt(1, serviceBotY, singlesFrac), serviceBotY, serviceBotY);
+   366→
+   367→  // Center service line (net → service line, both halves)
+   368→  seg(cx, serviceTopY, cx, serviceBotY, netY);
+   369→
+   370→  // Net: dark band + bright cord, slightly wider than the court
+   371→  const netHalfW = halfWAt(netY) * 1.12;
+   372→  ctx.shadowBlur = 0;
+   373→  ctx.fillStyle = "rgba(2,8,20,0.35)";
+   374→  ctx.fillRect(cx - netHalfW, netY - 6, netHalfW * 2, 14);
+   375→  ctx.shadowColor = "rgba(255,255,255,0.8)";
+   376→  ctx.shadowBlur = 10;
+   377→  ctx.strokeStyle = "rgba(255,255,255,0.95)";
+   378→  ctx.lineWidth = 4;
+   379→  ctx.beginPath();
+   380→  ctx.moveTo(cx - netHalfW, netY);
+   381→  ctx.lineTo(cx + netHalfW, netY);
+   382→  ctx.stroke();
+   383→
+   384→  // Center marks on both baselines
+   385→  ctx.shadowBlur = 4;
+   386→  ctx.strokeStyle = pal.line;
+   387→  ctx.lineWidth = 5;
+   388→  ctx.beginPath();
+   389→  ctx.moveTo(cx, topY + 4);
+   390→  ctx.lineTo(cx, topY + 20);
+   391→  ctx.moveTo(cx, botY - 20);
+   392→  ctx.lineTo(cx, botY - 4);
+   393→  ctx.stroke();
+   394→  ctx.restore();
+   395→}
+   396→
+   397→function drawFloodBeams(ctx: CanvasRenderingContext2D, intensity: number): void {
+   398→  ctx.save();
+   399→  ctx.globalCompositeOperation = "screen";
+   400→
+   401→  const beam = (x0: number, y0: number, x1: number, x2: number, y1: number): void => {
+   402→    const g = ctx.createLinearGradient(x0, y0, (x1 + x2) / 2, y1);
+   403→    g.addColorStop(0, `rgba(103,232,249,${(0.2 * intensity).toFixed(3)})`);
+   404→    g.addColorStop(1, "rgba(103,232,249,0)");
+   405→    ctx.fillStyle = g;
+   406→    ctx.beginPath();
+   407→    ctx.moveTo(x0, y0);
+   408→    ctx.lineTo(x1, y1);
+   409→    ctx.lineTo(x2, y1);
+   410→    ctx.closePath();
+   411→    ctx.fill();
+   412→  };
+   413→  beam(-40, -40, 170, 640, 780);
+   414→  beam(W + 40, -40, W - 170, W - 640, 780);
+   415→
+   416→  const lamp = (x: number, y: number): void => {
+   417→    const g = ctx.createRadialGradient(x, y, 0, x, y, 280);
+   418→    g.addColorStop(0, `rgba(224,247,255,${(0.55 * intensity).toFixed(3)})`);
+   419→    g.addColorStop(1, "rgba(224,247,255,0)");
+   420→    ctx.fillStyle = g;
+   421→    ctx.fillRect(x - 280, y - 280, 560, 560);
+   422→  };
+   423→  lamp(24, 10);
+   424→  lamp(W - 24, 10);
+   425→  ctx.restore();
+   426→}
+   427→
+   428→function drawClayDust(ctx: CanvasRenderingContext2D, rng: () => number): void {
+   429→  ctx.save();
+   430→  ctx.globalCompositeOperation = "screen";
+   431→  for (let i = 0; i < 120; i++) {
+   432→    const x = 30 + rng() * (W - 60);
+   433→    const y = 110 + rng() * 1260;
+   434→    const r = 1.2 + rng() * 4.2;
+   435→    const a = 0.1 + rng() * 0.38;
+   436→    ctx.fillStyle = `rgba(255,207,122,${a.toFixed(3)})`;
+   437→    ctx.shadowColor = "rgba(255,190,90,0.85)";
+   438→    ctx.shadowBlur = 8;
+   439→    ctx.beginPath();
+   440→    ctx.arc(x, y, r, 0, Math.PI * 2);
+   441→    ctx.fill();
+   442→  }
+   443→  ctx.restore();
+   444→}
+   445→
+   446→function drawGrassHalo(ctx: CanvasRenderingContext2D, cx: number, cy: number, intensity: number): void {
+   447→  ctx.save();
+   448→  ctx.globalCompositeOperation = "screen";
+   449→  const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, 340);
+   450→  g.addColorStop(0, `rgba(255,209,102,${(0.28 * intensity).toFixed(3)})`);
+   451→  g.addColorStop(0.5, `rgba(255,209,102,${(0.1 * intensity).toFixed(3)})`);
+   452→  g.addColorStop(1, "rgba(255,209,102,0)");
+   453→  ctx.fillStyle = g;
+   454→  ctx.fillRect(cx - 340, cy - 340, 680, 680);
+   455→  ctx.restore();
+   456→}
+   457→
+   458→function drawVignette(ctx: CanvasRenderingContext2D): void {
+   459→  const g = ctx.createRadialGradient(W / 2, 640, 260, W / 2, 720, 1000);
+   460→  g.addColorStop(0, "rgba(0,0,0,0)");
+   461→  g.addColorStop(1, "rgba(0,0,0,0.5)");
+   462→  ctx.fillStyle = g;
+   463→  ctx.fillRect(0, 0, W, H);
+   464→
+   465→  // Top readability scrim (rings / names area)
+   466→  const top = ctx.createLinearGradient(0, 0, 0, 310);
+   467→  top.addColorStop(0, "rgba(2,6,16,0.55)");
+   468→  top.addColorStop(1, "rgba(2,6,16,0)");
+   469→  ctx.fillStyle = top;
+   470→  ctx.fillRect(0, 0, W, 310);
+   471→
+   472→  // Bottom readability scrim (slips / footer area)
+   473→  const bot = ctx.createLinearGradient(0, 1120, 0, H);
+   474→  bot.addColorStop(0, "rgba(2,6,16,0)");
+   475→  bot.addColorStop(1, "rgba(2,6,16,0.55)");
+   476→  ctx.fillStyle = bot;
+   477→  ctx.fillRect(0, 1120, W, H - 1120);
+   478→}
+   479→
+   480→// ─── Players: neon rings, flags, names, badges ─────────────────────────────
+   481→
+   482→function drawFlagOrInitials(
+   483→  ctx: CanvasRenderingContext2D,
+   484→  img: HTMLImageElement | null,
+   485→  cx: number,
+   486→  cy: number,
+   487→  r: number,
+   488→  name: string,
+   489→  accent: string
+   490→): void {
+   491→  ctx.save();
+   492→  if (img && img.width > 0 && img.height > 0) {
+   493→    ctx.beginPath();
+   494→    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+   495→    ctx.clip();
+   496→    const scale = Math.max((2 * r) / img.width, (2 * r) / img.height);
+   497→    const dw = img.width * scale;
+   498→    const dh = img.height * scale;
+   499→    ctx.drawImage(img, cx - dw / 2, cy - dh / 2, dw, dh);
+   500→  } else {
+   501→    // Fallback: dark disc + neon ring + initials
+   502→    ctx.beginPath();
+   503→    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+   504→    ctx.fillStyle = "rgba(4,10,24,0.85)";
+   505→    ctx.fill();
+   506→    ctx.shadowColor = accent;
+   507→    ctx.shadowBlur = 18;
+   508→    ctx.strokeStyle = accent;
+   509→    ctx.lineWidth = 4;
+   510→    ctx.beginPath();
+   511→    ctx.arc(cx, cy, r - 7, 0, Math.PI * 2);
+   512→    ctx.stroke();
+   513→    ctx.shadowBlur = 0;
+   514→    const initials = getInitials(name);
+   515→    fitText(ctx, initials, r * 1.25, 46, "800");
+   516→    ctx.fillStyle = "#ffffff";
+   517→    ctx.textAlign = "center";
+   518→    ctx.textBaseline = "middle";
+   519→    ctx.fillText(initials, cx, cy + 2);
+   520→  }
+   521→  ctx.restore();
+   522→}
+   523→
+   524→function drawPlayerRing(
+   525→  ctx: CanvasRenderingContext2D,
+   526→  player: PosterPlayer,
+   527→  img: HTMLImageElement | null,
+   528→  cx: number,
+   529→  cy: number,
+   530→  r: number,
+   531→  isFavorite: boolean
+   532→): void {
+   533→  const accent = isFavorite ? GOLD : "#7dd3fc";
+   534→  ctx.save();
+   535→  // Main neon ring
+   536→  ctx.shadowColor = accent;
+   537→  ctx.shadowBlur = isFavorite ? 28 : 14;
+   538→  ctx.strokeStyle = isFavorite ? "rgba(255,209,102,0.95)" : "rgba(186,230,253,0.85)";
+   539→  ctx.lineWidth = 6;
+   540→  ctx.beginPath();
+   541→  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+   542→  ctx.stroke();
+   543→  ctx.shadowBlur = 0;
+   544→  // Outer faint ring
+   545→  ctx.strokeStyle = "rgba(255,255,255,0.22)";
+   546→  ctx.lineWidth = 2;
+   547→  ctx.beginPath();
+   548→  ctx.arc(cx, cy, r + 11, 0, Math.PI * 2);
+   549→  ctx.stroke();
+   550→  ctx.restore();
+   551→  drawFlagOrInitials(ctx, img, cx, cy, r - 9, player.name, accent);
+   552→}
+   553→
+   554→function drawPlayerLabel(
+   555→  ctx: CanvasRenderingContext2D,
+   556→  player: PosterPlayer,
+   557→  cx: number,
+   558→  nameY: number,
+   559→  isFavorite: boolean
+   560→): void {
+   561→  const maxW = 440;
+   562→  const name = player.name.toUpperCase();
+   563→  fitText(ctx, name, maxW, 42, "800", false, 26);
+   564→  ctx.textAlign = "center";
+   565→  ctx.textBaseline = "middle";
+   566→  ctx.fillStyle = "#ffffff";
+   567→  ctx.shadowColor = isFavorite ? "rgba(255,209,102,0.6)" : "rgba(255,255,255,0.45)";
+   568→  ctx.shadowBlur = 14;
+   569→  ctx.fillText(name, cx, nameY);
+   570→  ctx.shadowBlur = 0;
+   571→
+   572→  // Rank / seed badge
+   573→  const badge =
+   574→    player.rank !== undefined
+   575→      ? `#${player.rank} RANKED`
+   576→      : player.seed !== undefined
+   577→        ? `SEED #${player.seed}`
+   578→        : "UNRANKED";
+   579→  ctx.font = font("700", 21, true);
+   580→  const tw = measureTracked(ctx, badge, 3);
+   581→  const pw = tw + 38;
+   582→  const ph = 38;
+   583→  const py = nameY + 48;
+   584→  roundRectPath(ctx, cx - pw / 2, py - ph / 2, pw, ph, ph / 2);
+   585→  ctx.fillStyle = "rgba(255,255,255,0.10)";
+   586→  ctx.fill();
+   587→  ctx.strokeStyle = isFavorite ? "rgba(255,209,102,0.45)" : "rgba(255,255,255,0.28)";
+   588→  ctx.lineWidth = 1.5;
+   589→  ctx.stroke();
+   590→  ctx.fillStyle = "rgba(255,255,255,0.88)";
+   591→  drawTracked(ctx, badge, cx, py + 1, 3);
+   592→}
+   593→
+   594→// ─── Tournament header strip ────────────────────────────────────────────────
+   595→
+   596→function drawSurfaceChip(ctx: CanvasRenderingContext2D, surface: PosterSurface, cx: number, cy: number): void {
+   597→  const chip = SURFACE_CHIPS[surface];
+   598→  ctx.save();
+   599→  ctx.font = font("800", 21, true);
+   600→  const textW = measureTracked(ctx, chip.text, 3);
+   601→  const dotR = 6;
+   602→  const dotGap = 12;
+   603→  const padX = 22;
+   604→  const totalW = padX * 2 + dotR * 2 + dotGap + textW;
+   605→  const h = 44;
+   606→  const x0 = cx - totalW / 2;
+   607→  roundRectPath(ctx, x0, cy - h / 2, totalW, h, h / 2);
+   608→  ctx.fillStyle = "rgba(0,0,0,0.35)";
+   609→  ctx.fill();
+   610→  ctx.globalAlpha = 0.5;
+   611→  ctx.strokeStyle = chip.color;
+   612→  ctx.lineWidth = 1.5;
+   613→  ctx.stroke();
+   614→  ctx.globalAlpha = 1;
+   615→
+   616→  const dotCx = x0 + padX + dotR;
+   617→  ctx.fillStyle = chip.color;
+   618→  ctx.shadowColor = chip.color;
+   619→  ctx.shadowBlur = 10;
+   620→  ctx.beginPath();
+   621→  ctx.arc(dotCx, cy, dotR, 0, Math.PI * 2);
+   622→  ctx.fill();
+   623→  ctx.shadowBlur = 0;
+   624→
+   625→  ctx.fillStyle = chip.color;
+   626→  ctx.textBaseline = "middle";
+   627→  drawTrackedLeft(ctx, chip.text, dotCx + dotR + dotGap, cy + 1, 3);
+   628→  ctx.restore();
+   629→}
+   630→
+   631→function drawTournamentStrip(ctx: CanvasRenderingContext2D, data: PosterData): void {
+   632→  ctx.textBaseline = "middle";
+   633→  const tournament = data.tournament.toUpperCase();
+   634→  fitTracked(ctx, tournament, 860, 36, "800", 4, false, 20);
+   635→  ctx.fillStyle = "rgba(255,255,255,0.95)";
+   636→  ctx.shadowColor = "rgba(255,255,255,0.4)";
+   637→  ctx.shadowBlur = 10;
+   638→  drawTracked(ctx, tournament, W / 2, 446, 4);
+   639→  ctx.shadowBlur = 0;
+   640→
+   641→  const round = data.round.toUpperCase();
+   642→  fitTracked(ctx, round, 720, 26, "700", 4, true, 17);
+   643→  ctx.fillStyle = "rgba(255,255,255,0.62)";
+   644→  drawTracked(ctx, round, W / 2, 492, 4);
+   645→
+   646→  drawSurfaceChip(ctx, data.surface, W / 2, 542);
+   647→}
+   648→
+   649→// ─── Glowing 3D tennis ball ─────────────────────────────────────────────────
+   650→
+   651→function drawBall(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, glow: number): void {
+   652→  // Soft glow halo
+   653→  ctx.save();
+   654→  ctx.globalCompositeOperation = "screen";
+   655→  const halo = ctx.createRadialGradient(cx, cy, r * 0.55, cx, cy, r * 2.1);
+   656→  halo.addColorStop(0, `rgba(223,255,79,${(0.35 * glow).toFixed(3)})`);
+   657→  halo.addColorStop(1, "rgba(223,255,79,0)");
+   658→  ctx.fillStyle = halo;
+   659→  ctx.fillRect(cx - r * 2.2, cy - r * 2.2, r * 4.4, r * 4.4);
+   660→  ctx.restore();
+   661→
+   662→  // Sphere body
+   663→  ctx.save();
+   664→  ctx.shadowColor = "rgba(223,255,79,0.65)";
+   665→  ctx.shadowBlur = 42;
+   666→  const g = ctx.createRadialGradient(cx - r * 0.35, cy - r * 0.4, r * 0.1, cx, cy, r);
+   667→  g.addColorStop(0, "#f7ffbe");
+   668→  g.addColorStop(0.35, OPTIC);
+   669→  g.addColorStop(0.75, "#c3e02e");
+   670→  g.addColorStop(1, "#8fb31c");
+   671→  ctx.beginPath();
+   672→  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+   673→  ctx.fillStyle = g;
+   674→  ctx.fill();
+   675→  ctx.shadowBlur = 0;
+   676→
+   677→  // White seam arcs (clipped to sphere)
+   678→  ctx.beginPath();
+   679→  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+   680→  ctx.clip();
+   681→  ctx.strokeStyle = "rgba(255,255,255,0.92)";
+   682→  ctx.lineWidth = r * 0.09;
+   683→  ctx.beginPath();
+   684→  ctx.arc(cx - r * 1.18, cy, r * 0.95, -0.62, 0.62);
+   685→  ctx.stroke();
+   686→  ctx.beginPath();
+   687→  ctx.arc(cx + r * 1.18, cy, r * 0.95, Math.PI - 0.62, Math.PI + 0.62);
+   688→  ctx.stroke();
+   689→
+   690→  // Sphere edge shading
+   691→  const sh = ctx.createRadialGradient(cx, cy, r * 0.55, cx, cy, r);
+   692→  sh.addColorStop(0, "rgba(0,0,0,0)");
+   693→  sh.addColorStop(1, "rgba(30,50,0,0.35)");
+   694→  ctx.fillStyle = sh;
+   695→  ctx.fillRect(cx - r, cy - r, 2 * r, 2 * r);
+   696→  ctx.restore();
+   697→}
+   698→
+   699→// ─── Chips ──────────────────────────────────────────────────────────────────
+   700→
+   701→function drawModelChip(ctx: CanvasRenderingContext2D, prob: number, cx: number, cy: number): void {
+   702→  const text = `MODEL P ${(prob * 100).toFixed(1)}%`;
+   703→  ctx.save();
+   704→  ctx.font = font("800", 21, true);
+   705→  const tw = measureTracked(ctx, text, 3);
+   706→  const w = tw + 46;
+   707→  const h = 44;
+   708→  roundRectPath(ctx, cx - w / 2, cy - h / 2, w, h, h / 2);
+   709→  ctx.fillStyle = "rgba(255,209,102,0.12)";
+   710→  ctx.fill();
+   711→  ctx.strokeStyle = "rgba(255,209,102,0.5)";
+   712→  ctx.lineWidth = 1.5;
+   713→  ctx.stroke();
+   714→  ctx.fillStyle = GOLD;
+   715→  ctx.textBaseline = "middle";
+   716→  drawTracked(ctx, text, cx, cy + 1, 3);
+   717→  ctx.restore();
+   718→}
+   719→
+   720→function drawTimingChip(ctx: CanvasRenderingContext2D, label: string, cx: number, cy: number): void {
+   721→  ctx.save();
+   722→  ctx.textBaseline = "middle";
+   723→  fitText(ctx, label, 760, 22, "700");
+   724→  const tw = ctx.measureText(label).width;
+   725→  const clockR = 13;
+   726→  const gap = 12;
+   727→  const totalW = 22 + clockR * 2 + gap + tw + 22;
+   728→  const h = 46;
+   729→  const x0 = cx - totalW / 2;
+   730→  roundRectPath(ctx, x0, cy - h / 2, totalW, h, h / 2);
+   731→  ctx.fillStyle = "rgba(255,255,255,0.10)";
+   732→  ctx.fill();
+   733→  ctx.strokeStyle = "rgba(255,255,255,0.28)";
+   734→  ctx.lineWidth = 1.5;
+   735→  ctx.stroke();
+   736→
+   737→  // Tiny clock icon
+   738→  const ccx = x0 + 22 + clockR;
+   739→  ctx.strokeStyle = "rgba(255,255,255,0.92)";
+   740→  ctx.lineWidth = 2;
+   741→  ctx.beginPath();
+   742→  ctx.arc(ccx, cy, clockR, 0, Math.PI * 2);
+   743→  ctx.stroke();
+   744→  ctx.beginPath();
+   745→  ctx.moveTo(ccx, cy);
+   746→  ctx.lineTo(ccx, cy - 7);
+   747→  ctx.moveTo(ccx, cy);
+   748→  ctx.lineTo(ccx + 5, cy + 2);
+   749→  ctx.stroke();
+   750→
+   751→  ctx.fillStyle = "rgba(255,255,255,0.9)";
+   752→  ctx.fillText(label, ccx + clockR + gap, cy + 1);
+   753→  ctx.restore();
+   754→}
+   755→
+   756→// ─── Slip boxes (glassmorphism — v4.0 readable typography) ────────────────
+   757→
+   758→interface SlipBoxOpts {
+   759→  x: number;
+   760→  y: number;
+   761→  w: number;
+   762→  h: number;
+   763→  label: string;
+   764→  slip: { textEn: string; odds: number };
+   765→  blurred: boolean;
+   766→}
+   767→
+   768→function drawSlipBox(ctx: CanvasRenderingContext2D, opts: SlipBoxOpts): void {
+   769→  const { x, y, w, h, label, slip, blurred } = opts;
+   770→  const pad = 30;
+   771→
+   772→  // Glass panel
+   773→  roundRectPath(ctx, x, y, w, h, 26);
+   774→  ctx.fillStyle = "rgba(255,255,255,0.08)";
+   775→  ctx.fill();
+   776→  ctx.strokeStyle = "rgba(255,255,255,0.25)";
+   777→  ctx.lineWidth = 2;
+   778→  ctx.stroke();
+   779→
+   780→  ctx.textBaseline = "middle";
+   781→
+   782→  // Label (always sharp) — v4.0: larger 22px label
+   783→  ctx.font = font("700", 22, true);
+   784→  ctx.fillStyle = "rgba(255,255,255,0.72)";
+   785→  ctx.textAlign = "left";
+   786→  drawTrackedLeft(ctx, label, x + pad, y + 32, 4);
+   787→
+   788→  // Content (blurred in teaser mode)
+   789→  if (blurred) ctx.filter = "blur(7px)";
+   790→
+   791→  // v4.0 FIX — the slip text used to shrink to 13px on long official market
+   792→  // names. It now word-wraps into up to 2 lines at a much larger size
+   793→  // (36px → 26px floor) so the bet stays readable on every device.
+   794→  const maxTextW = w - pad * 2 - 230;
+   795→  const lines = wrapFit(ctx, slip.textEn, maxTextW, 36, "800", 26, 2);
+   796→  ctx.fillStyle = "#ffffff";
+   797→  ctx.textAlign = "left";
+   798→  ctx.fillText(lines[0], x + pad, y + 76);
+   799→  if (lines[1]) ctx.fillText(lines[1], x + pad, y + 114);
+   800→
+   801→  // Odds — v4.0: 34px → 44px bold gold capsule text
+   802→  ctx.font = font("800", 44, true);
+   803→  ctx.textAlign = "right";
+   804→  ctx.fillStyle = GOLD;
+   805→  ctx.fillText(`@${slip.odds.toFixed(2)}`, x + w - pad, y + 82);
+   806→  ctx.textAlign = "left";
+   807→
+   808→  const impliedPct = Math.max(0, Math.min(100, 100 / Math.max(slip.odds, 1.01)));
+   809→  ctx.font = font("600", 23, true);
+   810→  ctx.fillStyle = "rgba(255,255,255,0.72)";
+   811→  ctx.fillText(`P ≈ ${impliedPct.toFixed(1)}%`, x + pad, y + h - 26);
+   812→
+   813→  ctx.filter = "none";
+   814→}
+   815→
+   816→function drawPadlock(ctx: CanvasRenderingContext2D, cx: number, cy: number): void {
+   817→  const bw = 62;
+   818→  const bh = 48;
+   819→  const bodyTop = cy - 12;
+   820→
+   821→  ctx.save();
+   822→  ctx.shadowColor = "rgba(255,209,102,0.75)";
+   823→  ctx.shadowBlur = 24;
+   824→
+   825→  // Shackle
+   826→  ctx.strokeStyle = GOLD;
+   827→  ctx.lineWidth = 8;
+   828→  ctx.lineCap = "round";
+   829→  ctx.beginPath();
+   830→  ctx.arc(cx, bodyTop, 17, Math.PI, Math.PI * 2);
+   831→  ctx.stroke();
+   832→
+   833→  // Body
+   834→  roundRectPath(ctx, cx - bw / 2, bodyTop, bw, bh, 10);
+   835→  ctx.fillStyle = GOLD;
+   836→  ctx.fill();
+   837→  ctx.shadowBlur = 0;
+   838→
+   839→  // Keyhole
+   840→  ctx.fillStyle = "rgba(60,40,0,0.85)";
+   841→  ctx.beginPath();
+   842→  ctx.arc(cx, bodyTop + bh * 0.38, 7, 0, Math.PI * 2);
+   843→  ctx.fill();
+   844→  ctx.fillRect(cx - 3, bodyTop + bh * 0.38, 6, 14);
+   845→  ctx.restore();
+   846→}
+   847→
+   848→// ─── Footer telemetry ───────────────────────────────────────────────────────
+   849→
+   850→function drawFooter(ctx: CanvasRenderingContext2D, data: PosterData): void {
+   851→  ctx.save();
+   852→  ctx.textBaseline = "middle";
+   853→  ctx.font = font("700", 23, true);
+   854→  ctx.fillStyle = "rgba(255,255,255,0.70)";
+   855→  drawTracked(ctx, "NEOBET TENNIS QUANT • @AINEOBET • SHA-256 LOCKED", W / 2, 1318, 5);
+   856→
+   857→  if (data.hashPre) {
+   858→    const lock = `LOCK ${data.hashPre.slice(0, 10).toUpperCase()}`;
+   859→    ctx.font = font("700", 20, true);
+   860→    ctx.fillStyle = "#67e8f9";
+   861→    drawTracked(ctx, lock, W / 2, 1362, 4);
+   862→  } else if (data.preview) {
+   863→    // engineering-review render: amber MODEL PREVIEW ribbon instead of the lock
+   864→    ctx.font = font("800", 21, true);
+   865→    const label = "MODEL PREVIEW — ENGINEERING REVIEW";
+   866→    const tw = ctx.measureText(label).width + 44;
+   867→    const bx = W / 2 - tw / 2;
+   868→    ctx.fillStyle = "rgba(245,197,66,0.14)";
+   869→    ctx.strokeStyle = "rgba(245,197,66,0.55)";
+   870→    ctx.lineWidth = 1.5;
+   871→    ctx.beginPath();
+   872→    ctx.roundRect(bx, 1340, tw, 40, 12);
+   873→    ctx.fill();
+   874→    ctx.stroke();
+   875→    ctx.fillStyle = "#f5c542";
+   876→    ctx.textAlign = "center";
+   877→    ctx.fillText(label, W / 2, 1361);
+   878→  }
+   879→  ctx.restore();
+   880→}
+   881→
+   882→// ─── Public API ─────────────────────────────────────────────────────────────
+   883→
+   884→export async function drawPoster(canvas: HTMLCanvasElement, data: PosterData): Promise<void> {
+   885→  canvas.width = W;
+   886→  canvas.height = H;
+   887→  const ctx = canvas.getContext("2d");
+   888→  if (!ctx) throw new Error("Canvas 2D context is unavailable");
+   889→
+   890→  // Reset any inherited state
+   891→  ctx.setTransform(1, 0, 0, 1, 0, 0);
+   892→  ctx.globalAlpha = 1;
+   893→  ctx.globalCompositeOperation = "source-over";
+   894→  ctx.filter = "none";
+   895→  ctx.textBaseline = "middle";
+   896→
+   897→  // Flags load in parallel through the same-origin proxy; failures fall back
+   898→  // to neon-initials rings after the timeout.
+   899→  const [flagA, flagB] = await Promise.all([
+   900→    data.playerA.flagUrl ? loadFlag(data.playerA.flagUrl) : Promise.resolve(null),
+   901→    data.playerB.flagUrl ? loadFlag(data.playerB.flagUrl) : Promise.resolve(null),
+   902→  ]);
+   903→
+   904→  // Deterministic per-match RNG: particles / glow variation are seeded from
+   905→  // the player names so the same match renders pixel-identically.
+   906→  const rng = mulberry32(hashStringToSeed(`${data.playerA.name}${data.playerB.name}`));
+   907→  const glowJitter = 0.85 + rng() * 0.3; // 0.85..1.15
+   908→  const glow2 = 0.85 + rng() * 0.3;
+   909→
+   910→  const pal = PALETTES[data.surface];
+   911→
+   912→  // 1. Procedural court background
+   913→  drawCourt(ctx, pal);
+   914→  if (data.surface === "HARD") drawFloodBeams(ctx, glowJitter);
+   915→  if (data.surface === "CLAY") {
+   916→    // Dust particles are seeded from hashPre so the same match renders identically
+   917→    drawClayDust(ctx, mulberry32(hashStringToSeed(data.hashPre ?? `${data.playerA.name} vs ${data.playerB.name}`)));
+   918→  }
+   919→  if (data.surface === "GRASS") drawGrassHalo(ctx, W / 2, 690, glowJitter);
+   920→  drawVignette(ctx);
+   921→
+   922→  // 2. Player rings + names + badges
+   923→  const ringY = 190;
+   924→  const ringR = 88;
+   925→  const cxA = 268;
+   926→  const cxB = W - 268;
+   927→  drawPlayerRing(ctx, data.playerA, flagA, cxA, ringY, ringR, data.favorite === "A");
+   928→  drawPlayerRing(ctx, data.playerB, flagB, cxB, ringY, ringR, data.favorite === "B");
+   929→  drawPlayerLabel(ctx, data.playerA, cxA, 320, data.favorite === "A");
+   930→  drawPlayerLabel(ctx, data.playerB, cxB, 320, data.favorite === "B");
+   931→
+   932→  // 3. Tournament header strip
+   933→  drawTournamentStrip(ctx, data);
+   934→
+   935→  // 4. Center glowing ball
+   936→  drawBall(ctx, W / 2, 690, 86, glow2);
+   937→
+   938→  // 5. MODEL P chip
+   939→  if (typeof data.marketProbAFav === "number" && Number.isFinite(data.marketProbAFav)) {
+   940→    drawModelChip(ctx, Math.max(0, Math.min(1, data.marketProbAFav)), W / 2, 800);
+   941→  }
+   942→
+   943→  // 6. Slip boxes — v4.0: taller boxes (170px) so the official market text
+   944→  // renders at readable sizes instead of a shrunken 13px single line
+   945→  const boxX = 90;
+   946→  const boxW = W - 180;
+   947→  const boxH = 170;
+   948→  if (data.slipA) {
+   949→    drawSlipBox(ctx, { x: boxX, y: 848, w: boxW, h: boxH, label: "SLIP A", slip: data.slipA, blurred: false });
+   950→  }
+   951→  if (data.slipB) {
+   952→    const teaser = data.mode === "teaser";
+   953→    const by = 1038;
+   954→    drawSlipBox(ctx, { x: boxX, y: by, w: boxW, h: boxH, label: "SLIP B", slip: data.slipB, blurred: teaser });
+   955→    if (teaser) {
+   956→      // Dark backing panel + padlock + "UNLOCK IN VIP"
+   957→      const panelW = 250;
+   958→      const panelH = 118;
+   959→      const panelCy = by + boxH / 2 - 2;
+   960→      roundRectPath(ctx, W / 2 - panelW / 2, panelCy - panelH / 2, panelW, panelH, 20);
+   961→      ctx.fillStyle = "rgba(6,10,22,0.6)";
+   962→      ctx.fill();
+   963→      ctx.strokeStyle = "rgba(255,209,102,0.4)";
+   964→      ctx.lineWidth = 1.5;
+   965→      ctx.stroke();
+   966→      drawPadlock(ctx, W / 2, panelCy - 12);
+   967→      ctx.font = font("800", 19, true);
+   968→      ctx.fillStyle = GOLD;
+   969→      ctx.textBaseline = "middle";
+   970→      drawTracked(ctx, "UNLOCK IN VIP", W / 2, panelCy + 38, 4);
+   971→    }
+   972→  }
+   973→
+   974→  // 7. Timing chip (aligned under the taller slip boxes)
+   975→  if (data.timingLabel) drawTimingChip(ctx, data.timingLabel, W / 2, 1234);
+   976→
+   977→  // 8. Footer telemetry
+   978→  drawFooter(ctx, data);
+   979→}
+   980→

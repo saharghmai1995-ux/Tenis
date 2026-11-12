@@ -285,6 +285,10 @@ export interface LineItem {
   stakePct?: number;
   /** Parlay bases (Tab 2 mix cards) */
   legs?: MixLeg[];
+  /** Direct ESPN match-page verification link (v4.0 hash modal) */
+  espnUrl?: string;
+  /** Official pricing window of the market on bookmaker sites [lo, hi] */
+  targetWindow?: [number, number];
 }
 
 export interface LedgerRow {
@@ -379,6 +383,10 @@ export interface BankPoint {
 export interface LedgerPayload {
   stats: {
     combinedWinRate: number;
+    /** v4.5 — core system win rate: DUAL + COMBO only (sniper excluded) */
+    coreWinRate: number;
+    /** v4.5 — stake-weighted win rate over the official record */
+    stakeWeightedWinRate: number;
     bank: number;
     bankStart: number;
     profit: number;

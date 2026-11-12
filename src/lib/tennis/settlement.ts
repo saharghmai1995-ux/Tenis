@@ -24,13 +24,22 @@ export interface MatchResult {
   playerBName: string;
 }
 
+interface ComboFavorite {
+  name: string;
+  eventKey: string;
+  /** v4.5 — explicit side stored at build time ("A" = playerA of that leg) */
+  side?: "A" | "B";
+  /** v4.5 — leg market: SET HANDICAP +1.5 SETS or MATCH WINNER */
+  market?: "HANDICAP" | "WINNER";
+}
+
 interface PickMeta {
   kind?: string;
   snipeKind?: string;
   favName?: string;
   dogName?: string;
   eventKey?: string;
-  favorites?: { name: string; eventKey: string }[];
+  favorites?: ComboFavorite[];
   size?: number;
 }
 
@@ -208,6 +217,12 @@ function settlePick(
       const won = result.code === target;
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
+    if (kind === "fav21") {
+      // v4.5 — SET BETTING: favorite wins 2-1 (any route to the exact score)
+      const target: ResultCode = side === "A" ? "2-1" : side === "B" ? "1-2" : "2-1";
+      const won = result.code === target;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
     if (kind === "tiebreak") {
       const won = result.set1Games.tiebreak;
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
@@ -238,6 +253,24 @@ export async function runSettlement(windowDays = 7): Promise<{
   picked: number;
   windowDays: number;
 }> {
+  // v4.5 migration — combos settled under the buggy v4.0 rule (0W/11L =
+  // −179u) carry no explicit leg side/market in their meta; their stored
+  // LOST results were produced by an inverted settlement check and by
+  // treating unresolved legs as losses. Those rows are VOIDed once so the
+  // official record only contains correctly-contracted slips.
+  try {
+    await db.tennisPick.updateMany({
+      where: {
+        line: "COMBO",
+        status: { not: "VOID" },
+        OR: [{ meta: null }, { meta: { not: { contains: '"side"' } } }],
+      },
+      data: { status: "VOID", profit: 0 },
+    });
+  } catch (e) {
+    console.error("[settle] stale combo migration failed", e);
+  }
+
   // 1) live finished results across the settlement window (today + N past days)
   const dateKeys = Array.from({ length: windowDays + 1 }, (_, i) =>
     i === 0 ? todayKey() : dateKeyDaysAgo(i)
@@ -282,27 +315,40 @@ export async function runSettlement(windowDays = 7): Promise<{
     if (pick.line === "COMBO") {
       const favorites = meta.favorites ?? [];
       if (!favorites.length) continue;
+      // ── v4.5 FT Settlement Fix ────────────────────────────────────────
+      // Every leg checks the REAL winner of its own match: the stored
+      // favorite must have won (equivalent of competitor.winner === true —
+      // sets won > opponent sets) or, for SET HANDICAP +1.5 SETS legs, have
+      // won at least ONE set (sets won ≥ 1). An undecidable leg (match not
+      // finished / result not extractable / side unresolvable) keeps the
+      // whole slip PENDING — it is NEVER auto-destroyed as a loss (the v4.0
+      // bug that produced 0W/11L).
+      let allDecided = true;
       let allWon = true;
       for (const f of favorites) {
         const ownMatch = fetched.find((x) => x.eventKey === f.eventKey);
         const result = ownMatch ? extractResult(ownMatch) : undefined;
         if (!result) {
-          allWon = false;
+          allDecided = false;
           break;
         }
-        const side = favSide(result.playerAName, result.playerBName, f.name);
-        const won =
-          side === "A"
-            ? result.code === "2-0" || result.code === "2-1"
-            : side === "B"
-              ? result.code === "0-2" || result.code === "1-2"
-              : false;
-        if (!won) {
+        // explicit side first (v4.5 contract); legacy picks fall back to
+        // full-name/surname matching
+        const side: "A" | "B" | null = f.side ?? favSide(result.playerAName, result.playerBName, f.name);
+        if (!side) {
+          allDecided = false;
+          break;
+        }
+        const favSets = side === "A" ? result.setsA : result.setsB;
+        const oppSets = side === "A" ? result.setsB : result.setsA;
+        const legWon = f.market === "HANDICAP" ? favSets >= 1 : favSets > oppSets;
+        if (!legWon) {
           allWon = false;
           break;
         }
       }
-      const profit = allWon ? (pick.odds - 1) * pick.stake : -pick.stake;
+      if (!allDecided) continue; // stays PENDING until every leg is decidable
+      const profit = allWon ? pick.odds * pick.stake - pick.stake : -pick.stake;
       await db.tennisPick.update({
         where: { id: pick.id },
         data: { status: allWon ? "WON" : "LOST", profit, settledAt: new Date() },
