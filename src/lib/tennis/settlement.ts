@@ -29,8 +29,8 @@ interface ComboFavorite {
   eventKey: string;
   /** v4.5 — explicit side stored at build time ("A" = playerA of that leg) */
   side?: "A" | "B";
-  /** v4.5 — leg market: SET HANDICAP +1.5 SETS or MATCH WINNER */
-  market?: "HANDICAP" | "WINNER";
+  /** v4.5/v5.0 — leg market: SET HANDICAP ±1.5 SETS or MATCH WINNER */
+  market?: "HANDICAP" | "WINNER" | "HANDICAP15";
 }
 
 interface PickMeta {
@@ -41,6 +41,14 @@ interface PickMeta {
   eventKey?: string;
   favorites?: ComboFavorite[];
   size?: number;
+  // v5.0 regime payloads
+  variant?: "DOM" | "SRV";
+  legCode?: string;
+  scenario?: string;
+  code?: string;
+  gamesLo?: number;
+  gamesHi?: number;
+  ev?: number;
 }
 
 function codeOf(setsA: number, setsB: number): ResultCode {
@@ -210,6 +218,61 @@ function settlePick(
     return { status: "VOID", profit: 0 };
   }
 
+  // ── v5.0 · regime markets (BANKER / REGCOMBO / CLUSTER) ──────────────────
+  if (pick.line === "BANKER" || pick.line === "REGCOMBO" || pick.line === "CLUSTER") {
+    const favWonMatch =
+      side === "A"
+        ? result.setsA > result.setsB
+        : side === "B"
+          ? result.setsB > result.setsA
+          : false;
+    const favWon20 =
+      side === "A" ? result.code === "2-0" : side === "B" ? result.code === "0-2" : false;
+    const dogSide = side === "A" ? "B" : "A";
+    const set1Winner = result.set1Games.a > result.set1Games.b ? "A" : "B";
+    const dogWonSet1 = set1Winner === dogSide;
+    const total = result.totalGames;
+
+    // 🔗 CLUSTER — exact scenario: set-score code + total-games band
+    if (pick.line === "CLUSTER") {
+      const target = meta.code as ResultCode | undefined;
+      if (!target) return { status: "VOID", profit: 0 };
+      const lo = meta.gamesLo ?? 12;
+      const hi = meta.gamesHi ?? 42;
+      const won = result.code === target && total >= lo && total <= hi;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+
+    // 🏦 BANKER — MATCH WINNER (BNK-WIN) or SET HANDICAP −1.5 (BNK-SH15)
+    if (pick.line === "BANKER") {
+      const leg = pick.leg;
+      if (leg === "BNK-WIN") {
+        return { status: favWonMatch ? "WON" : "LOST", profit: profitOf(favWonMatch) };
+      }
+      if (leg === "BNK-SH15") {
+        return { status: favWon20 ? "WON" : "LOST", profit: profitOf(favWon20) };
+      }
+      return { status: "VOID", profit: 0 };
+    }
+
+    // 🧩 REGCOMBO — copula combo (main) + official cover leg
+    if (pick.line === "REGCOMBO") {
+      const variant = meta.variant ?? (pick.leg.endsWith("SRV") ? "SRV" : "DOM");
+      const isMain = pick.leg.includes("MAIN");
+      if (variant === "DOM") {
+        // main: favorite win & under 21.5 games · cover: over 21.5 games
+        const won = isMain ? favWonMatch && total <= 21 : total >= 22;
+        return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+      }
+      // SRV variant — main: favorite win & over 20.5 games
+      // cover: under 20.5 games OR the underdog wins the match (disjoint)
+      const won = isMain
+        ? favWonMatch && total >= 21
+        : total <= 20 || !favWonMatch;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+  }
+
   if (pick.line === "SNIPER") {
     const kind = meta.snipeKind;
     if (kind === "comeback") {
@@ -261,7 +324,7 @@ export async function runSettlement(windowDays = 7): Promise<{
   try {
     await db.tennisPick.updateMany({
       where: {
-        line: "COMBO",
+        line: { in: ["COMBO", "ACCUMULATOR"] },
         status: { not: "VOID" },
         OR: [{ meta: null }, { meta: { not: { contains: '"side"' } } }],
       },
@@ -312,7 +375,7 @@ export async function runSettlement(windowDays = 7): Promise<{
       meta = {};
     }
 
-    if (pick.line === "COMBO") {
+    if (pick.line === "COMBO" || pick.line === "ACCUMULATOR") {
       const favorites = meta.favorites ?? [];
       if (!favorites.length) continue;
       // ── v4.5 FT Settlement Fix ────────────────────────────────────────
@@ -341,7 +404,12 @@ export async function runSettlement(windowDays = 7): Promise<{
         }
         const favSets = side === "A" ? result.setsA : result.setsB;
         const oppSets = side === "A" ? result.setsB : result.setsA;
-        const legWon = f.market === "HANDICAP" ? favSets >= 1 : favSets > oppSets;
+        const legWon =
+          f.market === "HANDICAP"
+            ? favSets >= 1
+            : f.market === "HANDICAP15"
+              ? favSets === 2 // SET HANDICAP −1.5 SETS = the favorite swept 2-0
+              : favSets > oppSets;
         if (!legWon) {
           allWon = false;
           break;

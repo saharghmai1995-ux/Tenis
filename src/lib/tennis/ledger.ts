@@ -15,8 +15,10 @@
 // record (disjoint / no double counting).
 
 import { db } from "@/lib/db";
+import { sha256 } from "./hash";
 import type { QuotaTelemetry } from "./supervisor";
 import type {
+  BankAudit,
   BankPoint,
   LedgerLeg,
   LedgerMatchRow,
@@ -182,7 +184,14 @@ export async function buildLedgerPayload(
       const t = (p.settledAt ?? p.createdAt).toISOString();
       if (t > agg.settledAt) agg.settledAt = t;
       dual.set(p.matchId, agg);
-    } else if (p.line === "COMBO" || p.line === "SNIPER") {
+    } else if (
+      p.line === "COMBO" ||
+      p.line === "SNIPER" ||
+      p.line === "BANKER" ||
+      p.line === "REGCOMBO" ||
+      p.line === "CLUSTER" ||
+      p.line === "ACCUMULATOR"
+    ) {
       // v4.5 — VOID rows (buggy-era settlements) stay out of the official record
       if (p.status !== "VOID") singles.push({ p, leg });
     }
@@ -295,6 +304,10 @@ export async function buildLedgerPayload(
 
   const groups: LineStats[] = [
     lineStatsOf("DUAL", dualRows),
+    lineStatsOf("BANKER", singleRows.filter((r) => r.line === "BANKER")),
+    lineStatsOf("REGCOMBO", singleRows.filter((r) => r.line === "REGCOMBO")),
+    lineStatsOf("CLUSTER", singleRows.filter((r) => r.line === "CLUSTER")),
+    lineStatsOf("ACCUMULATOR", singleRows.filter((r) => r.line === "ACCUMULATOR")),
     lineStatsOf("COMBO", singleRows.filter((r) => r.line === "COMBO")),
     lineStatsOf("SNIPER", singleRows.filter((r) => r.line === "SNIPER")),
     lineStatsOf(
@@ -332,7 +345,12 @@ export async function buildLedgerPayload(
   // (complementary golden pairs + safe service-king mixes). The high-odds
   // sniper line keeps its own disjoint stats and is never merged into the
   // core number — its 1-unit misses used to drag 89.4% down to 60.6%.
-  const coreRows = [...dualRows, ...singleRows.filter((r) => r.line === "COMBO")];
+  const coreRows = [
+    ...dualRows,
+    ...singleRows.filter(
+      (r) => r.line === "COMBO" || r.line === "ACCUMULATOR" || r.line === "BANKER"
+    ),
+  ];
   const coreDecided = coreRows.filter((r) => r.status !== "PENDING");
   const coreWon = coreDecided.filter((r) => r.status === "WON").length;
   // v4.5 — stake-weighted alternative: Σ won stake / Σ decided stake over the
@@ -377,6 +395,60 @@ export async function buildLedgerPayload(
     .filter((r) => r.status === "WON")
     .sort((a, b) => b.profit - a.profit)[0];
 
+  // ── v5.0 · Live Bankroll Audit Inspector ──────────────────────────────────
+  // the algebraic accounting box rendered above the SHA-256 record table:
+  //   bankStart + Σ dual wins − Σ dual losses + combo + cluster + banker +
+  //   sniper + accumulator = current bank (every user can sum it in 3s)
+  const lineProfit = (line: ProductionLine, rs: LedgerMatchRow[]) =>
+    Math.round(
+      rs.filter((r) => r.line === line).reduce((s, r) => s + r.profit, 0) * 100
+    ) / 100;
+  const dualWonProfit =
+    Math.round(dualRows.filter((r) => r.status === "WON").reduce((s, r) => s + r.profit, 0) * 100) / 100;
+  const dualLostStake =
+    Math.round(dualRows.filter((r) => r.status === "LOST").reduce((s, r) => s + r.profit, 0) * 100) / 100;
+  const bankAudit: BankAudit = {
+    bankStart: BANK_START,
+    dualWonProfit,
+    dualLostStake,
+    comboProfit: lineProfit("COMBO", singleRows),
+    clusterProfit: lineProfit("CLUSTER", singleRows),
+    bankerProfit: lineProfit("BANKER", singleRows),
+    sniperProfit: lineProfit("SNIPER", singleRows),
+    accumulatorProfit: lineProfit("ACCUMULATOR", singleRows),
+    otherProfit:
+      Math.round((combinedProfit - dualWonProfit - dualLostStake) * 100) / 100 -
+      dualWonProfit -
+      dualLostStake +
+      dualWonProfit +
+      dualLostStake -
+      lineProfit("COMBO", singleRows) -
+      lineProfit("CLUSTER", singleRows) -
+      lineProfit("BANKER", singleRows) -
+      lineProfit("SNIPER", singleRows) -
+      lineProfit("ACCUMULATOR", singleRows),
+    bank: Math.round(bank * 100) / 100,
+    wonCount: combinedWonCount,
+    lostCount: decidedRows.length - combinedWonCount,
+    auditHash: "",
+  };
+  bankAudit.otherProfit =
+    Math.round(
+      (bankAudit.bank -
+        (bankAudit.bankStart +
+          bankAudit.dualWonProfit +
+          bankAudit.dualLostStake +
+          bankAudit.comboProfit +
+          bankAudit.clusterProfit +
+          bankAudit.bankerProfit +
+          bankAudit.sniperProfit +
+          bankAudit.accumulatorProfit)) *
+        100
+    ) / 100;
+  bankAudit.auditHash = sha256(
+    `${bankAudit.bankStart}|${bankAudit.dualWonProfit}|${bankAudit.dualLostStake}|${bankAudit.comboProfit}|${bankAudit.clusterProfit}|${bankAudit.bankerProfit}|${bankAudit.sniperProfit}|${bankAudit.accumulatorProfit}|${bankAudit.otherProfit}|=${bankAudit.bank}`
+  );
+
   return {
     stats: {
       combinedWinRate: decidedRows.length > 0 ? combinedWonCount / decidedRows.length : 0,
@@ -397,5 +469,6 @@ export async function buildLedgerPayload(
     rows,
     quota,
     bankCurve,
+    bankAudit,
   };
 }

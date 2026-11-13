@@ -26,6 +26,10 @@ import type { LedgerPayload, ProductionLine } from "@/lib/tennis/types";
 
 const LINE_LABELS: Record<ProductionLine, string> = {
   DUAL: "زوج‌تیپ طلایی مکمل",
+  BANKER: "بانکر امن سرویس",
+  REGCOMBO: "کمبوی کاپولا + پوشش",
+  CLUSTER: "خوشه نتیجه دقیق",
+  ACCUMULATOR: "آکومولاتور سلاطین سرویس",
   COMBO: "میکس سلاطین سرویس",
   SNIPER: "تک‌تیرانداز ضریب بالا",
   SHADOW: "دفتر سایه (وتوها)",
@@ -33,6 +37,10 @@ const LINE_LABELS: Record<ProductionLine, string> = {
 
 const LINE_COLORS: Record<ProductionLine, string> = {
   DUAL: "text-amber-300",
+  BANKER: "text-emerald-300",
+  REGCOMBO: "text-violet-300",
+  CLUSTER: "text-orange-300",
+  ACCUMULATOR: "text-lime-300",
   COMBO: "text-cyan-300",
   SNIPER: "text-rose-300",
   SHADOW: "text-muted-foreground",

@@ -5,8 +5,151 @@ export type Surface = "HARD" | "CLAY" | "GRASS";
 export type SurfaceSource = "MAPPED" | "INFERRED";
 export type MatchState = "pre" | "in" | "post";
 export type ResultCode = "2-0" | "2-1" | "1-2" | "0-2";
-export type ProductionLine = "DUAL" | "COMBO" | "SNIPER" | "SHADOW";
+export type ProductionLine =
+  | "DUAL"
+  | "BANKER"
+  | "REGCOMBO"
+  | "CLUSTER"
+  | "ACCUMULATOR"
+  | "COMBO"
+  | "SNIPER"
+  | "SHADOW";
 export type ArchetypeCode = "ARCH1" | "ARCH2" | "ARCH3";
+
+// ─── v5.0 · Copula-Markov-MonteCarlo Pipeline & 5-Regime Router ────────────
+/** STATION 2 — Gaussian copula dependency telemetry of one match. */
+export interface CopulaTelemetry {
+  rhoSetCoupling: number; // ∈ [−0.15, +0.22]
+  rhoHoldTiebreak: number;
+  fatigueSet3: number;
+  bpSavedA: number;
+  bpSavedB: number;
+  comebackBoost: number;
+  tiebreakBoost: number;
+  winnerShift: number;
+}
+
+/** STATION 3 — 10,000 game-by-game Monte-Carlo authoritative distributions. */
+export interface McScenario {
+  label: string;
+  descFa: string;
+  descEn: string;
+  code: ResultCode;
+  favWin: boolean;
+  gamesLo: number;
+  gamesHi: number;
+  prob: number;
+}
+
+export interface MonteCarloResult {
+  runs: number;
+  outcomes: { p20: number; p21: number; p12: number; p02: number };
+  totalGamesMean: number;
+  totalGamesStd: number;
+  gamesDist: number[];
+  handicapSpread: {
+    minus55: number;
+    minus35: number;
+    minus15: number;
+    plus15: number;
+    plus35: number;
+    plus55: number;
+  };
+  entropy: number;
+  entropyNormalized: number;
+  topScenarios: McScenario[];
+  topScenariosMass: number;
+  favWinGamesCorr: number;
+  favWinUnder215: number;
+  favWinOver205: number;
+  coverOver215: number;
+  favWinShareOver205: number;
+  /** P(fav LOSES ∧ over 20.5 games ∧ fav won set 1) — SRV combo uncovered space */
+  favLoseOver205Set1: number;
+  /** P(favorite wins set 1) */
+  favWonSet1Prob: number;
+  sigmaMatchWinner: number;
+  pFavWinBy55: number;
+  pFavWinBy35: number;
+  tiebreakMass: number;
+}
+
+/** The 5 non-linear bet-type regimes of the v5.0 router. */
+export type RegimeCode =
+  | "BANKER"
+  | "COMBO"
+  | "CLUSTER"
+  | "DUAL-HEDGE"
+  | "ACCUMULATOR";
+
+export interface RegimeDecision {
+  code: RegimeCode | "VETOED";
+  labelFa: string;
+  labelEn: string;
+  icon: string;
+  /** non-linear Sharpe of the chosen regime position */
+  sharpe: number;
+  /** 10k Monte-Carlo composite score 0–100 (crown telemetry) */
+  mcScore: number;
+  why: string; // Persian routing reason
+  whyEn: string;
+  /** official market row of the regime (primary tip) */
+  marketEn?: string;
+  marketFa?: string;
+  targetWindow?: [number, number];
+  /** stake plan of the regime */
+  stakePlanFa?: string;
+  /** simultaneous-loss probability of the routed position (crown gate) */
+  pairLoss?: number;
+  /** granted by the 65% adaptive quota → SILVER crown + half stakes */
+  adaptive?: boolean;
+  /** BANKER — primary leg price & probability */
+  price?: number;
+  prob?: number;
+  /** settlement leg codes of the regime position */
+  legCodes?: { main: string; cover?: string };
+  /** CLUSTER — the three dutched exact scenarios */
+  scenarios?: {
+    label: string;
+    descFa: string;
+    descEn: string;
+    code: ResultCode;
+    gamesLo: number;
+    gamesHi: number;
+    prob: number;
+    price: number;
+    stake: number;
+  }[];
+  /** COMBO — main + cover legs */
+  comboLegs?: {
+    mainEn: string;
+    mainFa: string;
+    mainProb: number;
+    mainPrice: number;
+    coverEn: string;
+    coverFa: string;
+    coverProb: number;
+    coverPrice: number;
+  };
+}
+
+export type CrownTier = "GOLD" | "SILVER" | "NONE";
+
+export interface CrownInfo {
+  tier: CrownTier;
+  /** GOLD CROWN APPROVED / SILVER CROWN ADAPTIVE headline */
+  labelFa: string;
+  labelEn: string;
+  score: number; // 10k Monte-Carlo score (e.g. 94/100)
+}
+
+/** 4-station telemetry bar shown on every v5.0 flashcard. */
+export interface PipelineTelemetry {
+  station1Markov: { ok: boolean; label: string; pA: number; pB: number };
+  station2Copula: { ok: boolean; label: string; rho: number };
+  station3MonteCarlo: { ok: boolean; label: string; runs: number };
+  station4Supervisor: { ok: boolean; label: string; score: number };
+}
 
 // ─── v2.0 · Adaptive 3-Archetype Supervisor ────────────────────────────────
 /** Exact pair-loss / coverage metrics computed from the Bo3 joint Markov distribution. */
@@ -196,7 +339,7 @@ export interface Slip {
 export interface VetoInfo {
   vetoed: boolean;
   reason?: string;
-  code?: "TOP100" | "P02_RISK" | "NONE";
+  code?: "TOP100" | "P02_RISK" | "NONE" | "REGIME";
 }
 
 export interface TimingInfo {
@@ -220,6 +363,12 @@ export interface AnalyzedMatch extends EspnMatch {
   timing: TimingInfo;
   hashPre?: string;
   dbId?: string;
+  // ─── v5.0 · Copula-Markov-MonteCarlo pipeline & 5-regime router ───────────
+  copula?: CopulaTelemetry;        // STATION 2
+  monteCarlo?: MonteCarloResult;   // STATION 3 (authoritative distributions)
+  regime?: RegimeDecision;         // STATION 4 routing decision
+  crown?: CrownInfo;               // 👑 GOLD / 🥈 SILVER badge
+  pipeline?: PipelineTelemetry;    // 4-station telemetry bar
 }
 
 /** v4.0 — one base of a Multi-Match Parlay Slip (Tab 2 mix card). */
@@ -289,6 +438,12 @@ export interface LineItem {
   espnUrl?: string;
   /** Official pricing window of the market on bookmaker sites [lo, hi] */
   targetWindow?: [number, number];
+  // ─── v5.0 · Pipeline & regime telemetry flashcards ───────────────────────
+  regime?: RegimeDecision;
+  crown?: CrownInfo;
+  pipeline?: PipelineTelemetry;
+  copula?: CopulaTelemetry;
+  monteCarlo?: MonteCarloResult;
 }
 
 export interface LedgerRow {
@@ -408,6 +563,27 @@ export interface LedgerPayload {
     ratio: number;
   };
   bankCurve: BankPoint[];
+  /** v5.0 — Live Bankroll Audit Inspector (🧮 1,647-unit accounting box) */
+  bankAudit?: BankAudit;
+}
+
+/** v5.0 · the algebraic audit formula parts rendered above the SHA-256 table. */
+export interface BankAudit {
+  bankStart: number;
+  dualWonProfit: number;
+  dualLostStake: number;
+  comboProfit: number;
+  clusterProfit: number;
+  bankerProfit: number;
+  sniperProfit: number;
+  accumulatorProfit: number;
+  otherProfit: number;
+  bank: number;
+  /** count of settled rows per side */
+  wonCount: number;
+  lostCount: number;
+  /** SHA-256 of the audit string — integrity lock of the accounting box */
+  auditHash: string;
 }
 
 export interface FeedPayload {
@@ -419,6 +595,10 @@ export interface FeedPayload {
   news: NewsItem[];
   lines: {
     dual: LineItem[];
+    banker: LineItem[];
+    regCombo: LineItem[];
+    cluster: LineItem[];
+    accumulator: LineItem[];
     combo2: LineItem[];
     combo3: LineItem[];
     sniper: LineItem[];

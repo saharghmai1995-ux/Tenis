@@ -81,7 +81,7 @@ export function buildArcadeRequest(
 ): ArcadePosterRequest {
   const favName = (match.favorite === "A" ? match.playerA.name : match.playerB.name).toUpperCase();
   const mkSlip = (
-    slip: AnalyzedMatch["slips"]["A"],
+    slip: NonNullable<AnalyzedMatch["slips"]["A"]>,
     label: string,
     locked = false
   ): ArcadePosterRequest["slips"] extends (infer S)[] | undefined ? S : never => ({

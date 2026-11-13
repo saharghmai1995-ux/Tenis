@@ -14,6 +14,7 @@
 import { Fragment, useMemo, useState } from "react";
 import {
   BadgeCheck,
+  Calculator,
   ChevronDown,
   ExternalLink,
   FileCheck2,
@@ -22,7 +23,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import type { LedgerMatchRow, LedgerPayload } from "@/lib/tennis/types";
+import type { BankAudit, LedgerMatchRow, LedgerPayload } from "@/lib/tennis/types";
 
 const SURFACE_LABEL: Record<string, string> = {
   HARD: "هارد",
@@ -32,9 +33,107 @@ const SURFACE_LABEL: Record<string, string> = {
 
 const LINE_LABEL: Record<string, string> = {
   DUAL: "زوج‌تیپ",
+  BANKER: "بانکر",
+  REGCOMBO: "کمبو کاپولا",
+  CLUSTER: "خوشه دقیق",
+  ACCUMULATOR: "آکومولاتور",
   COMBO: "میکس",
   SNIPER: "اسنایپر",
 };
+
+// ─── v5.0 · 🧮 Live Bankroll Audit Inspector (1,647-unit accounting box) ───
+// the algebraic transparency formula rendered above the SHA-256 record table:
+//   موجودی اولیه + مجموع سود بردها − مجموع زیان بازنده‌ها + برآیند سایر خطوط
+//   = موجودی دقیق فعلی — every user can verify the bank growth in 3 seconds.
+
+/** uniform sign helper for the algebraic audit formula */
+function sgn(v: number): string {
+  return v >= 0 ? "+" : "−";
+}
+
+function AuditPart({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: string;
+  tone: "start" | "win" | "loss" | "line" | "result";
+}) {
+  const cls =
+    tone === "start"
+      ? "border-white/15 bg-white/[0.04] text-white"
+      : tone === "win"
+        ? "border-emerald-400/30 bg-emerald-400/[0.07] text-emerald-200"
+        : tone === "loss"
+          ? "border-rose-400/30 bg-rose-400/[0.07] text-rose-200"
+          : tone === "line"
+            ? "border-cyan-400/25 bg-cyan-400/[0.06] text-cyan-200"
+            : "border-amber-300/40 bg-amber-300/[0.09] text-amber-200";
+  return (
+    <div className={`flex flex-col items-center gap-0.5 rounded-xl border px-2.5 py-2 ${cls}`}>
+      <span className="mono-num text-sm font-extrabold" dir="ltr">
+        {value}
+      </span>
+      <span className="text-[9px] leading-3 opacity-80">{label}</span>
+    </div>
+  );
+}
+
+function BankAuditBox({ audit }: { audit?: BankAudit }) {
+  if (!audit) return null;
+  const fmt = (v: number) => `${v >= 0 ? "+" : "−"}${Math.abs(v).toFixed(2)}`;
+  return (
+    <div className="mb-4 rounded-2xl border border-amber-300/25 bg-amber-300/[0.04] p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-black text-amber-300">
+          <Calculator className="h-4 w-4" />
+          🧮 بازرس راستی‌آزمایی ریاضی بانک (Live Bankroll Audit Inspector)
+        </div>
+        <span
+          className="mono-num rounded-lg border border-white/10 bg-black/30 px-2 py-1 text-[9px] text-white/50"
+          dir="ltr"
+          title="SHA-256 integrity lock of the audit formula"
+        >
+          AUDIT·{audit.auditHash.slice(0, 10).toUpperCase()}
+        </span>
+      </div>
+      <p className="mt-1.5 text-[10px] leading-4 text-muted-foreground">
+        جمع جبری تک‌تک سطرهای تسویه‌شده کارنامه — هر کاربر می‌تواند صحت ۱۰۰٪ رشد بانک را در ۳
+        ثانیه با چشم خود جمع بزند و تایید کند.
+      </p>
+      <div className="mt-3 grid grid-cols-2 gap-1.5 sm:grid-cols-4 lg:grid-cols-8" dir="ltr">
+        <AuditPart label="موجودی اولیه" value={audit.bankStart.toFixed(2)} tone="start" />
+        <AuditPart label="سود بردهای زوج‌تیپ" value={fmt(audit.dualWonProfit)} tone="win" />
+        <AuditPart label="زیان بازنده‌های زوج‌تیپ" value={fmt(audit.dualLostStake)} tone="loss" />
+        <AuditPart label="سایر خطوط میکس" value={fmt(audit.comboProfit + audit.accumulatorProfit)} tone="line" />
+        <AuditPart label="بانکر + کمبو کاپولا" value={fmt(audit.bankerProfit + audit.comboProfit)} tone="line" />
+        <AuditPart label="خوشه دقیق" value={fmt(audit.clusterProfit)} tone="line" />
+        <AuditPart label="اسنایپر +EV" value={fmt(audit.sniperProfit)} tone="line" />
+        <AuditPart label="موجودی دقیق فعلی" value={audit.bank.toFixed(2)} tone="result" />
+      </div>
+      <p className="mono-num mt-3 break-words rounded-xl border border-white/10 bg-black/30 p-3 text-center text-[11px] font-bold leading-5 text-white/85" dir="ltr">
+        {audit.bankStart.toFixed(2)} {sgn(audit.dualWonProfit)} {Math.abs(audit.dualWonProfit).toFixed(2)}{" "}
+        {sgn(audit.dualLostStake)} {Math.abs(audit.dualLostStake).toFixed(2)} {sgn(audit.comboProfit)}{" "}
+        {Math.abs(audit.comboProfit).toFixed(2)} {sgn(audit.bankerProfit)} {Math.abs(audit.bankerProfit).toFixed(2)}{" "}
+        {sgn(audit.clusterProfit)} {Math.abs(audit.clusterProfit).toFixed(2)} {sgn(audit.sniperProfit)}{" "}
+        {Math.abs(audit.sniperProfit).toFixed(2)} {sgn(audit.accumulatorProfit)}{" "}
+        {Math.abs(audit.accumulatorProfit).toFixed(2)} = <span className="text-amber-300">{audit.bank.toFixed(2)} units</span>
+      </p>
+      <div className="mt-2 flex flex-wrap items-center justify-center gap-3 text-[10px] text-muted-foreground">
+        <span className="text-emerald-300">
+          ✓ <span className="mono-num">{audit.wonCount}</span> پوزیشن برد
+        </span>
+        <span className="text-rose-300">
+          ✗ <span className="mono-num">{audit.lostCount}</span> پوزیشن باخت
+        </span>
+        <span dir="ltr" className="mono-num">
+          {audit.wonCount + audit.lostCount} settled rows · SHA-256 locked
+        </span>
+      </div>
+    </div>
+  );
+}
 
 /** per-wing settlement math string, e.g. 50 × 2.85 − 100 = +42.5 */
 function wingMath(r: LedgerMatchRow, legOdds: number, legStake: number): string {
@@ -282,6 +381,7 @@ export function RecordTable({ ledger }: { ledger: LedgerPayload }) {
         </CardTitle>
       </CardHeader>
       <CardContent>
+        <BankAuditBox audit={ledger.bankAudit} />
         {rows.length === 0 ? (
           <p className="py-8 text-center text-sm text-muted-foreground">
             هنوز مسابقه تسویه‌شده‌ای در پنجره ۷ روزه ثبت نشده — موتور به محض پایان هر مسابقه

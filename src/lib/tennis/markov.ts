@@ -155,21 +155,130 @@ export function bo3Outcomes(setWinA: number): {
 // ─── Match-level joint distribution (outcome × total games × set-1 winner) ─
 // Set serve order alternates: set1 A-first, set2 B-first, set3 A-first
 // (assumes player A won the racket toss — documented engine assumption).
+// v5.0 STATION 2 — the set-2 / set-3 transition matrices are COPULA-ADJUSTED:
+//   · the previous-set winner carries the Gaussian-copula momentum shift
+//     (winnerPointShift, opponent gets the damped 0.6× reverse shift)
+//   · set-3 holds degrade by the fatiguePoint shift on BOTH servers
+//   · hold-level shifts use the exact point→hold map gameWinProb(·)
 const MAX_GAMES = 42;
+
+export interface CopulaAdjust {
+  /** momentum shift to the previous-set winner (POINT-prob units, ρ-driven) */
+  winnerPointShift: number;
+  /** set-3 fatigue (POINT-prob units, always ≤ 0, applied to both servers) */
+  fatiguePoint: number;
+}
+
+export interface CopulaJointTelemetry {
+  /** P(match reaches a deciding third set) under the copula */
+  threeSetMass: number;
+  /** same mass under the independent (ρ = 0) baseline — for the boost ratio */
+  threeSetMassIndep: number;
+  /** tie-break mass across sets 2-3 under the copula */
+  tiebreakMass23: number;
+  tiebreakMass23Indep: number;
+}
 
 export function matchJointDist(
   gA: number,
-  gB: number
-): { cells: MatchJointCell[]; dist: Map<ResultCode, number[]> } {
+  gB: number,
+  opts?: {
+    pointA?: number;
+    pointB?: number;
+    adjust?: CopulaAdjust;
+  }
+): { cells: MatchJointCell[]; dist: Map<ResultCode, number[]>; telemetry?: CopulaJointTelemetry } {
   const D1 = solveSet(gA, gB, "A").joint;
-  const D2 = solveSet(gA, gB, "B").joint;
-  const D3 = D1;
+  const pointA = opts?.pointA;
+  const pointB = opts?.pointB;
+  const adj = opts?.adjust;
+
+  // independent baseline (v4.x behaviour) when no copula adjust is requested
+  if (!adj || pointA === undefined || pointB === undefined) {
+    const D2 = solveSet(gA, gB, "B").joint;
+    const D3 = D1;
+    const out = assembleJoint(D1, D2, D3, null, null, null);
+    return { cells: out.cells, dist: out.dist };
+  }
+
+  const ws = adj.winnerPointShift; // signed momentum magnitude (ρ-driven)
+  const fz = adj.fatiguePoint; // set-3 fatigue (point units ≤ 0, both servers)
+  // copula-adjusted effective point probs (m = signed momentum toward A):
+  //   pA_eff = pA + m + fz3 · pB_eff = pB − 0.6·m + fz3  (loser 0.6× damped)
+  const effHolds = (m: number, fatigue: boolean) => ({
+    gA: gameWinProb(Math.max(0.5, Math.min(0.85, pointA + m + (fatigue ? fz : 0)))),
+    gB: gameWinProb(Math.max(0.5, Math.min(0.85, pointB - 0.6 * m + (fatigue ? fz : 0)))),
+  });
+  // set 2 — B serves first; the SET-1 winner carries the momentum (copula)
+  const set2A = effHolds(+ws, false); // A won set 1
+  const set2B = effHolds(-ws, false); // B won set 1
+  const D2_given_A = solveSet(set2A.gA, set2A.gB, "B").joint;
+  const D2_given_B = solveSet(set2B.gA, set2B.gB, "B").joint;
+  // set 3 — A serves first; the SET-2 winner carries the momentum + fatigue
+  const set3A = effHolds(+ws, true); // A won set 2
+  const set3B = effHolds(-ws, true); // B won set 2
+  const D3_momA = solveSet(set3A.gA, set3A.gB, "A").joint;
+  const D3_momB = solveSet(set3B.gA, set3B.gB, "A").joint;
+
+  const out = assembleJoint(
+    D1,
+    D2_given_A,
+    D2_given_B,
+    D3_momA,
+    D3_momB,
+    { winnerShift: ws, fatigue: fz, pointA, pointB }
+  );
+
+  // copula telemetry — 3-set mass and tie-break mass vs the ρ = 0 baseline
+  const threeSetMass = out.cells
+    .filter((c) => c.code === "2-1" || c.code === "1-2")
+    .reduce((s, c) => s + c.prob, 0);
+  const base = assembleJoint(D1, D1, D1, null, null, null);
+  const threeSetMassIndep = base.cells
+    .filter((c) => c.code === "2-1" || c.code === "1-2")
+    .reduce((s, c) => s + c.prob, 0);
+  const tiebreakMass23 = out.cells
+    .filter((c) => c.tiebreak23)
+    .reduce((s, c) => s + c.prob, 0);
+  const tiebreakMass23Indep = base.cells
+    .filter((c) => c.tiebreak23)
+    .reduce((s, c) => s + c.prob, 0);
+  return {
+    cells: out.cells,
+    dist: out.dist,
+    telemetry: {
+      threeSetMass,
+      threeSetMassIndep,
+      tiebreakMass23,
+      tiebreakMass23Indep,
+    },
+  };
+}
+
+// extended cell carry — per-set tiebreak flags survive to the telemetry sum
+type ExtendedJointCell = MatchJointCell & { tiebreak23?: boolean };
+
+/**
+ * Joint assembly over the (possibly copula-coupled) per-set distributions.
+ * D2_given_A / D2_given_B are the set-2 laws conditional on the set-1 winner;
+ * D3_momA / D3_momB are the set-3 laws conditional on the set-2 winner.
+ * When the momentum variants are null the assembly is the v4.x independent
+ * product (D2 = D3 = D1).
+ */
+function assembleJoint(
+  D1: SetJointCell[],
+  D2_given_A: SetJointCell[] | null,
+  D2_given_B: SetJointCell[] | null,
+  D3_momA: SetJointCell[] | null,
+  D3_momB: SetJointCell[] | null,
+  _params: Record<string, number> | null
+): { cells: ExtendedJointCell[]; dist: Map<ResultCode, number[]> } {
   // bucket key: code | total games | margin | set-1 winner — keeps the set-1
   // orientation needed by the v2.0 archetype coverage mathematics AND the
   // v4.0 game-margin (handicap) orientation
   const buckets = new Map<
     string,
-    { code: ResultCode; games: number; margin: number; set1A: boolean; prob: number }
+    { code: ResultCode; games: number; margin: number; set1A: boolean; prob: number; tb23: boolean }
   >();
 
   const add = (
@@ -177,12 +286,13 @@ export function matchJointDist(
     games: number,
     margin: number,
     set1A: boolean,
-    prob: number
+    prob: number,
+    tb23: boolean
   ) => {
-    const key = `${code}|${games}|${margin}|${set1A ? "A" : "B"}`;
+    const key = `${code}|${games}|${margin}|${set1A ? "A" : "B"}|${tb23 ? "t" : "n"}`;
     const cell = buckets.get(key);
     if (cell) cell.prob += prob;
-    else buckets.set(key, { code, games, margin, set1A, prob });
+    else buckets.set(key, { code, games, margin, set1A, prob, tb23 });
   };
 
   for (const t1 of D1) {
@@ -190,6 +300,7 @@ export function matchJointDist(
     const sa1 = w1A ? 1 : 0;
     const sb1 = w1A ? 0 : 1;
     const m1 = t1.gamesA - t1.gamesB;
+    const D2 = D2_given_A === null || D2_given_B === null ? D1 : w1A ? D2_given_A : D2_given_B;
     // set 2
     for (const t2 of D2) {
       const w2A = t2.gamesA > t2.gamesB;
@@ -199,23 +310,25 @@ export function matchJointDist(
       const g12 = t1.gamesA + t1.gamesB + t2.gamesA + t2.gamesB;
       const m12 = m1 + (t2.gamesA - t2.gamesB);
       if (sa2 === 2) {
-        add("2-0", g12, m12, w1A, p12);
+        add("2-0", g12, m12, w1A, p12, false);
         continue;
       }
       if (sb2 === 2) {
-        add("0-2", g12, m12, w1A, p12);
+        add("0-2", g12, m12, w1A, p12, false);
         continue;
       }
-      // set 3 decides
+      // set 3 decides — momentum to the set-2 winner + fatigue
+      const D3 = D3_momA === null || D3_momB === null ? D1 : w2A ? D3_momA : D3_momB;
+      const tb3 = t1.tiebreak || t2.tiebreak;
       for (const t3 of D3) {
         const w3A = t3.gamesA > t3.gamesB;
         const code: ResultCode = w3A ? "2-1" : "1-2";
-        add(code, g12 + t3.gamesA + t3.gamesB, m12 + (t3.gamesA - t3.gamesB), w1A, p12 * t3.prob);
+        add(code, g12 + t3.gamesA + t3.gamesB, m12 + (t3.gamesA - t3.gamesB), w1A, p12 * t3.prob, tb3 || t3.tiebreak);
       }
     }
   }
 
-  const cells: MatchJointCell[] = [];
+  const cells: ExtendedJointCell[] = [];
   const dist = new Map<ResultCode, number[]>();
   for (const cell of buckets.values()) {
     cells.push({
@@ -224,6 +337,7 @@ export function matchJointDist(
       prob: cell.prob,
       set1A: cell.set1A,
       margin: cell.margin,
+      tiebreak23: cell.tb23,
     });
     let arr = dist.get(cell.code);
     if (!arr) {
@@ -411,9 +525,15 @@ export interface FullMarkov {
   bpsA: number;
   bpsB: number;
   arch: ArchMetrics; // v2.0 — favorite-oriented archetype coverage metrics
+  /** v5.0 STATION 2 — copula joint telemetry (set-2/3 coupling) */
+  copulaJoint?: CopulaJointTelemetry;
 }
 
-export function fullMarkov(pA: number, pB: number): FullMarkov {
+export function fullMarkov(
+  pA: number,
+  pB: number,
+  adjust?: CopulaAdjust
+): FullMarkov {
   const gA = gameWinProb(pA);
   const gB = gameWinProb(pB);
 
@@ -437,11 +557,34 @@ export function fullMarkov(pA: number, pB: number): FullMarkov {
   // renormalize (guard numerical residue)
   const n = s1Prob > 0 ? s1Prob : 1;
 
-  // Layer 3 — doc formulas
-  const bo3 = bo3Outcomes(setWinA);
-
   // Match-level games distribution (with set-1 winner orientation)
-  const { cells, dist } = matchJointDist(gA, gB);
+  // v5.0 — copula-coupled when `adjust` is provided (STATION 2)
+  const { cells, dist, telemetry } = matchJointDist(
+    gA,
+    gB,
+    adjust ? { pointA: pA, pointB: pB, adjust } : undefined
+  );
+  // v5.0 — the 4-outcome decomposition now comes from the copula joint when
+  // available (authoritative Station-2 law); the i.i.d. bo3Outcomes formula
+  // stays as the ρ = 0 baseline cross-check.
+  const sumOf = (code: ResultCode) =>
+    cells.reduce((s, c) => s + (c.code === code ? c.prob : 0), 0);
+  const totalMass = cells.reduce((s, c) => s + c.prob, 0);
+  const massNorm = totalMass > 0 ? totalMass : 1;
+  const bo3 = adjust
+    ? {
+        p20: sumOf("2-0") / massNorm,
+        p21: sumOf("2-1") / massNorm,
+        p12: sumOf("1-2") / massNorm,
+        p02: sumOf("0-2") / massNorm,
+      }
+    : bo3Outcomes(setWinA);
+
+  // v2.0 — exact archetype metrics for the model favorite
+  const fav: "A" | "B" = pA >= pB ? "A" : "B";
+  const arch = archetypeMetrics(cells, sA.winA, fav);
+
+  // v5.0 — match-level games distribution derived metrics
   let over215 = 0;
   let slipBCombined = 0;
   for (const [code, arr] of dist.entries()) {
@@ -452,10 +595,6 @@ export function fullMarkov(pA: number, pB: number): FullMarkov {
       if ((code === "2-1" || code === "1-2") && g >= 21) slipBCombined += arr[g];
     }
   }
-
-  // v2.0 — exact archetype metrics for the model favorite
-  const fav: "A" | "B" = pA >= pB ? "A" : "B";
-  const arch = archetypeMetrics(cells, sA.winA, fav);
 
   return {
     gA,
@@ -473,6 +612,7 @@ export function fullMarkov(pA: number, pB: number): FullMarkov {
     bpsA: breakPointSavedProb(pA),
     bpsB: breakPointSavedProb(pB),
     arch,
+    copulaJoint: telemetry,
   };
 }
 

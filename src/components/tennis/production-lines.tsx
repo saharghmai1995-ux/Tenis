@@ -9,6 +9,7 @@ import {
   Crown,
   ExternalLink,
   Gem,
+  Layers,
   Link2,
   Lock,
   Rocket,
@@ -229,18 +230,34 @@ function MarketBox({
   wingLabel,
   item,
 }: {
-  tone: "A" | "B" | "single";
+  tone: "A" | "B" | "single" | "emerald" | "orange" | "violet" | "lime";
   wingLabel: string;
   item: LineItem;
 }) {
   const accent =
     tone === "A"
       ? "border-amber-300/30 bg-amber-300/[0.07]"
-      : tone === "B"
+      : tone === "B" || tone === "emerald"
         ? "border-emerald-400/30 bg-emerald-400/[0.07]"
-        : "border-rose-400/30 bg-rose-400/[0.06]";
+        : tone === "orange"
+          ? "border-orange-400/30 bg-orange-400/[0.07]"
+          : tone === "violet"
+            ? "border-violet-400/30 bg-violet-400/[0.07]"
+            : tone === "lime"
+              ? "border-lime-400/30 bg-lime-400/[0.07]"
+              : "border-rose-400/30 bg-rose-400/[0.06]";
   const toneText =
-    tone === "A" ? "text-amber-300" : tone === "B" ? "text-emerald-300" : "text-rose-300";
+    tone === "A"
+      ? "text-amber-300"
+      : tone === "B" || tone === "emerald"
+        ? "text-emerald-300"
+        : tone === "orange"
+          ? "text-orange-300"
+          : tone === "violet"
+            ? "text-violet-300"
+            : tone === "lime"
+              ? "text-lime-300"
+              : "text-rose-300";
   const stake = item.stakePct ?? item.stake;
   return (
     <div className={`rounded-xl border p-3 ${accent}`}>
@@ -511,6 +528,153 @@ function ArchBadge({ item }: { item: LineItem }) {
   );
 }
 
+// ─── v5.0 · 👑 Crown badge (GOLD / SILVER holographic) ─────────────────────
+
+function CrownBadge({ item }: { item: LineItem }) {
+  const c = item.crown;
+  if (!c || c.tier === "NONE") return null;
+  const gold = c.tier === "GOLD";
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge
+          className={`gap-1 border-0 text-[10px] font-black ${
+            gold
+              ? "bg-gradient-to-r from-amber-400 via-yellow-200 to-amber-400 text-black shadow-[0_0_14px_rgba(251,191,36,0.45)]"
+              : "bg-gradient-to-r from-slate-300 via-white to-slate-300 text-slate-900 shadow-[0_0_12px_rgba(226,232,240,0.35)]"
+          }`}
+        >
+          {gold ? "👑" : "🥈"}
+          {gold ? "GOLD CROWN" : "SILVER CROWN"}
+          <span className="mono-num">MC {c.score}/100</span>
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-xs text-[11px] leading-5">
+        <div className="font-bold">{c.labelFa}</div>
+        <div className="mono-num mt-1 text-[10px]" dir="ltr">
+          {c.labelEn}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+// ─── v5.0 · regime badge (5-regime router decision) ─────────────────────────
+
+function RegimeBadge({ item }: { item: LineItem }) {
+  const r = item.regime;
+  if (!r || r.code === "VETOED") return null;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge
+          variant="outline"
+          className="gap-1 border-cyan-400/40 bg-cyan-400/10 text-[10px] font-bold text-cyan-200"
+        >
+          {r.icon} {r.labelFa}
+          <span className="mono-num">· Sharpe {r.sharpe.toFixed(2)}</span>
+          <span className="mono-num">· MC {r.mcScore}/100</span>
+          {r.adaptive && <span className="text-amber-200">· سازگار</span>}
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-sm text-[11px] leading-5">
+        <div className="font-bold" dir="ltr">
+          {r.labelEn}
+        </div>
+        <div className="mt-1">{r.why}</div>
+        {r.stakePlanFa && <div className="mt-1 text-[10px]">{r.stakePlanFa}</div>}
+        {r.marketEn && (
+          <div className="mono-num mt-1 text-[10px]" dir="ltr">
+            MARKET: {r.marketEn}
+          </div>
+        )}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+// ─── v5.0 · 4-station pipeline telemetry bar ────────────────────────────────
+// [✅ 1. Markov p_A/p_B] ➔ [✅ 2. Copula ρ] ➔ [✅ 3. 10k Monte-Carlo] ➔ [👑 4. Supervisor Crown]
+
+function PipelineBar({ item }: { item: LineItem }) {
+  const p = item.pipeline;
+  if (!p) return null;
+  const crownIcon = p.station4Supervisor.label.includes("GOLD")
+    ? "👑"
+    : p.station4Supervisor.label.includes("SILVER")
+      ? "🥈"
+      : "✅";
+  const stations = [
+    {
+      ok: p.station1Markov.ok,
+      title: "1. Markov",
+      sub: `${(p.station1Markov.pA * 100).toFixed(0)}/${(p.station1Markov.pB * 100).toFixed(0)}`,
+      icon: "✅",
+    },
+    {
+      ok: p.station2Copula.ok,
+      title: "2. Copula ρ",
+      sub: p.station2Copula.label.replace("Copula ", ""),
+      icon: "✅",
+    },
+    {
+      ok: p.station3MonteCarlo.ok,
+      title: "3. 10k Monte-Carlo",
+      sub: `${(p.station3MonteCarlo.runs / 1000).toFixed(0)}k runs`,
+      icon: "✅",
+    },
+    {
+      ok: p.station4Supervisor.ok,
+      title: "4. Supervisor",
+      sub: `${p.station4Supervisor.score}/100`,
+      icon: crownIcon,
+    },
+  ];
+  return (
+    <div className="flex items-stretch gap-1 rounded-xl border border-white/10 bg-black/25 p-1.5" dir="ltr">
+      {stations.map((st, i) => (
+        <div key={i} className="flex min-w-0 flex-1 items-center gap-1">
+          <div
+            className={`flex min-w-0 flex-1 flex-col items-center gap-0.5 rounded-lg border px-1 py-1.5 ${
+              st.ok
+                ? "border-emerald-400/25 bg-emerald-400/[0.06]"
+                : "border-white/10 bg-white/[0.03] opacity-60"
+            }`}
+          >
+            <span className="text-[10px] leading-none">{st.icon}</span>
+            <span className="mono-num truncate text-[8.5px] font-bold leading-tight text-white/80">
+              {st.title}
+            </span>
+            <span className="mono-num truncate text-[8.5px] leading-tight text-cyan-300">
+              {st.sub}
+            </span>
+          </div>
+          {i < stations.length - 1 && (
+            <span className="shrink-0 text-[9px] text-white/35">➔</span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** v5.0 stacked panel: regime + crown badges over the 4-station telemetry bar. */
+function V5Panel({ item }: { item: LineItem }) {
+  const hasCrown = item.crown && item.crown.tier !== "NONE";
+  if (!item.regime && !hasCrown && !item.pipeline) return null;
+  return (
+    <div className="mt-3 space-y-2">
+      {(item.regime || hasCrown) && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <RegimeBadge item={item} />
+          <CrownBadge item={item} />
+        </div>
+      )}
+      <PipelineBar item={item} />
+    </div>
+  );
+}
+
 function FlashFooter({ item, matchLabel }: { item: LineItem; matchLabel: string }) {
   return (
     <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-white/10 pt-2.5">
@@ -539,6 +703,7 @@ function DualFlashcard({ pair }: { pair: { A: LineItem; B: LineItem } }) {
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <ArchBadge item={A} />
         </div>
+        <V5Panel item={A} />
         <div className="mt-3 space-y-2.5">
           <MarketBox tone="A" wingLabel="تیپ A — دکمه رسمی سایت بت" item={A} />
           <MarketBox tone="B" wingLabel="تیپ B — دکمه مکمل رسمی" item={B} />
@@ -646,8 +811,88 @@ function SniperFlashcard({ item }: { item: LineItem }) {
     <TiltCard className="rise-in rounded-2xl border border-rose-400/25 bg-rose-400/[0.04]">
       <div className="p-4">
         <FlashHeader item={item} matchLabel={matchLabel} />
+        <V5Panel item={item} />
         <div className="mt-3">
-          <MarketBox tone="single" wingLabel="تک‌تیرانداز — دکمه رسمی ضریب بالا" item={item} />
+          <MarketBox tone="single" wingLabel="تک‌تیرانداز — فیلتر ارزش انتظاری کاپولا (+EV ≥ ۱۴٪)" item={item} />
+        </div>
+        <FlashFooter item={item} matchLabel={matchLabel} />
+      </div>
+    </TiltCard>
+  );
+}
+
+// ─── v5.0 regime slip card (BANKER / CLUSTER scenario / REGCOMBO wing) ──────
+
+function RegimeSlipCard({
+  item,
+  tone,
+  wingLabel,
+}: {
+  item: LineItem;
+  tone: "emerald" | "orange" | "violet";
+  wingLabel: string;
+}) {
+  const matchLabel = `${item.playerA} × ${item.playerB}`;
+  const shell =
+    tone === "emerald"
+      ? "border-emerald-400/25 bg-emerald-400/[0.04]"
+      : tone === "orange"
+        ? "border-orange-400/25 bg-orange-400/[0.04]"
+        : "border-violet-400/25 bg-violet-400/[0.04]";
+  return (
+    <TiltCard className={`rise-in rounded-2xl ${shell}`}>
+      <div className="p-4">
+        <FlashHeader item={item} matchLabel={matchLabel} />
+        <V5Panel item={item} />
+        <div className="mt-3">
+          <MarketBox tone={tone} wingLabel={wingLabel} item={item} />
+        </div>
+        <FlashFooter item={item} matchLabel={matchLabel} />
+      </div>
+    </TiltCard>
+  );
+}
+
+// ─── v5.0 REGCOMBO card: main + cover wings of one match ────────────────────
+
+function RegComboCard({ pair }: { pair: { main: LineItem; cover: LineItem } }) {
+  const { main, cover } = pair;
+  const matchLabel = `${main.playerA} × ${main.playerB}`;
+  return (
+    <TiltCard className="rise-in rounded-2xl border border-violet-400/25 bg-violet-400/[0.04]">
+      <div className="p-4">
+        <FlashHeader item={main} matchLabel={matchLabel} />
+        <V5Panel item={main} />
+        <div className="mt-3 space-y-2.5">
+          <MarketBox tone="violet" wingLabel="کمبوی رسمی تک‌دکمه (تیپ اصلی)" item={main} />
+          <MarketBox tone="emerald" wingLabel="پوشش رسمی مکمل (Cover)" item={cover} />
+        </div>
+        <FlashFooter item={main} matchLabel={matchLabel} />
+      </div>
+    </TiltCard>
+  );
+}
+
+// ─── v5.0 CLUSTER card: the three dutched exact scenarios of one match ──────
+
+function ClusterCard({ legs }: { legs: LineItem[] }) {
+  const item = legs[0];
+  const matchLabel = `${item.playerA} × ${item.playerB}`;
+  const totalStake = legs.reduce((s, l) => s + l.stake, 0);
+  const wingLabels = ["سناریو ۱ — داچینگ دقیق", "سناریو ۲ — داچینگ دقیق", "سناریو ۳ — داچینگ دقیق"];
+  const tones = ["orange", "violet", "lime"] as const;
+  return (
+    <TiltCard className="rise-in rounded-2xl border border-orange-400/25 bg-orange-400/[0.04]">
+      <div className="p-4">
+        <FlashHeader item={item} matchLabel={matchLabel} />
+        <V5Panel item={item} />
+        <div className="mt-3 space-y-2.5">
+          {legs.map((leg, i) => (
+            <MarketBox key={leg.leg} tone={tones[i % tones.length]} wingLabel={wingLabels[i]} item={leg} />
+          ))}
+        </div>
+        <div className="mono-num mt-2 rounded-lg border border-white/10 bg-black/20 px-3 py-1.5 text-[10px] text-white/70" dir="ltr">
+          DUTCHING PLAN: {legs.map((l) => `${l.stake}u @ ${l.odds.toFixed(2)}`).join(" + ")} = {Math.round(totalStake * 10) / 10}u · NET +35–55%
         </div>
         <FlashFooter item={item} matchLabel={matchLabel} />
       </div>
@@ -732,7 +977,8 @@ function NearGateStrip({ matches }: { matches: AnalyzedMatch[] }) {
 
 export function ProductionLines({ feed }: { feed: FeedPayload }) {
   const [booster, setBooster] = useState(true);
-  const { dual, combo2, combo3, sniper, shadow } = feed.lines;
+  const { dual, banker, regCombo, cluster, accumulator, combo2, combo3, sniper, shadow } =
+    feed.lines;
 
   // v4.0 — the two complementary wings are ONE flashcard per match. Wing
   // classification uses the official atomic leg map (TS-O25 / GH-F45 are
@@ -759,6 +1005,31 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
     return first.slice(0, 10);
   }, [shadow]);
 
+  // v5.0 — REGCOMBO grouped into main + cover wings per match
+  const regComboPairs = useMemo(() => {
+    const byMatch = new Map<string, { main?: LineItem; cover?: LineItem }>();
+    for (const item of regCombo) {
+      const cur = byMatch.get(item.matchId) ?? {};
+      if (item.leg.includes("MAIN")) cur.main = item;
+      else cur.cover = item;
+      byMatch.set(item.matchId, cur);
+    }
+    return [...byMatch.values()].filter(
+      (p): p is { main: LineItem; cover: LineItem } => !!p.main && !!p.cover
+    );
+  }, [regCombo]);
+
+  // v5.0 — CLUSTER scenarios grouped per match (3 dutched legs)
+  const clusterGroups = useMemo(() => {
+    const byMatch = new Map<string, LineItem[]>();
+    for (const item of cluster) {
+      const arr = byMatch.get(item.matchId) ?? [];
+      arr.push(item);
+      byMatch.set(item.matchId, arr);
+    }
+    return [...byMatch.values()];
+  }, [cluster]);
+
   // Principal-Lock Booster display: asymmetric staking preview on dual line
   const boosterNote = booster
     ? "شتاب‌دهنده نامتقارن فعال: پس از هر برد، سود قفل می‌شود و نیمی از آن به استیک بعدی تزریق می‌گردد (اصل سرمایه همیشه محفوظ)"
@@ -770,22 +1041,33 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
         <CardHeader className="pb-2">
           <CardTitle className="flex flex-wrap items-center gap-2 text-sm font-bold">
             <Rocket className="h-4 w-4 text-amber-300" />
-            خطوط تولید سیگنال (۳ لاین مستقل)
+            خطوط تولید سیگنال — نسخه ۵.۰ (۵ رژیم غیرخطی)
             <span className="text-[11px] font-normal text-muted-foreground">
-              — مارکت‌های اتمی رسمی ATP/WTA · سوپروایزر ۳ الگویی با سهمیه تایید ۶۵٪ · خروجی امروز: {dualPairs.length} مسابقه زوج‌تیپ ({dual.length} بال) ·{" "}
-              {combo2.length + combo3.length} برگه میکس ·{" "}
-              {sniper.length} اسنایپر · {shadow.length} وتو
+              — خط لوله مارکوف ← کاپولا ← مونت‌کارلو ۱۰هزارتایی ← دروازه سوپروایزر · خروجی امروز:{" "}
+              {dualPairs.length} زوج‌تیپ ({dual.length} بال) · {banker.length} بانکر ·{" "}
+              {regComboPairs.length} کمبو کاپولا · {clusterGroups.length} خوشه دقیق ·{" "}
+              {accumulator.length + combo2.length + combo3.length} برگه میکس/آکومولاتور ·{" "}
+              {sniper.length} اسنایپر +EV · {shadow.length} وتو
             </span>
           </CardTitle>
         </CardHeader>
         <CardContent>
           <Tabs defaultValue="dual">
-            <TabsList className="grid w-full grid-cols-3 bg-white/5">
+            <TabsList className="grid w-full grid-cols-3 gap-1 bg-white/5 sm:grid-cols-6">
               <TabsTrigger value="dual" className="gap-1.5 text-xs">
-                <Target className="h-3.5 w-3.5" /> زوج‌تیپ اتمی رسمی
+                <Target className="h-3.5 w-3.5" /> زوج‌تیپ
+              </TabsTrigger>
+              <TabsTrigger value="banker" className="gap-1.5 text-xs">
+                <Wallet className="h-3.5 w-3.5" /> بانکر
+              </TabsTrigger>
+              <TabsTrigger value="regcombo" className="gap-1.5 text-xs">
+                <Layers className="h-3.5 w-3.5" /> کمبو کاپولا
+              </TabsTrigger>
+              <TabsTrigger value="cluster" className="gap-1.5 text-xs">
+                <Gem className="h-3.5 w-3.5" /> خوشه دقیق
               </TabsTrigger>
               <TabsTrigger value="combo" className="gap-1.5 text-xs">
-                <Sparkles className="h-3.5 w-3.5" /> برگه میکس رسمی
+                <Sparkles className="h-3.5 w-3.5" /> میکس/آکومو
               </TabsTrigger>
               <TabsTrigger value="sniper" className="gap-1.5 text-xs">
                 <Crosshair className="h-3.5 w-3.5" /> تک‌تیرانداز
@@ -849,17 +1131,69 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
               )}
             </TabsContent>
 
-            <TabsContent value="combo" className="mt-4 space-y-3">
-              {[...combo2, ...combo3].length === 0 ? (
+            <TabsContent value="banker" className="mt-4 space-y-3">
+              {banker.length === 0 ? (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  برگه میکس امنی با پنجره هدف <span className="mono-num">2.05x–2.40x</span> (۲تایی) یا{" "}
-                  <span className="mono-num">2.90x–3.80x</span> (۳تایی) یافت نشد — پایه‌های امن سلاطین سرویس
-                  (فاوریت با احتمال برد <span className="mono-num">≥74%</span>) امروز در تداخل رنکینگ هستند.
+                  بانکری امروز در پنجره رژیم (<span className="mono-num">S_fav ≥ 72%</span> و حفظ سرویس{" "}
+                  <span className="mono-num">≥ 85%</span>) صلاحیت نگرفت — بانکرها به‌صورت خودکار
+                  آکومولاتور سلاطین سرویس را تغذیه می‌کنند.
                 </div>
               ) : (
                 <div className="grid gap-3 xl:grid-cols-2">
-                  {[...combo2, ...combo3].map((item) => (
-                    <ParlaySlipCard key={`${item.matchId}-${item.leg}`} item={item} />
+                  {banker.map((item) => (
+                    <RegimeSlipCard
+                      key={`${item.matchId}-${item.leg}`}
+                      item={item}
+                      tone="emerald"
+                      wingLabel="🏦 بانکر امن سرویس — استیک مستقیم ۶۰ واحد"
+                    />
+                  ))}
+                </div>
+              )}
+            </TabsContent>
+
+            <TabsContent value="regcombo" className="mt-4 space-y-3">
+              {regComboPairs.length === 0 ? (
+                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
+                  کمبو کاپولایی با همبستگی بالای <span className="mono-num">۷۶٪</span> و پوشش{" "}
+                  <span className="mono-num">≥ ۹۲٪</span> امروز یافت نشد — مسابقه‌ای که همبستگی
+                  کاپولای برد فاوریت × تعداد گیم بالای ۷۶٪ بگذارد اینجا صادر می‌شود.
+                </div>
+              ) : (
+                <div className="grid gap-3 xl:grid-cols-2">
+                  {regComboPairs.map((pair) => (
+                    <RegComboCard key={pair.main.matchId} pair={pair} />
+                  ))}
+                </div>
+              )}
+            </TabsContent>
+
+            <TabsContent value="cluster" className="mt-4 space-y-3">
+              {clusterGroups.length === 0 ? (
+                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
+                  خوشه‌ای با آنتروپی شانون پایین و ۳ سناریوی بالای{" "}
+                  <span className="mono-num">۶۴٪</span> امروز یافت نشد — داچینگ ۱۰۰ واحدی روی
+                  سناریوهای دقیق ست و گیم فقط در مسابقه‌های قطعی صادر می‌شود.
+                </div>
+              ) : (
+                <div className="grid gap-3 xl:grid-cols-2">
+                  {clusterGroups.map((legs) => (
+                    <ClusterCard key={legs[0].matchId} legs={legs} />
+                  ))}
+                </div>
+              )}
+            </TabsContent>
+
+            <TabsContent value="combo" className="mt-4 space-y-3">
+              {[...accumulator, ...combo2, ...combo3].length === 0 ? (
+                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
+                  برگه میکس امنی یا آکومولاتور سلاطین سرویس امروز یافت نشد — آکومولاتور ۲-۳ تایی
+                  به‌صورت خودکار از بهترین بانکرهای روز ساخته می‌شود (وین‌ریت بالای ۷۸٪).
+                </div>
+              ) : (
+                <div className="grid gap-3 xl:grid-cols-2">
+                  {[...accumulator, ...combo2, ...combo3].map((item) => (
+                    <ParlaySlipCard key={`${item.line}-${item.matchId}-${item.leg}`} item={item} />
                   ))}
                 </div>
               )}
@@ -868,8 +1202,9 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
             <TabsContent value="sniper" className="mt-4 space-y-3">
               {sniper.length === 0 ? (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  تیر خالصی در پنجره هدف <span className="mono-num">3.40x–4.60x</span> پیدا نشد — اسنایپر فقط
-                  در بازی‌های نزدیک سیگنال صادر می‌کند (SET BETTING — FAVORITE WINS 2-1).
+                  تیر خالصی با فیلتر ارزش انتظاری کاپولا پیدا نشد — اسنایپر نسخه ۵.۰ فقط وقتی
+                  <span className="mono-num"> +EV ≥ 14%</span> و ضریب بازار در بازه{" "}
+                  <span className="mono-num">3.20x–4.80x</span> باشد سیگنال صادر می‌کند (ضریب‌های بالای ۶.۰۰x حذف شدند).
                 </div>
               ) : (
                 <div className="grid gap-3 xl:grid-cols-2">

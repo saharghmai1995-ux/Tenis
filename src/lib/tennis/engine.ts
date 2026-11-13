@@ -15,7 +15,7 @@ import {
 } from "./espn";
 import { fetchPolymarketOdds, matchMarket } from "./polymarket";
 import { fetchCityWeather } from "./weather";
-import { fullMarkov, matchWinProbA } from "./markov";
+import { bo3Outcomes, breakPointSavedProb, fullMarkov, matchWinProbA } from "./markov";
 import { removeMargin, reverseAnalysis } from "./solver";
 import {
   buildSlips,
@@ -24,10 +24,15 @@ import {
   evaluateArchetypes,
   isDualEligible,
   supervisorGate,
-  enforceApprovalQuota,
   DUAL_LEG_MARKET_ODDS,
+  OFFICIAL_TENNIS_ATOMIC_ARCHETYPES,
+  routeRegime,
+  routeRegimeAdaptive,
+  assignCrown,
+  finalizeRegimeScore,
 } from "./supervisor";
 import type { QuotaTelemetry } from "./supervisor";
+import { deriveCopulaTelemetry, runMonteCarlo } from "./copula";
 import { canonicalMatchString, sha256 } from "./hash";
 import { extractSettleableResult, runSettlement } from "./settlement";
 import { buildLedgerPayload } from "./ledger";
@@ -229,7 +234,14 @@ function analyzeMatch(
     m.surface,
     m.tour
   );
-  const mk = fullMarkov(rev.pFinalA, rev.pFinalB);
+  // ── v5.0 STATION 2 — Gaussian copula telemetry from exact BP-saved rates ──
+  const bpsA0 = breakPointSavedProb(rev.pFinalA);
+  const bpsB0 = breakPointSavedProb(rev.pFinalB);
+  const cop = deriveCopulaTelemetry(rev.pFinalA, rev.pFinalB, bpsA0, bpsB0);
+  const mk = fullMarkov(rev.pFinalA, rev.pFinalB, {
+    winnerPointShift: cop.winnerShift,
+    fatiguePoint: cop.fatigueSet3,
+  });
   const winA = matchWinProbA(rev.pFinalA, rev.pFinalB);
   const favorite: "A" | "B" = winA >= 0.5 ? "A" : "B";
   const favWinProb = favorite === "A" ? winA : 1 - winA;
@@ -246,14 +258,63 @@ function analyzeMatch(
     dualEligible: false,
     slips: {},
     timing: { label: "", code: "WAIT", optimal: false },
+    copula: cop,
   };
+
+  // ── v5.0 STATION 3 — 10,000 game-by-game Monte Carlo ─────────────────────
+  const mc = runMonteCarlo(rev.pFinalA, rev.pFinalB, cop, favorite);
+  am.monteCarlo = mc;
 
   const archReport = evaluateArchetypes(am);
   am.archEvals = archReport.evals;
   am.archetype = archReport.selected;
   am.veto = supervisorGate(am, archReport.selected);
-  am.dualEligible = isDualEligible(am);
-  am.slips = buildSlips(am);
+
+  // ── v5.0 STATION 4 — non-linear 5-regime router ──────────────────────────
+  const route = routeRegime(am, mc, archReport.selected?.pairLoss ?? 0);
+  if (route.decision.code === "DUAL-HEDGE") {
+    // the champion golden pair rides the official ARCH1 atomic slips so the
+    // DUAL production line + ledger + settlement stay exactly as contracted
+    if (!am.veto.vetoed) {
+      am.archetype = {
+        code: "ARCH1",
+        labelFa: "الگوی رسمی ۱ — تسلط ست‌ها",
+        labelEn: "Set Mastery",
+        coverage: 1 - (route.selected?.pairLoss ?? 0),
+        pairLoss: route.selected?.pairLoss ?? 0,
+      };
+      am.slips = buildSlips(am);
+    }
+  }
+  if (!am.veto.vetoed && route.decision.code === "VETOED") {
+    // regime-level veto (Top-100 veto keeps its own reason)
+    am.veto = { vetoed: true, code: "REGIME", reason: route.decision.why };
+  }
+  am.regime = finalizeRegimeScore(
+    route.decision,
+    mc,
+    route.selected?.pairLoss ?? 1 - favWinProb
+  );
+  am.dualEligible = !am.veto.vetoed && am.regime.code === "DUAL-HEDGE" && !!am.slips.A;
+  am.pipeline = {
+    station1Markov: {
+      ok: true,
+      label: "Markov p_A/p_B",
+      pA: rev.pFinalA,
+      pB: rev.pFinalB,
+    },
+    station2Copula: {
+      ok: true,
+      label: `Copula ρ=${cop.rhoSetCoupling >= 0 ? "+" : ""}${cop.rhoSetCoupling.toFixed(2)}`,
+      rho: cop.rhoSetCoupling,
+    },
+    station3MonteCarlo: { ok: true, label: "10k Monte-Carlo", runs: mc.runs },
+    station4Supervisor: {
+      ok: am.regime.code !== "VETOED",
+      label: "Supervisor Crown",
+      score: am.regime.mcScore,
+    },
+  };
   am.timing = timingOf(m, favorite);
   am.hashPre = lockHashOf(am);
   return am;
@@ -341,14 +402,33 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
       }
     }
 
-    // ── v3.0 · guaranteed 65% supervisor approval quota ──────────────────
-    // After every match passed the natural 3-archetype evaluation, the quota
-    // grants the least-risk archetype adaptively until ≥ 65% of today's
-    // main-tour card (min 12) is approved — tabs can never be empty.
-    const quota = enforceApprovalQuota(analyzed);
+    // ── v5.0 · guaranteed 65% supervisor approval quota (regime edition) ──
+    // Natural 5-regime approvals count first; remaining slots are granted the
+    // least-risk regime adaptively (🥈 SILVER crown · half stakes) until
+    // ≥ 65% of today's main-tour card (min 12) is approved.
+    const quota = enforceApprovalQuotaV5(analyzed);
     // adaptive approvals received fresh slips → recompute the SHA-256 lock
     for (const m of analyzed) {
       if (m.archetype?.adaptive) m.hashPre = lockHashOf(m);
+    }
+    // v5.0 crown badges — 👑 GOLD for natural low-risk/high-Sharpe positions,
+    // 🥈 SILVER for adaptive quota grants, none for standard approvals
+    for (const m of analyzed) {
+      if (m.state === "post" || !m.regime || m.regime.code === "VETOED" || m.veto.vetoed) continue;
+      const pairLoss = m.regime.pairLoss ?? 1 - m.favWinProb;
+      m.crown = assignCrown(
+        !!m.regime.adaptive,
+        pairLoss,
+        m.regime.sharpe,
+        m.regime.mcScore
+      );
+      if (m.pipeline) {
+        m.pipeline.station4Supervisor = {
+          ok: true,
+          label: m.crown.tier === "GOLD" ? "GOLD CROWN" : m.crown.tier === "SILVER" ? "SILVER CROWN" : "Approved",
+          score: m.regime.mcScore,
+        };
+      }
     }
 
     // ── v2.0 · 7-day historical auto-settlement ────────────────────────────
@@ -361,7 +441,17 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
     // ── persist → build lines → persist picks → settle → ledger
     await persistMatches(analyzed);
     const lines = buildLines(analyzed);
-    const settledItems = [...lines.dual, ...lines.combo2, ...lines.combo3, ...lines.sniper, ...lines.shadow];
+    const settledItems = [
+      ...lines.dual,
+      ...lines.banker,
+      ...lines.regCombo,
+      ...lines.cluster,
+      ...lines.accumulator,
+      ...lines.combo2,
+      ...lines.combo3,
+      ...lines.sniper,
+      ...lines.shadow,
+    ];
     const allItems = dedupeByKey(
       [...settledItems, ...historySummary.items],
       (i) => `${i.matchId}|${i.line}|${i.leg}`
@@ -398,6 +488,79 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
   } finally {
     feedPromise = null;
   }
+}
+
+// ─── v5.0 · Guaranteed 65% Approval Quota (5-regime edition) ───────────────
+// Natural regime approvals count first; remaining slots are granted the
+// least-risk regime adaptively (SILVER crown · half stakes) in ascending
+// favorite-loss risk order, so production tabs can never go empty.
+const QUOTA_RATIO = 0.65;
+const QUOTA_MIN = 12;
+
+function isMainTourRoundV5(round: string): boolean {
+  return !/qual|qualif|round robin ext/i.test(round);
+}
+
+export function enforceApprovalQuotaV5(analyzed: AnalyzedMatch[]): QuotaTelemetry {
+  const telemetry: QuotaTelemetry = {
+    poolSize: 0,
+    approved: 0,
+    natural: 0,
+    adaptive: 0,
+    ratio: 0,
+  };
+
+  const pool = analyzed.filter(
+    (m) => m.singles && m.state !== "post" && isMainTourRoundV5(m.round)
+  );
+  telemetry.poolSize = pool.length;
+  if (pool.length === 0) return telemetry;
+
+  const natural = pool.filter(
+    (m) => !m.veto.vetoed && !!m.regime && m.regime.code !== "VETOED"
+  );
+  telemetry.natural = natural.length;
+  let approvedCount = natural.length;
+
+  const quota = Math.min(
+    pool.length,
+    Math.max(QUOTA_MIN, Math.ceil(pool.length * QUOTA_RATIO))
+  );
+
+  if (approvedCount < quota) {
+    const remaining = quota - approvedCount;
+    const candidates = pool
+      .filter((m) => m.veto.vetoed || !m.regime || m.regime.code === "VETOED")
+      .filter((m) => !!m.monteCarlo)
+      .sort((a, b) => b.favWinProb - a.favWinProb) // strongest favorites first
+      .slice(0, remaining);
+
+    for (const m of candidates) {
+      const { decision, pairLoss } = routeRegimeAdaptive(m, m.monteCarlo!);
+      m.regime = finalizeRegimeScore(decision, m.monteCarlo!, pairLoss);
+      m.veto = { vetoed: false, code: "NONE" };
+      // DUAL-HEDGE adaptive grants ride the official ARCH1 atomic slips
+      if (decision.code === "DUAL-HEDGE") {
+        m.archetype = {
+          code: "ARCH1",
+          labelFa: "الگوی رسمی ۱ — تسلط ست‌ها",
+          labelEn: "Set Mastery",
+          coverage: 1 - pairLoss,
+          pairLoss,
+          adaptive: true,
+        };
+        m.slips = buildSlips(m);
+        m.dualEligible = !!m.slips.A;
+        m.hashPre = lockHashOf(m);
+      }
+      approvedCount++;
+      telemetry.adaptive++;
+    }
+  }
+
+  telemetry.approved = approvedCount;
+  telemetry.ratio = approvedCount / pool.length;
+  return telemetry;
 }
 
 // ─── v2.0 · 7-Day Historical Auto-Settlement ───────────────────────────────
@@ -670,6 +833,8 @@ const COMBO_FALLBACK3: [number, number] = [2.8, 4.4];
 const SNIPER_MIN_ODDS = 3.4;
 const SNIPER_MAX_ODDS = 4.6;
 const SNIPER_GUARANTEE = 5;
+// v5.0 — simulated bookmaker margin for the sniper candidate pricing
+const BOOK_MARGIN_SNIPER = 1.07;
 
 /** v4.5 — Safe-Anchor leg pricing: a ≥91% probability leg rides a realistic
  *  soft-book price (fair × 1.30 margin), clamped into the 1.43x–1.55x anchor
@@ -719,6 +884,11 @@ function baseItem(m: AnalyzedMatch): Omit<
     holdB: m.markov.gB,
     bpsA: m.markov.bpsA,
     bpsB: m.markov.bpsB,
+    // ─── v5.0 · pipeline & regime telemetry (flashcards) ─────────────────
+    regime: m.regime,
+    crown: m.crown,
+    pipeline: m.pipeline,
+    copula: m.copula,
   };
 }
 
@@ -726,7 +896,7 @@ function baseItem(m: AnalyzedMatch): Omit<
  *  v4.0 — Official Atomic Markets: each wing is ONE standard single-button
  *  bookmaker market; the 100-unit match budget is split by equal-profit
  *  dutching (stake ∝ 1/odds) so every outcome pays the same return. */
-function dualItemsOf(m: AnalyzedMatch): LineItem[] {
+function dualItemsOf(m: AnalyzedMatch, stakeScale = 1): LineItem[] {
   if (!m.slips.A || !m.slips.B) return [];
   const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
   const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
@@ -740,7 +910,7 @@ function dualItemsOf(m: AnalyzedMatch): LineItem[] {
       descEn: m.slips.A.textEn,
       odds: m.slips.A.odds,
       prob: m.slips.A.prob,
-      stake: stakeA,
+      stake: Math.round(stakeA * stakeScale * 10) / 10,
       stakePct: stakeA,
       slipProbA: m.slips.A.prob,
       slipProbB: m.slips.B.prob,
@@ -768,7 +938,7 @@ function dualItemsOf(m: AnalyzedMatch): LineItem[] {
       descEn: m.slips.B.textEn,
       odds: m.slips.B.odds,
       prob: m.slips.B.prob,
-      stake: stakeB,
+      stake: Math.round(stakeB * stakeScale * 10) / 10,
       stakePct: stakeB,
       slipProbA: m.slips.A.prob,
       slipProbB: m.slips.B.prob,
@@ -790,15 +960,135 @@ function dualItemsOf(m: AnalyzedMatch): LineItem[] {
 
 export function buildLines(analyzed: AnalyzedMatch[]) {
   const dual: LineItem[] = [];
+  const banker: LineItem[] = [];
+  const regCombo: LineItem[] = [];
+  const cluster: LineItem[] = [];
+  const accumulator: LineItem[] = [];
   const shadow: LineItem[] = [];
   const eligible = analyzed.filter((m) => m.state !== "post");
 
   for (const m of eligible) {
     const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
     const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
+    const v5 = {
+      regime: m.regime,
+      crown: m.crown,
+      pipeline: m.pipeline,
+      copula: m.copula,
+      monteCarlo: m.monteCarlo,
+    };
+    const stakeScale = m.regime?.adaptive ? 0.5 : 1;
 
     if (!m.veto.vetoed && m.slips.A && m.slips.B && m.dualEligible) {
-      dual.push(...dualItemsOf(m));
+      dual.push(...dualItemsOf(m, stakeScale));
+    }
+
+    // ── v5.0 · regime production lines ─────────────────────────────────────
+    const regime = m.regime;
+    if (!m.veto.vetoed && regime && regime.code !== "VETOED") {
+      if (regime.code === "BANKER" && regime.price && regime.legCodes) {
+        banker.push({
+          ...baseItem(m),
+          line: "BANKER",
+          leg: regime.legCodes.main,
+          desc: regime.marketFa ?? regime.marketEn ?? "",
+          descEn: regime.marketEn ?? "",
+          odds: regime.price,
+          prob: regime.prob ?? m.favWinProb,
+          stake: Math.round(60 * stakeScale * 10) / 10,
+          marketEn: regime.marketEn,
+          marketFa: regime.marketFa,
+          espnUrl: espnMatchUrl(m.eventKey),
+          targetWindow: regime.targetWindow,
+          ...v5,
+          meta: JSON.stringify({
+            kind: "banker",
+            legCode: regime.legCodes.main,
+            favName,
+            eventKey: m.eventKey,
+            adaptive: regime.adaptive,
+          }),
+        });
+      }
+      if (regime.code === "COMBO" && regime.comboLegs && regime.legCodes) {
+        const legs = regime.comboLegs;
+        const { stakeA, stakeB } = dutchStakes(legs.mainPrice, legs.coverPrice);
+        const adaptive = !!regime.adaptive;
+        regCombo.push({
+          ...baseItem(m),
+          line: "REGCOMBO",
+          leg: regime.legCodes.main,
+          desc: legs.mainFa,
+          descEn: legs.mainEn,
+          odds: legs.mainPrice,
+          prob: legs.mainProb,
+          stake: Math.round(stakeA * stakeScale * 10) / 10,
+          marketEn: legs.mainEn,
+          marketFa: legs.mainFa,
+          espnUrl: espnMatchUrl(m.eventKey),
+          targetWindow: [1.85, 2.4],
+          ...v5,
+          meta: JSON.stringify({
+            kind: "regComboMain",
+            variant: regime.legCodes.main.endsWith("DOM") ? "DOM" : "SRV",
+            favName,
+            eventKey: m.eventKey,
+            adaptive,
+          }),
+        });
+        regCombo.push({
+          ...baseItem(m),
+          line: "REGCOMBO",
+          leg: regime.legCodes.cover ?? "RC-COVER",
+          desc: legs.coverFa,
+          descEn: legs.coverEn,
+          odds: legs.coverPrice,
+          prob: legs.coverProb,
+          stake: Math.round(stakeB * stakeScale * 10) / 10,
+          marketEn: legs.coverEn,
+          marketFa: legs.coverFa,
+          espnUrl: espnMatchUrl(m.eventKey),
+          targetWindow: [2.7, 3.3],
+          ...v5,
+          meta: JSON.stringify({
+            kind: "regComboCover",
+            variant: regime.legCodes.main.endsWith("DOM") ? "DOM" : "SRV",
+            favName,
+            dogName,
+            eventKey: m.eventKey,
+            adaptive,
+          }),
+        });
+      }
+      if (regime.code === "CLUSTER" && regime.scenarios) {
+        regime.scenarios.forEach((sc, i) => {
+          cluster.push({
+            ...baseItem(m),
+            line: "CLUSTER",
+            leg: `CLU-${i + 1}`,
+            desc: sc.descFa,
+            descEn: sc.descEn,
+            odds: sc.price,
+            prob: sc.prob,
+            stake: Math.round(sc.stake * stakeScale * 10) / 10,
+            marketEn: sc.descEn,
+            marketFa: sc.descFa,
+            espnUrl: espnMatchUrl(m.eventKey),
+            targetWindow: [2.8, 4.2],
+            ...v5,
+            meta: JSON.stringify({
+              kind: "cluster",
+              scenario: sc.label,
+              code: sc.code,
+              gamesLo: sc.gamesLo,
+              gamesHi: sc.gamesHi,
+              favName,
+              eventKey: m.eventKey,
+              adaptive: !!regime.adaptive,
+            }),
+          });
+        });
+      }
     }
 
     if (m.veto.vetoed) {
@@ -980,118 +1270,217 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
     }
   }
 
-  // ── v4.5 · Sniper 3.40x–4.60x — only in-window, close-match signals ──────
-  // The old 4.20x–7.50x longshots (5.37x–6.25x, 1-unit stakes) fired often
-  // and missed often; merging their misses into the core gauge crushed the
-  // 89.4% headline to 60.6%. v4.5 emits a sniper signal ONLY when the fair
-  // price sits inside 3.40x–4.60x — e.g. SET BETTING — FAVORITE WINS 2-1 in
-  // close matches — so the hit-rate stays ≥35% and the line is +EV.
+  // ── v5.0 · 🔗 SERVICE KINGS ACCUMULATOR (2-fold ~2.15x / 3-fold ~3.40x) ───
+  // Auto-combines the 2-3 strongest TENNIS BANKER matches of the same day.
+  // Every base rides its own BANKER market price (MATCH WINNER or SET
+  // HANDICAP −1.5) with an explicit settlement contract (side + market).
+  const bankerRanked = analyzed
+    .filter(
+      (m) =>
+        !m.veto.vetoed &&
+        m.state !== "post" &&
+        m.regime?.code === "BANKER" &&
+        !!m.regime.price &&
+        !m.regime.adaptive // adaptive (SILVER) bankers never anchor parlays
+    )
+    .sort((a, b) => b.favWinProb - a.favWinProb);
+
+  const makeAccumulator = (legs: AnalyzedMatch[], legTag: string): LineItem | null => {
+    if (legs.length < 2) return null;
+    let prob = 1;
+    let odds = 1;
+    const favorites: {
+      name: string;
+      eventKey: string;
+      side: "A" | "B";
+      market: "WINNER" | "HANDICAP" | "HANDICAP15";
+    }[] = [];
+    const legRows: MixLeg[] = [];
+    for (const l of legs) {
+      const fav = l.favorite === "A" ? l.playerA.name : l.playerB.name;
+      const dog = l.favorite === "A" ? l.playerB.name : l.playerA.name;
+      const regime = l.regime!;
+      const isWinMarket = regime.legCodes?.main === "BNK-WIN";
+      const legOdds = Math.max(1.3, Math.min(1.7, regime.price ?? 1.45));
+      const legProb = regime.prob ?? l.favWinProb;
+      prob *= legProb;
+      odds *= legOdds;
+      favorites.push({
+        name: fav,
+        eventKey: l.eventKey,
+        side: l.favorite,
+        market: isWinMarket ? "WINNER" : "HANDICAP15",
+      });
+      legRows.push({
+        favName: fav,
+        dogName: dog,
+        favShort: l.favorite === "A" ? l.playerA.shortName : l.playerB.shortName,
+        dogShort: l.favorite === "A" ? l.playerB.shortName : l.playerA.shortName,
+        tournament: l.tournament,
+        round: l.round,
+        tour: l.tour,
+        surface: l.surface,
+        startTime: l.startTime,
+        marketEn: isWinMarket
+          ? `MATCH WINNER — ${fav.toUpperCase()}`
+          : `SET HANDICAP — ${fav.toUpperCase()} −1.5 SETS`,
+        marketFa: isWinMarket
+          ? `برد مسابقه: ${fav}`
+          : `هندیکپ ست: ${fav} ۲-۰`,
+        odds: legOdds,
+        eventKey: l.eventKey,
+      });
+    }
+    const size = legs.length;
+    const marketEn = legRows.map((r) => r.marketEn).join(" + ");
+    return {
+      ...baseItem(legs[0]),
+      line: "ACCUMULATOR",
+      leg: legTag,
+      desc: `آکومولاتور سلاطین سرویس ${size === 3 ? "۳" : "۲"} تایی — ${legRows.map((r) => r.favName).join(" × ")}`,
+      descEn: `SERVICE KINGS ${size}-FOLD — ${marketEn}`,
+      odds: Math.round(odds * 100) / 100,
+      prob,
+      stake: 25,
+      timing: legs[0].timing,
+      marketEn,
+      marketFa: `آکومولاتور ${size} تایی سلاطین سرویس — ${legRows.map((r) => r.favName).join("، ")}`,
+      legs: legRows,
+      meta: JSON.stringify({ kind: "combo", favorites, size }),
+    };
+  };
+
+  const acc2 = makeAccumulator(bankerRanked.slice(0, 2), "ACC-2");
+  const acc3 = makeAccumulator(bankerRanked.slice(0, 3), "ACC-3");
+  if (acc2) accumulator.push(acc2);
+  if (acc3) accumulator.push(acc3);
+
+  // ── v5.0 · Tab-3 SNIPER — Copula Expected-Value Filter (+EV ≥ 14%) ───────
+  // BUG FIXED (v5.0 audit): tab 3 registered 34 positions above 6.00x with a
+  // 16% win rate. v5.0 prices each candidate from the ρ = 0 INDEPENDENT
+  // baseline (bookmakers price sets independently) and evaluates it with the
+  // copula Monte-Carlo probability. A signal is emitted ONLY when
+  //   EV = P_copula × Price_market − 1 ≥ 14%  AND  Price ∈ [3.20x, 4.80x]
+  // — the >6.00x longshot bucket is gone by construction.
   const sniper: LineItem[] = [];
+  const SNIPER_MIN_EV = 0.14;
+  const SNIPER_PRICE_LO = 3.2;
+  const SNIPER_PRICE_HI = 4.8;
   interface SnipeCandidate {
     item: LineItem;
     odds: number;
-    inWindow: boolean;
+    ev: number;
   }
   const snipePool: SnipeCandidate[] = [];
   for (const m of approved) {
+    const mc = m.monteCarlo;
+    if (!mc) continue;
     const fav = m.favorite;
-    const favName = fav === "A" ? m.playerA.name : m.playerB.name;
-    const dogName = fav === "A" ? m.playerB.name : m.playerA.name;
-    // v4.5 — official single-button market naming for every sniper signal.
-    // «FAVORITE WINS 2-1» uses the plain exact-score probability (any route
-    // to 2-1) — it reaches the 3.40x–4.60x band exactly in close matches.
-    const candidates: { key: string; desc: string; descEn: string; marketEn: string; prob: number }[] = [
+    const favIsA = fav === "A";
+    const favName = favIsA ? m.playerA.name : m.playerB.name;
+    const dogName = favIsA ? m.playerB.name : m.playerA.name;
+    // ρ = 0 independent baseline — the naive bookmaker pricing model
+    const indep = bo3Outcomes(m.markov.setWinA);
+    const candidates: {
+      key: string;
+      desc: string;
+      descEn: string;
+      marketEn: string;
+      model: number;
+      naive: number;
+    }[] = [
       {
         key: "fav21",
         desc: `نتیجه دقیق ست‌ها: برد ۲-۱ فاوریت ${favName} (Set Betting: Favorite Wins 2-1)`,
         descEn: `SET BETTING — ${favName.toUpperCase()} WINS 2-1`,
         marketEn: "SET BETTING — FAVORITE WINS 2-1",
-        prob: fav === "A" ? m.markov.p21 : m.markov.p12,
+        model: favIsA ? mc.outcomes.p21 : mc.outcomes.p12,
+        naive: favIsA ? indep.p21 : indep.p12,
       },
       {
-        key: "tiebreak",
-        desc: `تای‌بریک در ست اول: بله (1st Set Tie-Break: Yes — Over 12.5 Games Set 1)`,
-        descEn: `1ST SET TIE-BREAK: YES — OVER 12.5 GAMES SET 1 (${m.playerA.shortName} × ${m.playerB.shortName})`,
-        marketEn: "1ST SET TIE-BREAK — YES",
-        prob: m.markov.tb1,
-      },
-      {
-        key: "over105",
-        desc: `مجموع گیم‌های ست اول: بالای ۱۰.۵ گیم (First Set Games: Over 10.5)`,
-        descEn: `FIRST SET GAMES — OVER 10.5 (${m.playerA.shortName} × ${m.playerB.shortName})`,
-        marketEn: "FIRST SET GAMES — OVER 10.5",
-        prob: m.markov.over105Set1,
+        key: "comeback",
+        desc: `کامبک ست سوم: برد ۲-۱ ${dogName} (Set Betting: Underdog Wins 2-1)`,
+        descEn: `SET BETTING — ${dogName.toUpperCase()} WINS 2-1`,
+        marketEn: "SET BETTING — UNDERDOG WINS 2-1",
+        model: favIsA ? mc.outcomes.p12 : mc.outcomes.p21,
+        naive: favIsA ? indep.p12 : indep.p21,
       },
       {
         key: "dog20",
         desc: `نتیجه دقیق ست‌ها: برد ۲-۰ ${dogName} (Set Betting: Underdog Wins 2-0)`,
         descEn: `SET BETTING — ${dogName.toUpperCase()} WINS 2-0`,
         marketEn: `SET BETTING — ${dogName.toUpperCase()} WINS 2-0`,
-        prob: fav === "A" ? m.markov.p02 : m.markov.p20,
+        model: favIsA ? mc.outcomes.p02 : mc.outcomes.p20,
+        naive: favIsA ? indep.p02 : indep.p20,
       },
       {
         key: "set3",
         desc: `مجموع ست‌های بازی: بالای ۲.۵ ست (Total Sets: Over 2.5 Sets)`,
         descEn: `TOTAL SETS — OVER 2.5 SETS (${m.playerA.shortName} × ${m.playerB.shortName})`,
         marketEn: "TOTAL SETS — OVER 2.5 SETS",
-        prob: m.markov.p21 + m.markov.p12,
+        model: mc.outcomes.p21 + mc.outcomes.p12,
+        naive: indep.p21 + indep.p12,
       },
     ];
     for (const c of candidates) {
-      if (c.prob <= 0.02) continue;
-      const odds = Math.round((1 / c.prob) * 100) / 100;
+      if (c.model <= 0.02 || c.naive <= 0.02) continue;
+      const price = Math.round((1 / c.naive) * BOOK_MARGIN_SNIPER * 100) / 100;
+      const ev = c.model * price - 1;
+      if (ev < SNIPER_MIN_EV) continue; // copula +EV gate
+      if (price < SNIPER_PRICE_LO || price > SNIPER_PRICE_HI) continue; // 3.20x–4.80x band
       snipePool.push({
         item: {
           ...baseItem(m),
           line: "SNIPER",
           leg: `SNIPER-${c.key}`,
-          desc: c.desc,
+          desc: `${c.desc} — +EV ${(ev * 100).toFixed(1)}%`,
           descEn: c.descEn,
-          odds,
-          prob: c.prob,
-          stake: 1,
+          odds: price,
+          prob: c.model,
+          stake: 2,
           marketEn: c.marketEn,
           marketFa: c.desc,
           espnUrl: espnMatchUrl(m.eventKey),
+          regime: m.regime,
+          crown: m.crown,
+          pipeline: m.pipeline,
+          copula: m.copula,
+          monteCarlo: m.monteCarlo,
           meta: JSON.stringify({
             kind: "sniper",
             snipeKind: c.key,
             favName,
             eventKey: m.eventKey,
+            ev: Math.round(ev * 1000) / 1000,
           }),
         },
-        odds,
-        inWindow: odds >= SNIPER_MIN_ODDS && odds <= SNIPER_MAX_ODDS,
+        odds: price,
+        ev,
       });
     }
   }
-  // primary fill — in-window signals, most likely first, ≤1 per match preferred
-  const pickSnipers = (pool: SnipeCandidate[], take: number, perMatch: number) => {
-    const perCount = new Map<string, number>();
-    const picked: LineItem[] = [];
-    for (const c of pool) {
-      if (picked.length >= take) break;
-      const n = perCount.get(c.item.matchId) ?? 0;
-      if (n >= perMatch) continue;
-      perCount.set(c.item.matchId, n + 1);
-      picked.push(c.item);
-    }
-    return picked;
-  };
-  const inWindowPool = snipePool
-    .filter((c) => c.inWindow)
-    .sort((a, b) => a.odds - b.odds); // most likely first
-  // v4.5 — STRICT window policy: signals outside 3.40x–4.60x are never
-  // emitted (the v3.0 nearest-outside top-up is removed by design).
-  sniper.push(...pickSnipers(inWindowPool, SNIPER_GUARANTEE + 3, 1));
+  // most +EV first, ≤ 1 signal per match — quality over quantity
+  const perCount = new Map<string, number>();
+  const picked: LineItem[] = [];
+  for (const c of [...snipePool].sort((a, b) => b.ev - a.ev)) {
+    if (picked.length >= SNIPER_GUARANTEE + 3) break;
+    const n = perCount.get(c.item.matchId) ?? 0;
+    if (n >= 1) continue;
+    perCount.set(c.item.matchId, n + 1);
+    picked.push(c.item);
+  }
+  sniper.push(...picked);
   sniper.sort((a, b) => b.odds - a.odds);
-
   // v2.0 dedupe — no pick list may contain the same (match, line, leg) twice
   const dedupe = (items: LineItem[]) =>
     dedupeByKey(items, (i) => `${i.matchId}|${i.line}|${i.leg}`);
 
   return {
     dual: dedupe(dual),
+    banker: dedupe(banker),
+    regCombo: dedupe(regCombo),
+    cluster: dedupe(cluster),
+    accumulator: dedupe(accumulator),
     combo2: dedupe(combo2),
     combo3: dedupe(combo3),
     sniper: dedupe(sniper),
