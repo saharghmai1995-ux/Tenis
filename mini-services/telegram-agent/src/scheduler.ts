@@ -6,7 +6,7 @@
 
 import { CONFIG, JOB_SPECS } from "./config";
 import { store } from "./store";
-import { telegram } from "./telegram";
+import { telegram, meCached, refreshMe } from "./telegram";
 import { dataHub, LEG_DETAIL_EN } from "./data";
 import type { CardMatch } from "./data";
 import { fetchTennisRadar, peekRadar, type TennisNewsItem, type LiveTennisMatch, type FitnessItem } from "./espn";
@@ -654,6 +654,7 @@ function tick(): void {
 export function startScheduler(): void {
   registerFonts();
   restoreLive();
+  void refreshMe().catch(() => null);
   scheduleAll();
   // warm immediately so the first flashcard is never cold
   void dataHub.warm().then((ok) => {
@@ -735,7 +736,7 @@ export function status(): AgentStatus {
   const radar = peekRadar();
   return {
     ok: true,
-    bot: { username: "Aineobet_bot", live: isLive() },
+    bot: { username: meCached()?.username ?? "Neotenisbot", live: isLive() },
     chats: { public: CONFIG.publicChatId, vip: vipChatId() || undefined, vipTitle: store.kvGet("vipChatTitle") || undefined },
     uptimeSeconds: Math.round((Date.now() - BOOT_AT) / 1000),
     jobs,

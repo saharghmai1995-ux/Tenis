@@ -11,7 +11,7 @@
 //   GET  /outbox/:jobId.png     → last rendered poster of a job (dry-run proof)
 
 import { CONFIG } from "./src/config";
-import { telegram } from "./src/telegram";
+import { telegram, meCached, refreshMe } from "./src/telegram";
 import { dataHub } from "./src/data";
 import { renderPoster, samplePoster, registerFonts } from "./src/poster/engine";
 import {
@@ -131,6 +131,7 @@ async function handle(req: Request): Promise<Response> {
 }
 
 registerFonts();
+void refreshMe().catch(() => null);
 startScheduler();
 
 const server = Bun.serve({
@@ -139,7 +140,7 @@ const server = Bun.serve({
 });
 
 console.log(
-  `[agent] telegram-agent listening on :${CONFIG.port} — bot Aineobet_bot — live=${status().bot.live}`
+  `[agent] telegram-agent listening on :${CONFIG.port} — bot ${meCached()?.username ?? "Neotenisbot"} — live=${status().bot.live}`
 );
 
 // keep a reference so bun --hot doesn't GC the server

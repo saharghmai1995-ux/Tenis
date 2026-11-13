@@ -117,3 +117,31 @@ export const telegram = {
 export function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
+
+// ─── cached bot identity (getMe resolved once per boot) ────────────────────
+
+export interface BotIdentity {
+  id: number;
+  username: string;
+  first_name: string;
+}
+
+let cachedMe: BotIdentity | null = null;
+
+/** Resolve and cache the bot identity from the Bot API (best-effort). */
+export async function refreshMe(): Promise<BotIdentity | null> {
+  const res = await telegram.getMe();
+  if (res.ok && res.result) {
+    cachedMe = {
+      id: res.result.id,
+      username: res.result.username ?? "unknown",
+      first_name: res.result.first_name ?? "Bot",
+    };
+  }
+  return cachedMe;
+}
+
+/** Last cached identity, or null before the first successful getMe. */
+export function meCached(): BotIdentity | null {
+  return cachedMe;
+}
