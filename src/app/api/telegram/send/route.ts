@@ -10,6 +10,8 @@ export const dynamic = "force-dynamic";
 interface SendBody {
   imageBase64: string; // raw base64 of PNG (no data: prefix)
   target: "public" | "vip";
+  /** optional Persian caption — bilingual rule: English poster, Persian text */
+  caption?: string;
 }
 
 export async function POST(request: Request) {
@@ -47,9 +49,13 @@ export async function POST(request: Request) {
     const buffer = Buffer.from(body.imageBase64, "base64");
     const form = new FormData();
     form.append("chat_id", chatId);
+    if (body.caption && body.caption.trim().length > 0) {
+      // caption limited to 1024 chars by Telegram Bot API
+      const cap = body.caption.length > 1024 ? `${body.caption.slice(0, 1000)}\n…` : body.caption;
+      form.append("caption", cap);
+    }
     const blob = new Blob([new Uint8Array(buffer)], { type: "image/png" });
-    form.append("photo", blob, "neotennis-poster.png");
-    // sendPhoto WITHOUT caption — per @aineobet director spec
+    form.append("photo", blob, "neobet-arcade.png");
     const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, {
       method: "POST",
       body: form,

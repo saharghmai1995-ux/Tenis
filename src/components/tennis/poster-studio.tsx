@@ -1,12 +1,13 @@
 "use client";
 
-// ─── NeoTennis Markov Quant — Poster Studio ─────────────────────────────────
-// Client component: renders the procedural 1080×1440 poster for the selected
-// match, with Teaser/Full modes, PNG download and Telegram channel send.
-// UI is Persian; the canvas image itself is 100% English (see lib/tennis/poster).
+// ─── NeoTennis Markov Quant — Poster Studio (16-Bit Arcade, server-rendered) ─
+// The heavy pixel-art/CRT rendering now lives in the always-warm
+// telegram-agent service (browser-independent). This studio proxies the
+// render, previews it and offers download + manual channel send with a full
+// Persian caption.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Crown, Download, FlaskConical, Loader2, Send, Sparkles } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Crown, Download, Loader2, RefreshCw, Send, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -14,68 +15,16 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
-import { drawPoster, type PosterData, type PosterSurface } from "@/lib/tennis/poster";
+import { buildArcadeRequest, renderArcadePoster } from "@/lib/tennis/arcade";
 import type { AnalyzedMatch } from "@/lib/tennis/types";
 
-type PosterMode = PosterData["mode"];
 type SendTarget = "public" | "vip";
 
-const SURFACE_ACCENT: Record<PosterSurface, { text: string; border: string; dot: string }> = {
+const SURFACE_ACCENT = {
   HARD: { text: "text-cyan-300", border: "border-cyan-400/30", dot: "bg-cyan-300" },
   CLAY: { text: "text-orange-300", border: "border-orange-400/30", dot: "bg-orange-300" },
   GRASS: { text: "text-emerald-300", border: "border-emerald-400/30", dot: "bg-emerald-300" },
-};
-
-/** AnalyzedMatch → PosterData for the drawing engine. */
-function toPosterData(match: AnalyzedMatch, mode: PosterMode, preview: boolean): PosterData {
-  const marketProbAFav = match.market
-    ? match.favorite === "A"
-      ? match.market.probA
-      : match.market.probB
-    : undefined;
-
-  // Review mode derives slips straight from the live model output and marks
-  // the render with a MODEL PREVIEW ribbon — the supervisor gate stays intact.
-  const favName = match.favorite === "A" ? match.playerA.name : match.playerB.name;
-  const p20Fav = match.favorite === "A" ? match.markov.p20 : match.markov.p02;
-  const over25 = match.markov.p21 + match.markov.p12;
-
-  return {
-    playerA: {
-      name: match.playerA.name,
-      shortName: match.playerA.shortName,
-      flagUrl: match.playerA.flagUrl,
-      rank: match.playerA.rank,
-      seed: match.playerA.seed,
-    },
-    playerB: {
-      name: match.playerB.name,
-      shortName: match.playerB.shortName,
-      flagUrl: match.playerB.flagUrl,
-      rank: match.playerB.rank,
-      seed: match.playerB.seed,
-    },
-    tournament: match.tournament,
-    round: match.round,
-    surface: match.surface,
-    favorite: match.favorite,
-    slipA: match.slips.A
-      ? { textEn: match.slips.A.textEn, odds: match.slips.A.odds }
-      : preview && p20Fav > 0.02
-        ? { textEn: `${favName.toUpperCase()} WINS 2-0 (SET BETTING)`, odds: Number((1 / p20Fav).toFixed(2)) }
-        : undefined,
-    slipB: match.slips.B
-      ? { textEn: match.slips.B.textEn, odds: match.slips.B.odds }
-      : preview && over25 > 0.02
-        ? { textEn: "TOTAL SETS — OVER 2.5 SETS", odds: Number((1 / over25).toFixed(2)) }
-        : undefined,
-    hashPre: match.hashPre,
-    timingLabel: match.timing ? TIMING_EN[match.timing.code] : undefined,
-    marketProbAFav,
-    mode,
-    preview,
-  };
-}
+} as const;
 
 function safeFileNamePart(input: string): string {
   const cleaned = input
@@ -85,133 +34,146 @@ function safeFileNamePart(input: string): string {
   return cleaned || "match";
 }
 
-// The canvas is English-only — map timing codes to English telemetry labels.
-const TIMING_EN: Record<string, string> = {
-  T30: "T-30m Pre-Warmup — Optimal Entry",
-  INPLAY_BREAK: "In-Play After Early Break",
-  INPLAY: "In-Play — Live",
-  WAIT: "Awaiting T-30m Window",
-  DONE: "Settled",
-};
-
-/** Narrow an unknown JSON body to a string field (no `any`). */
-function readStringField(body: unknown, key: string): string | null {
-  if (typeof body !== "object" || body === null) return null;
-  const value = (body as Record<string, unknown>)[key];
-  return typeof value === "string" ? value : null;
-}
-
-function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob | null> {
-  return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), "image/png"));
-}
-
-function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(new Error("تبدیل پوستر به base64 ناموفق بود"));
-    reader.readAsDataURL(blob);
-  });
+/** Short Persian caption for manual sends (full captions live in the agent). */
+function persianCaption(match: AnalyzedMatch, freeCard: boolean): string {
+  const faNum = (n: number): string => n.toFixed(2).replace(/[0-9]/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[+d]);
+  const time = match.startTime
+    ? new Date(match.startTime).toLocaleTimeString("fa-IR", {
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZone: "Asia/Tehran",
+      })
+    : "نامشخص";
+  const surface = match.surface === "HARD" ? "هارد" : match.surface === "CLAY" ? "خاک" : "چمن";
+  const favName = match.favorite === "A" ? match.playerA.name : match.playerB.name;
+  const slipA = match.slips.A;
+  const slipB = match.slips.B;
+  const lines = [
+    "🅽🅴🅾🅱🅴🆃 | پوستر آرکید ۱۶-بیتی NeoBet",
+    "",
+    `🎾 ${match.playerA.name} × ${match.playerB.name}`,
+    `🏆 ${match.tournament} — ${match.round}`,
+    `⏰ شروع: ${time} (تهران) | سطح: ${surface}`,
+    "",
+  ];
+  if (slipA) {
+    lines.push(`🔹 تیپ A — ${slipA.marketFa ?? slipA.text} | ضریب ${faNum(slipA.odds)}`);
+  }
+  if (slipB) {
+    lines.push(
+      freeCard
+        ? "🔒 تیپ B فقط در کانال VIP منتشر می‌شود."
+        : `🔹 تیپ B — ${slipB.marketFa ?? slipB.text} | ضریب ${faNum(slipB.odds)}`
+    );
+  }
+  lines.push(
+    "",
+    `⭐️ فاوریت مدل: ${favName} (احتمال ٪${Math.round(match.favWinProb)})`,
+    match.hashPre ? `🔐 قفل SHA-256 پیش از بازی: ${match.hashPre.slice(0, 10).toUpperCase()}` : "",
+    "🧭 انضباط اجرا: یک واحد ثابت روی هر تیپ؛ بدون چیس، بدون ورود خارج از تایمینگ.",
+    "",
+    "————————————————",
+    "⚡️ کانال عمومی: @aineobet",
+    "👑 کارت‌های کامل VIP: @aineobet_vip",
+    "⚠️ +۱۸ | مسئولیت مالی با شماست."
+  );
+  return lines.filter((l) => l !== undefined).join("\n");
 }
 
 export interface PosterStudioProps {
   matches: AnalyzedMatch[]; // approved dual slips (production posters)
-  allMatches?: AnalyzedMatch[]; // upcoming matches for the engineering-review mode
+  allMatches?: AnalyzedMatch[]; // upcoming matches for review mode
   onSent?: () => void;
 }
 
 export default function PosterStudio({ matches, allMatches, onSent }: PosterStudioProps) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
-  const [mode, setMode] = useState<PosterMode>("teaser");
-  const [review, setReview] = useState(false);
+  const [freeCard, setFreeCard] = useState(false);
+  const [pngUrl, setPngUrl] = useState<string | null>(null);
+  const [pngB64, setPngB64] = useState<string | null>(null);
   const [drawing, setDrawing] = useState(false);
   const [sending, setSending] = useState<SendTarget | null>(null);
 
-  const pool = review ? (allMatches ?? []) : matches;
+  const pool = useMemo<AnalyzedMatch[]>(() => {
+    if (freeCard) return matches;
+    // merge without duplicate chips (approved matches also live in allMatches)
+    const seen = new Set(matches.map((m) => m.eventKey));
+    const extra = (allMatches ?? []).filter((m) => !seen.has(m.eventKey));
+    return [...matches, ...extra];
+  }, [matches, allMatches, freeCard]);
   const selectedMatch = useMemo<AnalyzedMatch | null>(
     () => pool.find((m) => m.eventKey === selectedKey) ?? pool[0] ?? null,
     [pool, selectedKey]
   );
 
-  // Redraw whenever selection or mode changes (flags load inside drawPoster).
+  // render through the always-warm agent (server-side 16-bit engine)
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !selectedMatch) return;
+    if (!selectedMatch) return;
     let cancelled = false;
     setDrawing(true);
-    drawPoster(canvas, toPosterData(selectedMatch, mode, review))
-      .then(() => {
-        if (!cancelled) setDrawing(false);
+    const controller = new AbortController();
+    renderArcadePoster(buildArcadeRequest(selectedMatch, { freeCard }), controller.signal)
+      .then(({ pngBase64 }) => {
+        if (cancelled) return;
+        setPngB64(pngBase64);
+        setPngUrl(`data:image/png;base64,${pngBase64}`);
+        setDrawing(false);
       })
       .catch((err: unknown) => {
         if (cancelled) return;
         setDrawing(false);
-        toast.error(err instanceof Error ? err.message : "خطا در تولید پوستر");
+        setPngUrl(null);
+        toast.error(
+          err instanceof Error && err.message.includes("abort")
+            ? "رندر لغو شد"
+            : `سرویس پوستر آرکید در دسترس نیست — ${err instanceof Error ? err.message : "خطا"}`
+        );
       });
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, [selectedMatch, mode, review]);
+  }, [selectedMatch, freeCard]);
 
   const handleDownload = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !selectedMatch) return;
-    canvas
-      .toBlob((blob) => {
-        if (!blob) {
-          toast.error("ساخت فایل PNG ناموفق بود");
-          return;
-        }
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `neotennis-${safeFileNamePart(selectedMatch.playerA.shortName)}-${safeFileNamePart(
-          selectedMatch.playerB.shortName
-        )}.png`;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        window.setTimeout(() => URL.revokeObjectURL(url), 2000);
-        toast.success("پوستر دانلود شد");
-      }, "image/png");
-  }, [selectedMatch]);
+    if (!pngUrl || !selectedMatch) return;
+    const a = document.createElement("a");
+    a.href = pngUrl;
+    a.download = `neobet-arcade-${safeFileNamePart(selectedMatch.playerA.shortName)}-${safeFileNamePart(
+      selectedMatch.playerB.shortName
+    )}.png`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    toast.success("پوستر دانلود شد");
+  }, [pngUrl, selectedMatch]);
 
   const handleSend = useCallback(
     async (target: SendTarget) => {
-      const canvas = canvasRef.current;
-      if (!canvas || sending !== null || !selectedMatch) return;
+      if (!pngB64 || sending !== null || !selectedMatch) return;
       setSending(target);
       try {
-        const blob = await canvasToBlob(canvas);
-        if (!blob) throw new Error("ساخت فایل PNG ناموفق بود");
-        const dataUrl = await blobToBase64(blob);
-        const imageBase64 = dataUrl.replace(/^data:image\/png;base64,/, "");
-
         const res = await fetch("/api/telegram/send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ imageBase64, target }),
+          body: JSON.stringify({
+            imageBase64: pngB64,
+            target,
+            caption: persianCaption(selectedMatch, freeCard),
+          }),
         });
-
-        let body: unknown = null;
-        try {
-          body = await res.json();
-        } catch {
-          body = null;
-        }
-
-        const code = readStringField(body, "code");
-        if (res.status === 501 || code === "TELEGRAM_NOT_CONFIGURED") {
-          toast.error(readStringField(body, "error") ?? "تلگرام پیکربندی نشده است");
-          return;
-        }
+        const body: unknown = await res.json().catch(() => null);
+        const err =
+          typeof body === "object" && body !== null
+            ? String((body as Record<string, unknown>).error ?? "")
+            : "";
         if (!res.ok) {
-          toast.error(readStringField(body, "error") ?? `ارسال ناموفق بود (HTTP ${res.status})`);
+          toast.error(err || `ارسال ناموفق بود (HTTP ${res.status})`);
           return;
         }
-
-        toast.success(`پوستر به کانال ${target === "public" ? "عمومی" : "VIP"} ارسال شد`);
+        toast.success(
+          `پوستر ۱۶-بیتی به کانال ${target === "public" ? "عمومی" : "VIP"} با کپشن فارسی ارسال شد`
+        );
         onSent?.();
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "خطای ناشناخته در ارسال پوستر");
@@ -219,7 +181,7 @@ export default function PosterStudio({ matches, allMatches, onSent }: PosterStud
         setSending(null);
       }
     },
-    [sending, selectedMatch, onSent]
+    [pngB64, sending, selectedMatch, freeCard, onSent]
   );
 
   if (!selectedMatch) {
@@ -230,18 +192,6 @@ export default function PosterStudio({ matches, allMatches, onSent }: PosterStud
           <p className="max-w-md text-sm leading-7 text-white/60">
             پوستر پس از تولید تیپ‌های سوپروایزر فعال می‌شود — دروازه طلایی امروز باز نشده است
           </p>
-          {(allMatches ?? []).length > 0 && (
-            <div className="mt-2 flex items-center gap-3 rounded-xl border border-amber-300/20 bg-amber-300/5 px-4 py-2.5">
-              <FlaskConical className="size-4 text-amber-300" />
-              <div className="text-start">
-                <div className="text-xs font-bold text-amber-300">حالت بازبینی مهندسی</div>
-                <div className="text-[10px] text-white/50">
-                  ترسیم آزمایشی پوستر از خروجی زنده مدل با واترمارک MODEL PREVIEW
-                </div>
-              </div>
-              <Switch checked={review} onCheckedChange={setReview} aria-label="حالت بازبینی" />
-            </div>
-          )}
         </CardContent>
       </Card>
     );
@@ -253,34 +203,37 @@ export default function PosterStudio({ matches, allMatches, onSent }: PosterStud
   return (
     <Card dir="rtl" className="gap-4 rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur">
       <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-base text-white">
+        <CardTitle className="flex flex-wrap items-center gap-2 text-base text-white">
           <Sparkles className="size-4 text-cyan-300" />
-          استودیو پوستر — NeoTennis Quant
+          استودیو پوستر — Retro 16-Bit Arcade
+          <Badge variant="outline" className="border-amber-300/40 bg-amber-300/10 text-amber-200">
+            موتور سمت سرور — بدون مرورگر
+          </Badge>
         </CardTitle>
         <CardDescription className="text-xs leading-6 text-white/50">
-          پوستر تلگرام ۱۰۸۰×۱۴۴۰ (۳:۴) — تایپوگرافی داخل تصویر انگلیسی است
-          {review && " · حالت بازبینی مهندسی (بدون قفل SHA-256)"}
+          پس‌زمینه پیکسل‌آرت + لایه CRT (اسکن‌لاین + وینیت) · هدر HUD با نشان ۱۶-بیت و INSERT COIN ·
+          کلید مارکت لاتین‌سازی‌شده · فوتر جان/سکه پیکسلی — متن داخل تصویر ۱۰۰٪ انگلیسی، کپشن ارسالی ۱۰۰٪ فارسی
         </CardDescription>
       </CardHeader>
 
       <CardContent className="space-y-4">
-        {/* Review-mode toggle (engineering preview) */}
-        <div className="flex items-center justify-between rounded-xl border border-amber-300/20 bg-amber-300/5 px-3.5 py-2.5">
+        {/* Free-card teaser toggle */}
+        <div className="flex items-center justify-between rounded-xl border border-emerald-300/20 bg-emerald-300/5 px-3.5 py-2.5">
           <div className="flex items-center gap-2">
-            <FlaskConical className="size-4 text-amber-300" />
+            <Crown className="size-4 text-emerald-300" />
             <div>
-              <div className="text-xs font-bold text-amber-300">حالت بازبینی مهندسی</div>
+              <div className="text-xs font-bold text-emerald-300">حالت کارت رایگان (تیزر عمومی)</div>
               <div className="text-[10px] text-white/50">
-                انتخاب هر مسابقه پیش‌رو و ترسیم آزمایشی با واترمارک MODEL PREVIEW
+                تیپ B قفل می‌شود — همان پوستری که هر روز ساعت ۱۰:۳۰ در کانال عمومی منتشر می‌شود
               </div>
             </div>
           </div>
-          <Switch checked={review} onCheckedChange={setReview} aria-label="حالت بازبینی" />
+          <Switch checked={freeCard} onCheckedChange={setFreeCard} aria-label="حالت کارت رایگان" />
         </div>
 
         {/* Match chips */}
-        <div className="flex flex-wrap gap-2">
-          {matches.map((m) => {
+        <div className="scroll-slim flex max-h-24 flex-wrap gap-2 overflow-y-auto">
+          {pool.map((m) => {
             const active = m.eventKey === selectedMatch.eventKey;
             const chipAccent = SURFACE_ACCENT[m.surface];
             return (
@@ -303,22 +256,36 @@ export default function PosterStudio({ matches, allMatches, onSent }: PosterStud
         </div>
 
         <div className="flex flex-col items-center gap-5 lg:flex-row lg:items-start">
-          {/* Canvas preview — 1080×1440 internal, responsive display */}
+          {/* Server-rendered poster preview */}
           <div className="relative w-full max-w-[360px] shrink-0">
-            <div className="overflow-hidden rounded-2xl border border-white/10 bg-black/40 shadow-[0_0_40px_rgba(56,189,248,0.08)]">
-              <canvas ref={canvasRef} width={1080} height={1440} className="aspect-[3/4] w-full" />
+            <div className="overflow-hidden rounded-2xl border border-white/10 bg-black/40 shadow-[0_0_40px_rgba(255,209,102,0.10)]">
+              {pngUrl ? (
+                <img
+                  src={pngUrl}
+                  alt={`پوستر آرکید ${selectedMatch.playerA.shortName} در برابر ${selectedMatch.playerB.shortName}`}
+                  className="aspect-[3/4] w-full"
+                />
+              ) : (
+                <div className="flex aspect-[3/4] w-full items-center justify-center">
+                  {drawing ? (
+                    <Loader2 className="size-6 animate-spin text-amber-300" />
+                  ) : (
+                    <RefreshCw className="size-6 text-white/30" />
+                  )}
+                </div>
+              )}
             </div>
             {drawing ? (
               <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/50">
-                <Loader2 className="size-6 animate-spin text-cyan-300" />
+                <Loader2 className="size-6 animate-spin text-amber-300" />
               </div>
             ) : null}
-            <div className="mt-2 flex items-center justify-center gap-2">
+            <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
               <Badge variant="outline" className={cn("bg-white/[0.04]", accent.text, accent.border)}>
                 {selectedMatch.surface} COURT
               </Badge>
               {selectedMatch.hashPre ? (
-                <Badge variant="outline" className="border-white/10 bg-white/[0.04] font-mono text-cyan-300">
+                <Badge variant="outline" className="border-white/10 bg-white/[0.04] font-mono text-amber-300">
                   LOCK {selectedMatch.hashPre.slice(0, 10).toUpperCase()}
                 </Badge>
               ) : null}
@@ -327,34 +294,12 @@ export default function PosterStudio({ matches, allMatches, onSent }: PosterStud
 
           {/* Controls */}
           <div className="flex w-full flex-1 flex-col gap-3">
-            {/* Mode toggle */}
-            <div className="grid grid-cols-2 gap-1 rounded-xl border border-white/10 bg-white/[0.03] p-1">
-              <Button
-                type="button"
-                size="sm"
-                variant={mode === "teaser" ? "secondary" : "ghost"}
-                onClick={() => setMode("teaser")}
-                className={cn(mode === "teaser" && "bg-white/10 text-white")}
-              >
-                Teaser (Public)
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant={mode === "full" ? "secondary" : "ghost"}
-                onClick={() => setMode("full")}
-                className={cn(mode === "full" && "bg-white/10 text-white")}
-              >
-                Full (VIP)
-              </Button>
-            </div>
-
             <Button
               type="button"
               variant="outline"
               className="w-full border-white/15 bg-white/[0.04] text-white hover:bg-white/[0.09] hover:text-white"
               onClick={handleDownload}
-              disabled={drawing}
+              disabled={!pngUrl}
             >
               <Download className="size-4" />
               دانلود PNG
@@ -362,26 +307,27 @@ export default function PosterStudio({ matches, allMatches, onSent }: PosterStud
 
             <Button
               type="button"
-              className="w-full bg-cyan-500/90 text-black hover:bg-cyan-400"
+              className="w-full bg-amber-400/90 text-black hover:bg-amber-300"
               onClick={() => handleSend("public")}
-              disabled={busy}
+              disabled={busy || !pngB64}
             >
               {sending === "public" ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
-              ارسال به کانال عمومی
+              ارسال به کانال عمومی (کپشن فارسی)
             </Button>
 
             <Button
               type="button"
-              className="w-full bg-amber-400/90 text-black hover:bg-amber-300"
+              className="w-full bg-cyan-500/90 text-black hover:bg-cyan-400"
               onClick={() => handleSend("vip")}
-              disabled={busy}
+              disabled={busy || !pngB64}
             >
               {sending === "vip" ? <Loader2 className="size-4 animate-spin" /> : <Crown className="size-4" />}
               ارسال به کانال VIP
             </Button>
 
             <p className="text-[11px] leading-5 text-white/40">
-              حالت Teaser تیپ B را تار می‌کند و قفل «UNLOCK IN VIP» می‌گذارد؛ حالت Full برای کانال VIP همه‌چیز را باز نشان می‌دهد.
+              رندر روی سرویس پایدار telegram-agent انجام می‌شود (پورت ۳۰۳۰)؛ همین موتور، ۹ پست خودکار روزانه را
+              نیز تولید و منتشر می‌کند. ارسال دستی با کپشن کامل فارسی همراه است.
             </p>
           </div>
         </div>

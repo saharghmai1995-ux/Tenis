@@ -13,6 +13,7 @@ import { Scoreboard } from "@/components/tennis/scoreboard";
 import { RankingsNews } from "@/components/tennis/rankings-news";
 import { TennisFooter } from "@/components/tennis/footer";
 import { AnalysisDialog } from "@/components/tennis/analysis-dialog";
+import { SupervisorMonitor } from "@/components/tennis/supervisor-monitor";
 import PosterStudio from "@/components/tennis/poster-studio";
 import type { AnalyzedMatch } from "@/lib/tennis/types";
 
@@ -139,6 +140,7 @@ export default function Home() {
             <Scoreboard matches={data.matches} onAnalyze={openAnalysis} />
             <RankingsNews rankings={data.rankings} news={data.news} />
             <PosterStudio matches={posterMatches} allMatches={data.matches.filter((m) => m.state !== "post")} />
+            <SupervisorMonitor />
           </>
         )}
       </main>
