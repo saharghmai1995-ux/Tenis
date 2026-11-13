@@ -550,6 +550,13 @@ export interface LedgerPayload {
     settled: number;
     streak: number;
     bestWin?: LedgerMatchRow;
+    // ─── v5.0 · Live Bankroll Audit Inspector (exact algebraic identity) ────
+    /** gross net-profit of all WON match positions (positive) */
+    winsGross: number;
+    /** gross net-profit of all LOST match positions (negative) */
+    lossesGross: number;
+    winsCount: number;
+    lossesCount: number;
   };
   groups: LineStats[];
   /** v3.0 — one consolidated row per match (DUAL grouped, both wings inside) */

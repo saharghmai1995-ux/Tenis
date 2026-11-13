@@ -17,6 +17,8 @@ import { fetchPolymarketOdds, matchMarket } from "./polymarket";
 import { fetchCityWeather } from "./weather";
 import { bo3Outcomes, breakPointSavedProb, fullMarkov, matchWinProbA } from "./markov";
 import { removeMargin, reverseAnalysis } from "./solver";
+import { orientMonteCarlo, simulateMatch10000 } from "./montecarlo";
+import type { McSim } from "./montecarlo";
 import {
   buildSlips,
   dutchStakes,
@@ -131,9 +133,25 @@ function attachResolvedRanks(m: EspnMatch, rankLookup: Map<string, RankRow>) {
   m.playerB.points = m.playerB.points ?? b.points;
 }
 
-/** v3.0 — SHA-256 pre-lock of the approved dual-slip pair. */
+/** v3.0 — SHA-256 pre-lock of the approved regime position (slips or regime). */
 function lockHashOf(m: AnalyzedMatch): string | undefined {
-  if (!m.slips.A || !m.slips.B) return undefined;
+  let slipAText: string | undefined;
+  let slipAOdds: number | undefined;
+  let slipBText: string | undefined;
+  let slipBOdds: number | undefined;
+  if (m.slips.A && m.slips.B) {
+    slipAText = m.slips.A.textEn;
+    slipAOdds = m.slips.A.odds;
+    slipBText = m.slips.B.textEn;
+    slipBOdds = m.slips.B.odds;
+  } else if (m.regime && m.crown) {
+    slipAText = m.regime.marketEn;
+    slipAOdds = m.regime.odds;
+    slipBText = m.regime.marketFa;
+    slipBOdds = m.regime.prob;
+  } else {
+    return undefined;
+  }
   return sha256(
     canonicalMatchString({
       dateKey: m.dateKey,
@@ -143,10 +161,10 @@ function lockHashOf(m: AnalyzedMatch): string | undefined {
       round: m.round,
       playerA: m.playerA.name,
       playerB: m.playerB.name,
-      slipAText: m.slips.A.textEn,
-      slipAOdds: m.slips.A.odds,
-      slipBText: m.slips.B.textEn,
-      slipBOdds: m.slips.B.odds,
+      slipAText,
+      slipAOdds,
+      slipBText,
+      slipBOdds,
     })
   );
 }
@@ -208,15 +226,18 @@ function timingOf(m: EspnMatch, favorite: "A" | "B"): TimingInfo {
 }
 
 /**
- * Full v2.0 analysis pipeline for a single match (works for pre / in / post):
- * market fusion (when available) → Kovalchik calibration → Markov DP →
- * 3-archetype evaluation → supervisor gate → slips → SHA-256 lock.
+ * Full v5.0 analysis pipeline for a single match (works for pre / in / post):
+ * Station 1 — market fusion (65% market + 35% surface Elo)
+ * Station 2 — Gaussian copula dependency matrix (markov.ts)
+ * Station 3 — 10,000 game-by-game Monte-Carlo (montecarlo.ts)
+ * Station 4 — 5-regime Sharpe router + crown tier + SHA-256 lock.
+ * Returns the match AND the transient per-sim tuples (never serialized).
  */
 function analyzeMatch(
   m: EspnMatch,
   market: MarketOdds | undefined,
   weather?: WeatherInfo
-): AnalyzedMatch {
+): { analyzed: AnalyzedMatch; sims: McSim[] } {
   let marketProbA: number | undefined;
   let marketOddsA: number | undefined;
   let method: "shin" | "power" = "shin";
@@ -246,6 +267,15 @@ function analyzeMatch(
   const favorite: "A" | "B" = winA >= 0.5 ? "A" : "B";
   const favWinProb = favorite === "A" ? winA : 1 - winA;
 
+  // ── Station 3 — 10,000 game-by-game Monte-Carlo with copula coupling ──
+  const seed = nameHash32(m.eventKey.toLowerCase());
+  const oriented = orientMonteCarlo(
+    simulateMatch10000(mk.gA, mk.gB, mk.copula, seed),
+    favorite,
+    mk.copula
+  );
+  const { sims, ...mcSummary } = oriented;
+
   const am: AnalyzedMatch = {
     ...m,
     weather,
@@ -254,6 +284,8 @@ function analyzeMatch(
     markov: mk,
     favorite,
     favWinProb,
+    copula: mk.copula,
+    mc: mcSummary,
     veto: { vetoed: false, code: "NONE" },
     dualEligible: false,
     slips: {},
@@ -317,7 +349,7 @@ function analyzeMatch(
   };
   am.timing = timingOf(m, favorite);
   am.hashPre = lockHashOf(am);
-  return am;
+  return { analyzed: am, sims };
 }
 
 export async function buildFeed(force = false): Promise<FeedPayload> {
@@ -389,14 +421,18 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
         )
       : new Map<string, MarketOdds>();
 
-    // ── per-match analysis (unified v2.0 path for pre / in / post)
+    // ── per-match analysis (unified v5.0 path for pre / in / post) ────────
+    // 4-station pipeline per match; raw 10k MC tuples stay in a transient map
     const analyzed: AnalyzedMatch[] = [];
+    const simsByEvent = new Map<string, McSim[]>();
     for (const m of unique) {
       try {
         const key = `${m.playerA.name}__${m.playerB.name}`;
         const market = m.state === "post" ? undefined : marketMap.get(key);
         const weather = m.city ? weatherByCity.get(m.city.toLowerCase()) : undefined;
-        analyzed.push(analyzeMatch(m, market, weather));
+        const { analyzed: am, sims } = analyzeMatch(m, market, weather);
+        analyzed.push(am);
+        simsByEvent.set(m.eventKey, sims);
       } catch (e) {
         console.error("[engine] analysis failed", m.eventKey, e);
       }
@@ -409,7 +445,7 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
     const quota = enforceApprovalQuotaV5(analyzed);
     // adaptive approvals received fresh slips → recompute the SHA-256 lock
     for (const m of analyzed) {
-      if (m.archetype?.adaptive) m.hashPre = lockHashOf(m);
+      if (m.regime) m.hashPre = lockHashOf(m);
     }
     // v5.0 crown badges — 👑 GOLD for natural low-risk/high-Sharpe positions,
     // 🥈 SILVER for adaptive quota grants, none for standard approvals
@@ -622,7 +658,7 @@ async function processHistorySettlement(
     for (const m of fresh) {
       try {
         attachResolvedRanks(m, rankLookup);
-        const am = analyzeMatch(m, undefined);
+        const { analyzed: am } = analyzeMatch(m, undefined);
         freshAnalyzed.push(am);
         processedKeys.push(m.eventKey);
       } catch (e) {
@@ -630,13 +666,27 @@ async function processHistorySettlement(
       }
     }
 
-    // 4) persist match rows (marks them processed) and build DUAL items
+    // 4) persist match rows (marks them processed) and build the routed items
     await persistMatches(freshAnalyzed, true);
     for (const am of freshAnalyzed) {
       const result = extractSettleableResult(am);
-      const approved = !am.veto.vetoed && am.dualEligible && !!am.slips.A && !!am.slips.B;
+      const approved = !am.veto.vetoed && !!am.regime && !!am.crown;
       if (approved && result) {
-        summary.items.push(...dualItemsOf(am));
+        switch (am.regime?.code) {
+          case "BANKER": {
+            const item = bankerItemOf(am);
+            if (item) summary.items.push(item);
+            break;
+          }
+          case "CLUSTER":
+            summary.items.push(...clusterItemsOf(am));
+            break;
+          case "COMBO":
+            summary.items.push(...comboRegimeItemsOf(am));
+            break;
+          default:
+            if (am.slips.A && am.slips.B) summary.items.push(...dualItemsOf(am));
+        }
         summary.approved++;
       }
     }
@@ -773,6 +823,12 @@ function rowOf(m: AnalyzedMatch) {
     slipBProb: m.slips.B?.prob ?? null,
     timing: m.timing.label,
     hashPre: m.hashPre ?? null,
+    // ─── v5.0 · pipeline persistence ─────────────────────────────────────
+    rho: m.copula?.rhoSet ?? null,
+    mcScore: m.crown?.score ?? null,
+    mcEntropy: m.mc?.entropy ?? null,
+    regime: m.regime?.code ?? null,
+    crownTier: m.crown?.tier ?? null,
   };
 }
 
@@ -827,11 +883,12 @@ const COMBO3_MAX_ODDS = 3.8;
 const COMBO_GUARANTEE = 4;
 const COMBO_FALLBACK2: [number, number] = [1.9, 2.9];
 const COMBO_FALLBACK3: [number, number] = [2.8, 4.4];
-// v4.5 — Tab 3 sniper: ONLY 3.40x–4.60x signals are emitted (no
-// outside-window top-up). The 4.20x–7.50x longshots stay OUT of the core
-// gauge and their 1-unit misses no longer drag 89.4% down to 60.6%.
-const SNIPER_MIN_ODDS = 3.4;
-const SNIPER_MAX_ODDS = 4.6;
+// v5.0 — Tab 3 sniper: ONLY copula +EV signals inside 3.20x–4.80x are
+// emitted (≥14% expected-value edge over the official price; the 34
+// positions @ >6.00x with a 16% win rate are delisted by design).
+const SNIPER_MIN_ODDS = 3.2;
+const SNIPER_MAX_ODDS = 4.8;
+const SNIPER_MIN_EV = 0.14;
 const SNIPER_GUARANTEE = 5;
 // v5.0 — simulated bookmaker margin for the sniper candidate pricing
 const BOOK_MARGIN_SNIPER = 1.07;
@@ -901,6 +958,9 @@ function dualItemsOf(m: AnalyzedMatch, stakeScale = 1): LineItem[] {
   const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
   const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
   const { stakeA, stakeB } = dutchStakes(m.slips.A.odds, m.slips.B.odds);
+  const mult = m.crown?.stakeMultiplier ?? 1;
+  const stA = Math.round(stakeA * mult * 10) / 10;
+  const stB = Math.round(stakeB * mult * 10) / 10;
   return [
     {
       ...baseItem(m),
@@ -917,6 +977,7 @@ function dualItemsOf(m: AnalyzedMatch, stakeScale = 1): LineItem[] {
       marketEn: m.slips.A.marketEn,
       marketFa: m.slips.A.marketFa,
       espnUrl: espnMatchUrl(m.eventKey),
+      targetWindow: m.slips.A.targetWindow,
       meta: JSON.stringify({
         kind: "dualA",
         arch: m.archetype?.code,
@@ -926,7 +987,7 @@ function dualItemsOf(m: AnalyzedMatch, stakeScale = 1): LineItem[] {
         archAdaptive: m.archetype?.adaptive,
         favName,
         marketEn: m.slips.A.marketEn,
-        stakePct: stakeA,
+        stakePct: stA,
         eventKey: m.eventKey,
       }),
     },
@@ -945,13 +1006,14 @@ function dualItemsOf(m: AnalyzedMatch, stakeScale = 1): LineItem[] {
       marketEn: m.slips.B.marketEn,
       marketFa: m.slips.B.marketFa,
       espnUrl: espnMatchUrl(m.eventKey),
+      targetWindow: m.slips.B.targetWindow,
       meta: JSON.stringify({
         kind: "dualB",
         arch: m.archetype?.code,
         favName,
         dogName,
         marketEn: m.slips.B.marketEn,
-        stakePct: stakeB,
+        stakePct: stB,
         eventKey: m.eventKey,
       }),
     },
@@ -967,6 +1029,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
   const shadow: LineItem[] = [];
   const eligible = analyzed.filter((m) => m.state !== "post");
 
+  // ── v5.0 · 5-Regime dispatch — exactly ONE production card per match ─────
   for (const m of eligible) {
     const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
     const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
@@ -1119,16 +1182,11 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
     }
   }
 
-  // ── v4.5 · Service-King Safe-Anchor Combos (2-leg & 3-leg) ────────────────
-  // BUG FIXED (v4.5 audit): v4.0 anchored parlays on ANY >55% favorite and
-  // the settlement path destroyed slips whenever one leg could not be
-  // resolved — that is how the history recorded 0W/11L (−179u). Anchors are
-  // now REAL favorites only: P_win ≥ 0.74 AND set-win S_fav ≥ 0.66, and every
-  // leg is one official single-button market:
-  //   · SET HANDICAP — FAVORITE +1.5 SETS  (favorite wins ≥ 1 set, P ≥ 91%)
-  //   · MATCH WINNER — FAVORITE WIN
-  // Each leg stores its explicit side + market in the pick meta so the 7-day
-  // settlement checks the REAL winner (see settlement.ts FT Settlement Fix).
+  // ── v5.0 · SERVICE KINGS ACCUMULATOR (regime 5) — 2/3-fold parlays ──────
+  // Auto-combines the top BANKER-regime matches of the day (S_fav ≥ 0.72,
+  // Hold ≥ 85%, 10k MC ≥ 86%); when the BANKER pool is thin the proven
+  // v4.5 safe-anchor ladder (P_win ≥ 0.74 ∧ S_fav ≥ 0.66) backfills so the
+  // tab never goes empty. Windows: 2-fold ≈ 2.05–2.40 · 3-fold ≈ 2.90–3.80.
   const approved = analyzed.filter(
     (m) => !m.veto.vetoed && m.state !== "post" && m.favWinProb > 0.55
   );
@@ -1137,7 +1195,14 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
     const sFav = m.favorite === "A" ? m.markov.setWinA : 1 - m.markov.setWinA;
     return m.favWinProb >= 0.74 && sFav >= 0.66;
   };
-  const byStrength = analyzed.filter(anchorEligible).sort((a, b) => b.favWinProb - a.favWinProb);
+  const bankerPool = analyzed
+    .filter((m) => m.regime?.code === "BANKER" && m.state !== "post")
+    .sort((a, b) => (b.mc?.bankerProb ?? 0) - (a.mc?.bankerProb ?? 0));
+  const anchorPool = bankerPool.length >= 2
+    ? bankerPool
+    : [...bankerPool, ...analyzed.filter((m) => !bankerPool.includes(m) && anchorEligible(m))]
+        .sort((a, b) => (b.mc?.bankerProb ?? b.favWinProb) - (a.mc?.bankerProb ?? a.favWinProb));
+  const byStrength = anchorPool;
   const combo2: LineItem[] = [];
   const combo3: LineItem[] = [];
 

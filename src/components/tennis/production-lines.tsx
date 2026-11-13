@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
+  ArrowRight,
   BadgeCheck,
   CalendarClock,
   Copy,
@@ -34,8 +35,16 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { TiltCard } from "@/components/tennis/spatial-tilt";
 import { dedupeByKey } from "@/lib/tennis/dedupe";
-import { legLabelOf } from "@/lib/tennis/supervisor";
-import type { AnalyzedMatch, FeedPayload, LineItem, Surface } from "@/lib/tennis/types";
+import { legLabelOf, REGIME_META } from "@/lib/tennis/supervisor";
+import type {
+  AnalyzedMatch,
+  CrownInfo,
+  FeedPayload,
+  LineItem,
+  PipelineStation,
+  RegimeRoute,
+  Surface,
+} from "@/lib/tennis/types";
 
 // ─── v4.0 surface identity (official broadcast badge colors) ───────────────
 
@@ -310,6 +319,133 @@ function MarketBox({
         </span>
       </div>
     </div>
+  );
+}
+
+// ─── v5.0 · holographic crown-tier badge (GOLD full stake / SILVER half) ───
+
+function CrownBadge({ crown }: { crown: CrownInfo }) {
+  const gold = crown.tier === "GOLD";
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div
+          className={`holo-badge flex items-center gap-2.5 rounded-xl px-3 py-2 ${
+            gold
+              ? "holo-gold border border-amber-300/50 bg-gradient-to-r from-amber-300/15 via-yellow-200/10 to-amber-300/15"
+              : "holo-silver border border-slate-300/40 bg-gradient-to-r from-slate-200/10 via-white/10 to-slate-200/10"
+          }`}
+        >
+          <span className="text-lg leading-none drop-shadow">{gold ? "👑" : "🥈"}</span>
+          <div className="min-w-0">
+            <div
+              className={`text-[11px] font-black tracking-wide ${gold ? "text-amber-200" : "text-slate-200"}`}
+              dir="ltr"
+            >
+              {gold ? "GOLD CROWN APPROVED" : "SILVER CROWN · ADAPTIVE"}
+            </div>
+            <div className="mono-num text-[9px] text-white/60" dir="ltr">
+              10k Monte-Carlo Score: {crown.score}/100
+              {gold ? " · FULL STAKE 60u/100u" : " · HALF STAKE 50u"}
+            </div>
+          </div>
+        </div>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-[300px] text-[11px] leading-5">
+        {crown.labelFa}
+        <br />
+        {gold
+          ? "کارت‌هایی که بدون سهمیه کمکی، ریسک باخت همزمان زیر ۸.۸٪ و نسبت شارپ بالای ۰.۳۴ دارند — بانک اصلی ۱۰۰۰ واحدی با استیک کامل."
+          : "کارت سهمیه تطبیقی ۶۵٪ سوپروایزر یا ریسک حاشیه‌ای — با نصف استیک (۵۰ واحد) مدیریت می‌شود."}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+// ─── v5.0 · 4-stage pipeline telemetry bar (Markov ➔ Copula ➔ MC ➔ Crown) ──
+
+function PipelineBar({ stations }: { stations: PipelineStation[] }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div className="flex items-center gap-1 overflow-x-auto pb-0.5">
+          {stations.map((s, i) => (
+            <div key={s.id} className="flex shrink-0 items-center gap-1">
+              <div
+                className={`flex items-center gap-1 rounded-lg border px-2 py-1 ${
+                  s.ok
+                    ? s.id === 4
+                      ? "border-amber-300/40 bg-amber-300/10"
+                      : "border-emerald-400/30 bg-emerald-400/[0.07]"
+                    : "border-white/10 bg-white/[0.04]"
+                }`}
+              >
+                <span className="text-[10px] leading-none">
+                  {s.id === 4 ? (s.ok ? "👑" : "—") : s.ok ? "✅" : "⏳"}
+                </span>
+                <span className="text-[9px] font-bold text-white/80" dir="ltr">
+                  {s.label}
+                </span>
+              </div>
+              {i < stations.length - 1 && (
+                <ArrowRight className="h-3 w-3 shrink-0 text-white/25" />
+              )}
+            </div>
+          ))}
+        </div>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-[340px] text-[10px] leading-5">
+        <div className="space-y-1">
+          {stations.map((s) => (
+            <div key={s.id}>
+              <span className="font-bold">{s.label}:</span>{" "}
+              <span className="mono-num" dir="ltr">
+                {s.detail}
+              </span>
+            </div>
+          ))}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+// ─── v5.0 · regime chip (the ONE routed strategy with its Sharpe reason) ───
+
+const REGIME_ICON: Record<string, string> = {
+  BANKER: "🏦",
+  COMBO: "🧩",
+  CLUSTER: "🎯",
+  DUAL_HEDGE: "⚖️",
+  ACCUMULATOR: "🔗",
+};
+
+function RegimeChip({ regime }: { regime: RegimeRoute }) {
+  const meta = REGIME_META[regime.code];
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge
+          variant="outline"
+          className={`gap-1 text-[10px] font-bold ${meta?.chip ?? "border-white/10 bg-white/5"}`}
+          dir="ltr"
+        >
+          <span>{REGIME_ICON[regime.code] ?? "🎯"}</span>
+          {meta?.en ?? regime.code}
+          <span className="mono-num">· Sharpe {regime.sharpe.toFixed(2)}</span>
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-[300px] text-[11px] leading-5">
+        <div className="font-bold" dir="ltr">
+          {regime.labelEn}
+        </div>
+        <p className="mt-1">{regime.reason}</p>
+        <p className="mono-num mt-1" dir="ltr">
+          coverage {(regime.coverage * 100).toFixed(1)}% · pair-loss{" "}
+          {(regime.pairLoss * 100).toFixed(1)}%
+        </p>
+      </TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -691,11 +827,81 @@ function FlashFooter({ item, matchLabel }: { item: LineItem; matchLabel: string 
   );
 }
 
-// ─── v4.0 Tab-1 dual flashcard: one card per match, Type A + Type B boxes ──
+// ─── v5.0 regime-aware badges row (crown + pipeline + regime) ─────────────
+
+function RegimeBadges({ item }: { item: LineItem }) {
+  if (!item.crown || !item.regime) return null;
+  return (
+    <div className="mt-3 space-y-2">
+      <CrownBadge crown={item.crown} />
+      {item.pipeline && <PipelineBar stations={item.pipeline} />}
+      <div className="flex flex-wrap items-center gap-2">
+        <RegimeChip regime={item.regime} />
+        <ArchBadge item={item} />
+      </div>
+    </div>
+  );
+}
+
+// ─── v5.0 Tab-BANKER flashcard: ONE safe single button (60u direct stake) ─
+
+function BankerFlashcard({ item }: { item: LineItem }) {
+  const matchLabel = `${item.playerA} × ${item.playerB}`;
+  return (
+    <TiltCard className="rise-in rounded-2xl border border-emerald-400/25 bg-emerald-400/[0.04]">
+      <div className="p-4">
+        <FlashHeader item={item} matchLabel={matchLabel} />
+        <RegimeBadges item={item} />
+        <div className="mt-3">
+          <MarketBox tone="A" wingLabel="بانکر امن — تک‌دکمه رسمی (استیک ۶۰ واحد)" item={item} />
+        </div>
+        <FlashFooter item={item} matchLabel={matchLabel} />
+      </div>
+    </TiltCard>
+  );
+}
+
+// ─── v5.0 Tab-CLUSTER flashcard: 3 exact set/game scenarios (100u dutching) ─
+
+function ClusterFlashcard({ legs }: { legs: LineItem[] }) {
+  const first = legs[0];
+  const matchLabel = `${first.playerA} × ${first.playerB}`;
+  const totalStake = legs.reduce((s, l) => s + l.stake, 0);
+  const coverage = first.regime?.coverage ?? 0;
+  return (
+    <TiltCard className="rise-in rounded-2xl border border-fuchsia-400/25 bg-fuchsia-400/[0.04]">
+      <div className="p-4">
+        <FlashHeader item={first} matchLabel={matchLabel} />
+        <RegimeBadges item={first} />
+        <div className="mt-3 space-y-2.5">
+          {legs.map((l, i) => (
+            <MarketBox
+              key={l.leg}
+              tone={i === 0 ? "A" : i === 1 ? "B" : "single"}
+              wingLabel={`سناریو ${i + 1} — داچینگ ${totalStake > 0 ? ((l.stake / totalStake) * 100).toFixed(1) : "0"}٪`}
+              item={l}
+            />
+          ))}
+        </div>
+        <div className="mt-2.5 rounded-xl border border-fuchsia-400/30 bg-fuchsia-400/10 p-2.5 text-center">
+          <span className="text-[11px] font-bold text-fuchsia-200">
+            پوشش مشترک ۳ سناریو در ۱۰,۰۰۰ شبیه‌سازی:{" "}
+            <span className="mono-num">{(coverage * 100).toFixed(1)}%</span> — سود خالص هر سناریو{" "}
+            <span className="mono-num" dir="ltr">+35% تا +55%</span>
+          </span>
+        </div>
+        <FlashFooter item={first} matchLabel={matchLabel} />
+      </div>
+    </TiltCard>
+  );
+}
+
+// ─── v4.0 Tab-DUAL flashcard: one card per match, Type A + Type B boxes ────
 
 function DualFlashcard({ pair }: { pair: { A: LineItem; B: LineItem } }) {
   const { A, B } = pair;
   const matchLabel = `${A.playerA} × ${A.playerB}`;
+  const isComboRegime = A.regime?.code === "COMBO";
   return (
     <TiltCard className="rise-in rounded-2xl border border-white/12 bg-white/[0.03]">
       <div className="p-4">
@@ -705,9 +911,27 @@ function DualFlashcard({ pair }: { pair: { A: LineItem; B: LineItem } }) {
         </div>
         <V5Panel item={A} />
         <div className="mt-3 space-y-2.5">
-          <MarketBox tone="A" wingLabel="تیپ A — دکمه رسمی سایت بت" item={A} />
-          <MarketBox tone="B" wingLabel="تیپ B — دکمه مکمل رسمی" item={B} />
+          <MarketBox
+            tone="A"
+            wingLabel={isComboRegime ? "تیپ اصلی — دکمه رسمی کمبو" : "تیپ A — دکمه رسمی سایت بت"}
+            item={A}
+          />
+          <MarketBox
+            tone="B"
+            wingLabel={isComboRegime ? "پوشش رسمی مکمل" : "تیپ B — دکمه مکمل رسمی"}
+            item={B}
+          />
         </div>
+        {A.regime?.code === "COMBO" && (
+          <div className="mt-2.5 rounded-xl border border-cyan-400/30 bg-cyan-400/10 p-2.5 text-center">
+            <span className="text-[11px] font-bold text-cyan-200">
+              پوشش مشترک تیپ اصلی + پوشش در ۱۰,۰۰۰ شبیه‌سازی: {" "}
+              <span className="mono-num">
+                {(((A.regime.coverage ?? 0) * 100)).toFixed(1)}%
+              </span>
+            </span>
+          </div>
+        )}
         <FlashFooter item={A} matchLabel={matchLabel} />
       </div>
     </TiltCard>
@@ -973,16 +1197,16 @@ function NearGateStrip({ matches }: { matches: AnalyzedMatch[] }) {
   );
 }
 
-// ─── Production lines (3 tabs) ─────────────────────────────────────────────
+// ─── v5.0 Production lines (5 regime tabs) ─────────────────────────────────
 
 export function ProductionLines({ feed }: { feed: FeedPayload }) {
   const [booster, setBooster] = useState(true);
   const { dual, banker, regCombo, cluster, accumulator, combo2, combo3, sniper, shadow } =
     feed.lines;
 
-  // v4.0 — the two complementary wings are ONE flashcard per match. Wing
-  // classification uses the official atomic leg map (TS-O25 / GH-F45 are
-  // تیپ B even though they do not start with "B").
+  // v5.0 — the two complementary wings are ONE flashcard per match. Wing
+  // classification uses the official atomic leg map (TS-O25 / GH-F45 /
+  // RC-O215 / RC-U205 are the cover wing even though they do not start with "B").
   const dualPairs = useMemo(() => {
     const byMatch = new Map<string, { A?: LineItem; B?: LineItem }>();
     for (const item of dual) {
@@ -993,6 +1217,17 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
     }
     return [...byMatch.values()].filter((p): p is { A: LineItem; B: LineItem } => !!p.A && !!p.B);
   }, [dual]);
+
+  // v5.0 — CLUSTER legs grouped 3-per-match (dutching position)
+  const clusterGroups = useMemo(() => {
+    const byMatch = new Map<string, LineItem[]>();
+    for (const item of cluster) {
+      const arr = byMatch.get(item.matchId) ?? [];
+      arr.push(item);
+      byMatch.set(item.matchId, arr);
+    }
+    return [...byMatch.values()].filter((l) => l.length >= 2);
+  }, [cluster]);
 
   // v2.0 bug fix — the shadow ledger is grouped ONE row per match (the v1.0
   // audit saw every match listed twice). Legs stay separate for settlement;
@@ -1035,6 +1270,8 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
     ? "شتاب‌دهنده نامتقارن فعال: پس از هر برد، سود قفل می‌شود و نیمی از آن به استیک بعدی تزریق می‌گردد (اصل سرمایه همیشه محفوظ)"
     : "استیک ثابت ۱ واحدی";
 
+  const defaultTab = banker.length > 0 ? "banker" : dualPairs.length > 0 ? "dual" : "combo";
+
   return (
     <section aria-label="خطوط تولید" className="space-y-4">
       <Card className="spatial-card rounded-2xl">
@@ -1069,11 +1306,45 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
               <TabsTrigger value="combo" className="gap-1.5 text-xs">
                 <Sparkles className="h-3.5 w-3.5" /> میکس/آکومو
               </TabsTrigger>
-              <TabsTrigger value="sniper" className="gap-1.5 text-xs">
+              <TabsTrigger value="cluster" className="gap-1 px-1 text-[11px]">
+                <Layers className="h-3.5 w-3.5" /> خوشه دقیق
+              </TabsTrigger>
+              <TabsTrigger value="combo" className="gap-1 px-1 text-[11px]">
+                <Link2 className="h-3.5 w-3.5" /> آکومولاتور
+              </TabsTrigger>
+              <TabsTrigger value="sniper" className="gap-1 px-1 text-[11px]">
                 <Crosshair className="h-3.5 w-3.5" /> تک‌تیرانداز
               </TabsTrigger>
             </TabsList>
 
+            {/* ── Tab 1 · 🏦 TENNIS BANKER — single safe button ── */}
+            <TabsContent value="banker" className="mt-4 space-y-3">
+              <div className="rounded-xl border border-emerald-400/25 bg-emerald-400/[0.06] px-3.5 py-2.5">
+                <div className="flex items-center gap-2 text-xs font-bold text-emerald-300">
+                  <Landmark className="h-4 w-4" />
+                  رژیم ۱ — بانکر امن سرویس (TENNIS BANKER)
+                  <span className="mono-num text-[10px] font-normal text-emerald-200/70" dir="ltr">
+                    S_fav ≥ 72% · Hold ≥ 85% · 10k MC ≥ 86% · odds 1.38x–1.65x · stake 60u
+                  </span>
+                </div>
+                <div className="mt-1 text-[10px] text-muted-foreground">
+                  تک‌دکمه امن با احتمال بالای ۸۶٪ — تغذیه خودکار تب آکومولاتور سلاطین سرویس.
+                </div>
+              </div>
+              {banker.length === 0 ? (
+                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
+                  امروز هیچ بازی به پنجره بانکر (S_fav ≥ 72٪ و Hold ≥ 85٪ و احتمال مونت‌کارلو ≥ 86٪) نرسید.
+                </div>
+              ) : (
+                <div className="grid gap-3 xl:grid-cols-2">
+                  {banker.map((item) => (
+                    <BankerFlashcard key={`${item.matchId}-${item.leg}`} item={item} />
+                  ))}
+                </div>
+              )}
+            </TabsContent>
+
+            {/* ── Tab 2 · ⚖️ DUAL-HEDGE + 🧩 COMBO regimes ── */}
             <TabsContent value="dual" className="mt-4 space-y-4">
               <div className="flex items-center justify-between rounded-xl border border-amber-300/20 bg-amber-300/5 px-3.5 py-2.5">
                 <div className="flex items-center gap-2">
@@ -1091,12 +1362,11 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
               {dualPairs.length === 0 ? (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center">
                   <ShieldAlert className="mx-auto h-8 w-8 text-amber-300/60" />
-                  <p className="mt-3 text-sm font-bold">هیچ الگویی امروز صلاحیت نگرفت</p>
+                  <p className="mt-3 text-sm font-bold">هیچ رژیمی امروز این خط را صادر نکرد</p>
                   <p className="mx-auto mt-1 max-w-md text-xs leading-6 text-muted-foreground">
-                    سوپروایزر هر مسابقه را با ۳ الگوی رسمی اتمی ارزیابی می‌کند
-                    (تسلط ست‌ها / تفکیک دقیق ست‌ها / گیم‌های سرویس‌زنان) و فقط وقتی ریسک باخت
-                    همزمان زیر <span className="mono-num">9.5%</span> باشد تایید می‌کند.
-                    باقی کارت امروز با سهمیه ۶۵٪ و برچسب «سازگار» صادر می‌شود.
+                    روتینگ ۵ رژیمی هر مسابقه را به دقیقاً یک استراتژی هدایت می‌کند — الگوی قهرمان
+                    زوج‌تیپ (ریسک 0-2 زیر <span className="mono-num">8.8%</span>) و کمبوی رسمی
+                    برد×گیم (پوشش مشترک ≥ <span className="mono-num">92%</span> در ۱۰k شبیه‌سازی).
                   </p>
                 </div>
               ) : (
@@ -1115,7 +1385,6 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
                     <ShieldAlert className="h-3.5 w-3.5" />
                     🛡️ دفتر سایه — ({shadow.length} تیپ وتوشده، بدون احتساب وین‌ریت)
                   </div>
-                  {/* v2.0 bug fix: dedupe by match id — one line per match */}
                   <div className="scroll-slim mt-2 grid max-h-40 gap-1.5 overflow-y-auto">
                     {shadowGroups.map((s) => (
                       <div key={s.matchId} className="flex items-center gap-2 rounded-lg border border-white/5 px-2.5 py-1.5 text-[11px]">
@@ -1199,7 +1468,20 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
               )}
             </TabsContent>
 
+            {/* ── Tab 5 · 🎯 Sniper — Copula +EV ≥ 14% @ 3.20x–4.80x ── */}
             <TabsContent value="sniper" className="mt-4 space-y-3">
+              <div className="rounded-xl border border-rose-400/25 bg-rose-400/[0.06] px-3.5 py-2.5">
+                <div className="flex items-center gap-2 text-xs font-bold text-rose-300">
+                  <Crosshair className="h-4 w-4" />
+                  فیلتر ارزش انتظاری کاپولا — Copula +EV ≥ 14% در بازه 3.20x تا 4.80x
+                  <span className="mono-num text-[10px] font-normal text-rose-200/70" dir="ltr">
+                    34 positions @ &gt;6.00x (16% WR) DELISTED
+                  </span>
+                </div>
+                <div className="mt-1 text-[10px] text-muted-foreground">
+                  هر سیگنال فقط وقتی صادر می‌شود که prob مونت‌کارلو × ضریب رسمی − ۱ ≥ ۱۴٪ باشد.
+                </div>
+              </div>
               {sniper.length === 0 ? (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
                   تیر خالصی با فیلتر ارزش انتظاری کاپولا پیدا نشد — اسنایپر نسخه ۵.۰ فقط وقتی

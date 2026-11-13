@@ -31,9 +31,16 @@ import type {
   AnalyzedMatch,
   ArchetypeEval,
   ArchetypeInfo,
+  CrownInfo,
+  McScenario,
+  MonteCarloSummary,
+  PipelineStation,
+  RegimeCode,
+  RegimeRoute,
   Slip,
   VetoInfo,
 } from "./types";
+import type { McSim } from "./montecarlo";
 
 const TOP100_LIMIT = 100;
 
@@ -147,6 +154,16 @@ export const DUAL_LEG_MARKET_ODDS: Record<string, number> = {
   "SB-P1-21": OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH2.legB.price,
   "TG-O225": OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH3.legA.price,
   "GH-F45": OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH3.legB.price,
+  // ─── v5.0 · 5-Regime Router official single-button prices ──────────────
+  "MW-FAV": 1.48,   // BANKER — MATCH WINNER — FAVORITE (window 1.38-1.65)
+  "SH-F15": 1.62,   // BANKER — SET HANDICAP — FAVORITE -1.5 SETS
+  "RC-FWU215": 2.15, // COMBO-UNDER — FAVORITE WIN & UNDER 21.5 GAMES
+  "RC-O215": 2.95,   // COMBO-UNDER cover — TOTAL GAMES OVER 21.5
+  "RC-FWO205": 1.95, // COMBO-OVER — FAVORITE WIN & OVER 20.5 GAMES
+  "RC-U205": 3.05,   // COMBO-OVER cover — TOTAL GAMES UNDER 20.5
+  "CL-F20U195": 2.8, // CLUSTER S1 — favorite fast 2-0 (under 19.5 games)
+  "CL-F20G20": 3.9,  // CLUSTER S2 — favorite close 2-0 (20-22 games / TB)
+  "CL-F21": 3.6,     // CLUSTER S3 — favorite 2-1
   // legacy v2.0/v3.0 legs (historical record integrity)
   "A": 2.05,
   "A-O195": 2.0,
@@ -170,10 +187,19 @@ const LEG_PAIR: Record<string, string> = {
   "B-ALT": "A-O195",
   "A-O225": "B-U225",
   "B-U225": "A-O225",
+  // v5.0 — COMBO regime main ⇄ cover wings (equal-profit dutching)
+  "RC-FWU215": "RC-O215",
+  "RC-O215": "RC-FWU215",
+  "RC-FWO205": "RC-U205",
+  "RC-U205": "RC-FWO205",
 };
 
 // legs whose wing carries the تیپ A label (everything else is تیپ B)
-const LEG_IS_A = new Set(["SB-F20", "SB-P1-20", "TG-O225", "A", "A-O195", "A-O225"]);
+const LEG_IS_A = new Set([
+  "SB-F20", "SB-P1-20", "TG-O225", "A", "A-O195", "A-O225",
+  // v5.0 — BANKER single-button legs + COMBO mains
+  "MW-FAV", "SH-F15", "RC-FWU215", "RC-FWO205",
+]);
 
 // legacy legs keep the historical 50/50 split; v4.0 legs use the exact
 // dutching split derived from the two official market prices
@@ -453,11 +479,15 @@ const isMainTourRound = (round: string): boolean => !/qual|qualif|round robin ex
 
 /**
  * Enforces the ≥65% approval quota on today's (pre/in) main-tour singles
- * card. Natural archetype approvals count first; remaining slots are filled
- * in ascending simultaneous-loss order with an adaptive grant of the
- * least-risk archetype. Mutates the matches in place.
+ * card. v5.0 — NATURAL approvals are 5-regime router routes (Station 4);
+ * remaining quota slots are filled with an ADAPTIVE max-Sharpe regime grant
+ * stamped as a SILVER crown (half stake). Mutates the matches in place.
+ * `simsByEvent` carries the raw 10k MC tuples of each match (transient).
  */
-export function enforceApprovalQuota(analyzed: AnalyzedMatch[]): QuotaTelemetry {
+export function enforceApprovalQuota(
+  analyzed: AnalyzedMatch[],
+  simsByEvent: Map<string, McSim[]>
+): QuotaTelemetry {
   const telemetry: QuotaTelemetry = {
     poolSize: 0,
     approved: 0,
@@ -472,7 +502,7 @@ export function enforceApprovalQuota(analyzed: AnalyzedMatch[]): QuotaTelemetry 
   telemetry.poolSize = pool.length;
   if (pool.length === 0) return telemetry;
 
-  const natural = pool.filter((m) => !m.veto.vetoed && !!m.archetype && !!m.slips.A);
+  const natural = pool.filter((m) => !m.veto.vetoed && !!m.regime && !!m.crown);
   telemetry.natural = natural.length;
   let approvedCount = natural.length;
 
@@ -484,28 +514,39 @@ export function enforceApprovalQuota(analyzed: AnalyzedMatch[]): QuotaTelemetry 
   if (approvedCount < quota) {
     const remaining = quota - approvedCount;
     const candidates = pool
-      .filter((m) => m.veto.vetoed || !m.archetype || !m.slips.A)
+      .filter((m) => !m.regime && !!m.mc)
       .map((m) => {
         const evals = [...(m.archEvals ?? [])].sort((a, b) => a.pairLoss - b.pairLoss);
-        return { m, best: evals[0] };
+        return { m, best: evals[0], sims: simsByEvent.get(m.eventKey) ?? [] };
       })
-      .filter((c): c is { m: AnalyzedMatch; best: ArchetypeEval } => !!c.best)
-      .sort((a, b) => a.best.pairLoss - b.best.pairLoss)
+      .filter((c) => c.best)
+      .sort((a, b) => (a.best!.pairLoss - b.best!.pairLoss))
       .slice(0, remaining);
 
-    for (const { m, best } of candidates) {
-      // adaptive grant — least-risk archetype, risk shown honestly in the UI
-      m.archetype = {
-        code: best.code,
-        labelFa: best.labelFa,
-        labelEn: best.labelEn,
-        coverage: best.coverage,
-        pairLoss: best.pairLoss,
-        adaptive: true,
-      };
+    for (const { m, sims } of candidates) {
+      if (!m.mc) continue;
+      // adaptive grant — least-risk regime by 10k Monte-Carlo Sharpe
+      const route = adaptiveRegimeGrant(m, m.mc, sims);
+      if (!route) continue;
+      m.regime = route;
+      m.crown = crownTierOf(route, m.mc, true);
       m.veto = { vetoed: false, code: "NONE" };
       m.dualEligible = true;
-      m.slips = buildSlips(m);
+      // DUAL_HEDGE grants keep an ARCH1 archetype so the legacy slips,
+      // dutching stakes and settlement legs stay in one consistent shape
+      if (route.code === "DUAL_HEDGE") {
+        m.archetype = {
+          code: "ARCH1",
+          labelFa: ARCH_LABELS.ARCH1.fa,
+          labelEn: ARCH_LABELS.ARCH1.en,
+          coverage: 1 - m.mc.p02,
+          pairLoss: m.mc.p02,
+          adaptive: true,
+        };
+        m.slips = buildSlips(m);
+      } else {
+        m.slips = {};
+      }
       approvedCount++;
       telemetry.adaptive++;
     }
@@ -516,7 +557,514 @@ export function enforceApprovalQuota(analyzed: AnalyzedMatch[]): QuotaTelemetry 
   return telemetry;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ─── v5.0 · Station 4 — 5-Regime Non-Linear Tennis Router + Crown Tiers ────
+// ═══════════════════════════════════════════════════════════════════════════
+// Every match is routed to EXACTLY ONE optimal strategy among the 5 regimes.
+// Eligibility windows (master-prompt table) are evaluated first; among the
+// eligible regimes the router computes the NON-LINEAR SHARPE SCORE of each
+// regime's P&L distribution across the 10,000 Monte-Carlo sims and selects
+// the single maximum-Sharpe regime. No hidden adaptive merging: every card
+// carries one of two crown badges (GOLD full stake / SILVER half stake).
+
+const BANKER_S_MIN = 0.72;
+const BANKER_HOLD_MIN = 0.85;
+const BANKER_PROB_MIN = 0.86;
+const COMBO_CORR_MIN = 0.76;
+const COMBO_COVER_MIN = 0.92;
+const CLUSTER_ENTROPY_MAX = 1.85;
+const CLUSTER_SHARE_MIN = 0.64;
+export const DUAL_P02_MAX = 0.088; // champion pattern gate: P(0-2) ≤ 8.8%
+export const GOLD_PAIRLOSS_MAX = 0.088;
+export const GOLD_SHARPE_MIN = 0.34;
+
+export const REGIME_META: Record<RegimeCode, { fa: string; en: string; chip: string }> = {
+  BANKER: { fa: "بانکر امن سرویس", en: "TENNIS BANKER", chip: "border-emerald-400/40 bg-emerald-400/10 text-emerald-300" },
+  COMBO: { fa: "کمبوی رسمی نتیجه و خط گیم", en: "TENNIS COMBO", chip: "border-cyan-400/40 bg-cyan-400/10 text-cyan-300" },
+  CLUSTER: { fa: "خوشه نتیجه دقیق ست و گیم", en: "EXACT SET & GAME CLUSTER", chip: "border-fuchsia-400/40 bg-fuchsia-400/10 text-fuchsia-300" },
+  DUAL_HEDGE: { fa: "زوج‌تیپ طلایی ست‌شماری", en: "DUAL-HEDGE", chip: "border-amber-300/40 bg-amber-300/10 text-amber-300" },
+  ACCUMULATOR: { fa: "آکومولاتور سلاطین سرویس", en: "SERVICE KINGS ACCUMULATOR", chip: "border-violet-400/40 bg-violet-400/10 text-violet-300" },
+};
+
+// ─── per-sim favorite-frame helpers ────────────────────────────────────────
+function simFavFrame(s: McSim, fav: "A" | "B") {
+  const flip = fav === "B";
+  const favWon = flip ? s.code === 2 || s.code === 3 : s.code === 0 || s.code === 1;
+  const favWon20 = flip ? s.code === 3 : s.code === 0;
+  const threeSets = s.code === 1 || s.code === 2;
+  return { favWon, favWon20, threeSets, total: s.games };
+}
+
+/** Non-linear Sharpe score = mean(P&L) / std(P&L) across the 10k sims. */
+export function sharpeOf(pnl: number[]): number {
+  const n = pnl.length;
+  if (n === 0) return 0;
+  const mean = pnl.reduce((a, b) => a + b, 0) / n;
+  const varr = pnl.reduce((a, b) => a + (b - mean) * (b - mean), 0) / n;
+  const std = Math.sqrt(varr);
+  return std < 1e-9 ? 0 : mean / std;
+}
+
+// ─── regime P&L distributions over the Monte-Carlo sims ────────────────────
+function regimePnL(
+  code: RegimeCode,
+  sims: McSim[],
+  fav: "A" | "B",
+  variant?: "UNDER" | "OVER"
+): number[] {
+  const { stakeA, stakeB } = dutchStakes(
+    DUAL_LEG_MARKET_ODDS["SB-F20"],
+    DUAL_LEG_MARKET_ODDS["TS-O25"]
+  );
+  return sims.map((s) => {
+    const f = simFavFrame(s, fav);
+    switch (code) {
+      case "BANKER": {
+        // MW-FAV @ 1.48 / SH-F15 @ 1.62 — 60u direct stake
+        const odds = variant === "UNDER" ? DUAL_LEG_MARKET_ODDS["SH-F15"] : DUAL_LEG_MARKET_ODDS["MW-FAV"];
+        const won = variant === "UNDER" ? f.favWon20 : f.favWon;
+        return won ? 60 * (odds - 1) : -60;
+      }
+      case "DUAL_HEDGE": {
+        // SB-F20 @ 1.97 ∪ TS-O25 @ 2.68 — equal-profit dutch (champion pattern)
+        const pnlA = f.favWon20 ? stakeA * (DUAL_LEG_MARKET_ODDS["SB-F20"] - 1) : -stakeA;
+        const pnlB = f.threeSets ? stakeB * (DUAL_LEG_MARKET_ODDS["TS-O25"] - 1) : -stakeB;
+        return pnlA + pnlB;
+      }
+      case "COMBO": {
+        const mainOdds = variant === "UNDER" ? DUAL_LEG_MARKET_ODDS["RC-FWU215"] : DUAL_LEG_MARKET_ODDS["RC-FWO205"];
+        const coverOdds = variant === "UNDER" ? DUAL_LEG_MARKET_ODDS["RC-O215"] : DUAL_LEG_MARKET_ODDS["RC-U205"];
+        const { stakeA: sm, stakeB: sc } = dutchStakes(mainOdds, coverOdds);
+        const mainWon =
+          variant === "UNDER"
+            ? f.favWon && f.total <= 21
+            : f.favWon && f.total >= 21;
+        const coverWon = variant === "UNDER" ? f.total >= 22 : f.total <= 20;
+        return (mainWon ? sm * (mainOdds - 1) : -sm) + (coverWon ? sc * (coverOdds - 1) : -sc);
+      }
+      case "CLUSTER": {
+        const [s1, s2, s3] = clusterStakes(
+          DUAL_LEG_MARKET_ODDS["CL-F20U195"],
+          DUAL_LEG_MARKET_ODDS["CL-F20G20"],
+          DUAL_LEG_MARKET_ODDS["CL-F21"]
+        );
+        const w1 = f.favWon20 && f.total <= 19;
+        const w2 = f.favWon20 && f.total >= 20 && f.total <= 22;
+        const w3 = f.favWon && f.threeSets;
+        let pnl = 0;
+        if (w1) pnl += s1 * (DUAL_LEG_MARKET_ODDS["CL-F20U195"] - 1); else pnl -= s1;
+        if (w2) pnl += s2 * (DUAL_LEG_MARKET_ODDS["CL-F20G20"] - 1); else pnl -= s2;
+        if (w3) pnl += s3 * (DUAL_LEG_MARKET_ODDS["CL-F21"] - 1); else pnl -= s3;
+        return pnl;
+      }
+      default:
+        return 0;
+    }
+  });
+}
+
+// ─── v5.0 — 3-way dutching for the CLUSTER regime (sum = 100) ──────────────
+export function clusterStakes(odds1: number, odds2: number, odds3: number): [number, number, number] {
+  const inv = [1 / Math.max(odds1, 1.01), 1 / Math.max(odds2, 1.01), 1 / Math.max(odds3, 1.01)];
+  const s = inv[0] + inv[1] + inv[2];
+  const raw = inv.map((x) => (100 * x) / s);
+  const rounded = raw.map((x) => Math.round(x * 10) / 10);
+  const drift = Math.round((100 - (rounded[0] + rounded[1] + rounded[2])) * 10) / 10;
+  rounded[1] = Math.round((rounded[1] + drift) * 10) / 10;
+  return [rounded[0], rounded[1], rounded[2]];
+}
+
+// ─── 10k Monte-Carlo score (0..100) ────────────────────────────────────────
+export function monteCarloScore(route: RegimeRoute, mc: MonteCarloSummary): number {
+  const cov = Math.max(0, Math.min(1, route.coverage));
+  const sh = Math.max(0, Math.min(1, route.sharpe / 0.6));
+  const bp = Math.max(0, Math.min(1, mc.bankerProb));
+  return Math.round(100 * (0.4 * cov + 0.3 * sh + 0.3 * bp));
+}
+
+// ─── regime candidate evaluation ───────────────────────────────────────────
+export interface RegimeCandidate {
+  code: RegimeCode;
+  variant?: "UNDER" | "OVER";
+  eligible: boolean;
+  sharpe: number;
+  coverage: number;
+  pairLoss: number;
+  whyNot?: string;
+  route?: RegimeRoute;
+}
+
+export interface RegimeRouterReport {
+  route?: RegimeRoute;
+  candidates: RegimeCandidate[];
+}
+
+function candidateOf(
+  code: RegimeCode,
+  variant: "UNDER" | "OVER" | undefined,
+  eligible: boolean,
+  whyNot: string,
+  coverage: number,
+  sharpe: number,
+  route?: RegimeRoute
+): RegimeCandidate {
+  return {
+    code,
+    variant,
+    eligible,
+    sharpe,
+    coverage,
+    pairLoss: 1 - coverage,
+    whyNot: eligible ? undefined : whyNot,
+    route,
+  };
+}
+
+/**
+ * Station 4 — evaluates all 5 regimes (ACCUMULATOR is assembled at line level
+ * from the BANKER pool), computes the non-linear Sharpe of each eligible
+ * regime over the 10k sims, and selects the single maximum-Sharpe route.
+ * `sims` are the raw per-sim tuples — passed explicitly, never serialized.
+ */
+export function routeRegime(
+  m: AnalyzedMatch,
+  mc: MonteCarloSummary,
+  sims: McSim[]
+): RegimeRouterReport {
+  const fav = m.favorite;
+  const sFav = fav === "A" ? m.markov.setWinA : 1 - m.markov.setWinA;
+  const holdFav = fav === "A" ? m.markov.gA : m.markov.gB;
+  const candidates: RegimeCandidate[] = [];
+
+  // ── 1 · 🏦 TENNIS BANKER — S_fav ≥ 0.72 ∧ Hold_fav ≥ 85% ∧ P ≥ 86% ──────
+  {
+    const windowOk = sFav >= BANKER_S_MIN && holdFav >= BANKER_HOLD_MIN && mc.bankerProb >= BANKER_PROB_MIN;
+    const useHandicap = mc.p20 >= 0.62;
+    const odds = useHandicap ? DUAL_LEG_MARKET_ODDS["SH-F15"] : DUAL_LEG_MARKET_ODDS["MW-FAV"];
+    const prob = useHandicap ? mc.p20 : mc.bankerProb;
+    const sharpe = sharpeOf(regimePnL("BANKER", sims, fav, useHandicap ? "UNDER" : undefined));
+    const favName = fav === "A" ? m.playerA.name : m.playerB.name;
+    const whyNot =
+      sFav < BANKER_S_MIN
+        ? `S_fav = ${(sFav * 100).toFixed(1)}% زیر آستانه بانکر 72%`
+        : holdFav < BANKER_HOLD_MIN
+          ? `Hold فاوریت ${(holdFav * 100).toFixed(1)}% زیر آستانه 85%`
+          : `احتمال برد مونت‌کارلو ${(mc.bankerProb * 100).toFixed(1)}% زیر کف 86%`;
+    candidates.push(
+      candidateOf(
+        "BANKER",
+        useHandicap ? "UNDER" : undefined,
+        windowOk,
+        whyNot,
+        mc.bankerProb,
+        sharpe,
+        windowOk
+          ? {
+              code: "BANKER",
+              labelFa: REGIME_META.BANKER.fa,
+              labelEn: REGIME_META.BANKER.en,
+              marketEn: useHandicap
+                ? `SET HANDICAP — ${favName.toUpperCase()} -1.5 SETS`
+                : `MATCH WINNER — ${favName.toUpperCase()}`,
+              marketFa: useHandicap
+                ? `هندیکپ ست: برد ${favName} با نتیجه ۲-۰ (بدون از دست دادن هیچ ست)`
+                : `برد مسابقه: ${favName} (تک‌دکمه امن با احتمال بالای ۸۶٪)`,
+              prob,
+              odds,
+              sharpe,
+              coverage: mc.bankerProb,
+              pairLoss: 1 - mc.bankerProb,
+              reason: `S_fav ${(sFav * 100).toFixed(0)}% · Hold ${(holdFav * 100).toFixed(0)}% · 10k MC ${(mc.bankerProb * 100).toFixed(1)}% · Sharpe ${sharpe.toFixed(2)}`,
+              variant: useHandicap ? "UNDER" : undefined,
+            }
+          : undefined
+      )
+    );
+  }
+
+  // ── 2 · ⚖️ DUAL-HEDGE — champion pattern: P(0-2) ≤ 8.8% ──────────────────
+  {
+    const eligible = mc.p02 <= DUAL_P02_MAX;
+    const coverage = 1 - mc.p02;
+    const sharpe = sharpeOf(regimePnL("DUAL_HEDGE", sims, fav));
+    const favName = fav === "A" ? m.playerA.name : m.playerB.name;
+    candidates.push(
+      candidateOf(
+        "DUAL_HEDGE",
+        undefined,
+        eligible,
+        `ریسک شوک ۲-۰ = ${(mc.p02 * 100).toFixed(1)}% بالاتر از سقف الگوی قهرمان 8.8%`,
+        coverage,
+        sharpe,
+        eligible
+          ? {
+              code: "DUAL_HEDGE",
+              labelFa: REGIME_META.DUAL_HEDGE.fa,
+              labelEn: REGIME_META.DUAL_HEDGE.en,
+              marketEn: `SET BETTING — ${favName.toUpperCase()} 2-0 + TOTAL SETS OVER 2.5`,
+              marketFa: `زوج‌تیپ طلایی: تیپ A «نتیجه دقیق ست‌ها ۲-۰ به سود ${favName}» + تیپ B «مجموع ست‌ها بالای ۲.۵»`,
+              prob: coverage,
+              odds: DUAL_LEG_MARKET_ODDS["SB-F20"],
+              sharpe,
+              coverage,
+              pairLoss: mc.p02,
+              reason: `الگوی قهرمان 45 برد / 6 باخت — ریسک 0-2 برابر ${(mc.p02 * 100).toFixed(1)}% ≤ 8.8% · Sharpe ${sharpe.toFixed(2)}`,
+            }
+          : undefined
+      )
+    );
+  }
+
+  // ── 3 · 🧩 TENNIS COMBO — copula corr ≥ 76% ∧ joint coverage ≥ 92% ───────
+  {
+    const favName = fav === "A" ? m.playerA.name : m.playerB.name;
+    const surfaceClayHard = m.surface === "CLAY" || m.surface === "HARD";
+    const underOk = mc.comboCorrUnder >= COMBO_CORR_MIN && mc.favWinUnder215 >= 0.62;
+    const overOk = mc.comboCorrOver >= COMBO_CORR_MIN && mc.favWinOver205 >= 0.55;
+    const covUnder = mc.favWinUnder215 + mc.ou215;
+    const covOver = mc.favWinOver205 + mc.u205;
+    const pickUnder = surfaceClayHard ? underOk || (covUnder >= COMBO_COVER_MIN && !overOk) : !overOk && covUnder >= COMBO_COVER_MIN;
+    const variant: "UNDER" | "OVER" | undefined = pickUnder
+      ? "UNDER"
+      : overOk || covOver >= COMBO_COVER_MIN
+        ? "OVER"
+        : undefined;
+    const cov = variant === "UNDER" ? covUnder : covOver;
+    const corr = variant === "UNDER" ? mc.comboCorrUnder : mc.comboCorrOver;
+    const eligible = variant !== undefined && corr >= COMBO_CORR_MIN && cov >= COMBO_COVER_MIN;
+    const sharpe = variant ? sharpeOf(regimePnL("COMBO", sims, fav, variant)) : 0;
+    const mainOdds = variant === "OVER" ? DUAL_LEG_MARKET_ODDS["RC-FWO205"] : DUAL_LEG_MARKET_ODDS["RC-FWU215"];
+    const mainProb = variant === "OVER" ? mc.favWinOver205 : mc.favWinUnder215;
+    candidates.push(
+      candidateOf(
+        "COMBO",
+        variant,
+        eligible,
+        `همبستگی کاپولا برد×گیم ${(corr * 100).toFixed(1)}% زیر آستانه 76% یا پوشش مشترک ${(cov * 100).toFixed(1)}% زیر 92%`,
+        cov,
+        sharpe,
+        eligible && variant
+          ? {
+              code: "COMBO",
+              labelFa: REGIME_META.COMBO.fa,
+              labelEn: REGIME_META.COMBO.en,
+              marketEn:
+                variant === "UNDER"
+                  ? `FAVORITE WIN & UNDER 21.5 GAMES (${favName.toUpperCase()})`
+                  : `FAVORITE WIN & OVER 20.5 GAMES (${favName.toUpperCase()})`,
+              marketFa:
+                variant === "UNDER"
+                  ? `کمبو رسمی: برد ${favName} و مجموع گیم‌های زیر ۲۱.۵ + پوشش «بالای ۲۱.۵ گیم»`
+                  : `کمبو رسمی: برد ${favName} و مجموع گیم‌های بالای ۲۰.۵ + پوشش «زیر ۲۰.۵ گیم»`,
+              prob: mainProb,
+              odds: mainOdds,
+              sharpe,
+              coverage: cov,
+              pairLoss: 1 - cov,
+              reason: `همبستگی کاپولا برد×گیم ${(corr * 100).toFixed(0)}% ≥ 76% · پوشش مشترک ۱۰k مونت‌کارلو ${(cov * 100).toFixed(1)}% ≥ 92% · Sharpe ${sharpe.toFixed(2)}`,
+              variant,
+            }
+          : undefined
+      )
+    );
+  }
+
+  // ── 4 · 🎯 EXACT SET & GAME CLUSTER — H ≤ 1.85 ∧ top-3 ≥ 64% ─────────────
+  {
+    const eligible = mc.entropy <= CLUSTER_ENTROPY_MAX && mc.top3Share >= CLUSTER_SHARE_MIN;
+    const sharpe = sharpeOf(regimePnL("CLUSTER", sims, fav));
+    candidates.push(
+      candidateOf(
+        "CLUSTER",
+        undefined,
+        eligible,
+        `آنتروپی شانون H = ${mc.entropy.toFixed(2)} bit یا سهم ۳ سناریو ${(mc.top3Share * 100).toFixed(1)}% زیر آستانه 64%`,
+        mc.top3Share,
+        sharpe,
+        eligible
+          ? {
+              code: "CLUSTER",
+              labelFa: REGIME_META.CLUSTER.fa,
+              labelEn: REGIME_META.CLUSTER.en,
+              marketEn: `DUTCHING CLUSTER — FAV 2-0 FAST / FAV 2-0 CLOSE / FAV 2-1`,
+              marketFa: `داچینگ ۳ سناریوی دقیق: برد ۲-۰ سریع + برد ۲-۰ نزدیک + برد ۲-۱ فاوریت (بودجه ۱۰۰ واحدی تقسیم دقیق)`,
+              prob: mc.top3Share,
+              odds: DUAL_LEG_MARKET_ODDS["CL-F20G20"],
+              sharpe,
+              coverage: mc.top3Share,
+              pairLoss: 1 - mc.top3Share,
+              reason: `H = ${mc.entropy.toFixed(2)} bit ≤ 1.85 · ۳ سناریو ${(mc.top3Share * 100).toFixed(0)}% ≥ 64% · سود خالص +35٪ تا +55٪ · Sharpe ${sharpe.toFixed(2)}`,
+            }
+          : undefined
+      )
+    );
+  }
+
+  // ── Station 4 selection — max non-linear Sharpe among eligible ───────────
+  const eligible = candidates.filter((c) => c.eligible);
+  eligible.sort((a, b) => b.sharpe - a.sharpe || b.coverage - a.coverage);
+  return { route: eligible[0]?.route, candidates };
+}
+
+/**
+ * Adaptive quota grant — the least-risk regime is granted WITHOUT the
+ * eligibility windows (pure max-Sharpe choice) and stamped as a SILVER
+ * adaptive approval (half stake).
+ */
+export function adaptiveRegimeGrant(
+  m: AnalyzedMatch,
+  mc: MonteCarloSummary,
+  sims: McSim[]
+): RegimeRoute | undefined {
+  const fav = m.favorite;
+  const options: { route: RegimeRoute; sharpe: number; coverage: number }[] = [];
+
+  const pushOpt = (code: RegimeCode, variant: "UNDER" | "OVER" | undefined, coverage: number, prob: number, odds: number, marketEn: string, marketFa: string) => {
+    const sharpe = sharpeOf(regimePnL(code, sims, fav, variant));
+    options.push({
+      sharpe,
+      coverage,
+      route: {
+        code,
+        labelFa: REGIME_META[code].fa,
+        labelEn: REGIME_META[code].en,
+        marketEn,
+        marketFa,
+        prob,
+        odds,
+        sharpe,
+        coverage,
+        pairLoss: 1 - coverage,
+        reason: `گرانت تطبیقی سهمیه ۶۵٪ — کم‌ریسک‌ترین رژیم بر اساس ۱۰k مونت‌کارلو · Sharpe ${sharpe.toFixed(2)}`,
+        variant,
+      },
+    });
+  };
+
+  const favName = fav === "A" ? m.playerA.name : m.playerB.name;
+  const useHandicap = mc.p20 >= 0.62;
+  pushOpt(
+    "BANKER",
+    useHandicap ? "UNDER" : undefined,
+    mc.bankerProb,
+    useHandicap ? mc.p20 : mc.bankerProb,
+    useHandicap ? DUAL_LEG_MARKET_ODDS["SH-F15"] : DUAL_LEG_MARKET_ODDS["MW-FAV"],
+    useHandicap ? `SET HANDICAP — ${favName.toUpperCase()} -1.5 SETS` : `MATCH WINNER — ${favName.toUpperCase()}`,
+    useHandicap ? `هندیکپ ست: برد ${favName} با نتیجه ۲-۰` : `برد مسابقه: ${favName}`
+  );
+  pushOpt(
+    "DUAL_HEDGE",
+    undefined,
+    1 - mc.p02,
+    1 - mc.p02,
+    DUAL_LEG_MARKET_ODDS["SB-F20"],
+    `SET BETTING — ${favName.toUpperCase()} 2-0 + TOTAL SETS OVER 2.5`,
+    `زوج‌تیپ: ۲-۰ فاوریت + مجموع ست‌ها بالای ۲.۵`
+  );
+  const covU = mc.favWinUnder215 + mc.ou215;
+  const covO = mc.favWinOver205 + mc.u205;
+  pushOpt(
+    "COMBO",
+    "UNDER",
+    covU,
+    mc.favWinUnder215,
+    DUAL_LEG_MARKET_ODDS["RC-FWU215"],
+    `FAVORITE WIN & UNDER 21.5 GAMES (${favName.toUpperCase()})`,
+    `کمبو: برد ${favName} و زیر ۲۱.۵ گیم + پوشش بالای ۲۱.۵`
+  );
+  pushOpt(
+    "CLUSTER",
+    undefined,
+    mc.top3Share,
+    mc.top3Share,
+    DUAL_LEG_MARKET_ODDS["CL-F20G20"],
+    `DUTCHING CLUSTER — FAV 2-0 FAST / FAV 2-0 CLOSE / FAV 2-1`,
+    `داچینگ ۳ سناریوی دقیق ست و گیم`
+  );
+
+  options.sort((a, b) => b.sharpe * b.coverage - a.sharpe * a.coverage);
+  return options[0]?.route;
+}
+
+// ─── v5.0 — Crown tier badge + pipeline telemetry builders ─────────────────
+export function crownTierOf(
+  route: RegimeRoute,
+  mc: MonteCarloSummary,
+  adaptive: boolean
+): CrownInfo {
+  const gold =
+    !adaptive && route.pairLoss < GOLD_PAIRLOSS_MAX && route.sharpe > GOLD_SHARPE_MIN;
+  const score = monteCarloScore(route, mc);
+  if (gold) {
+    return {
+      tier: "GOLD",
+      score,
+      stakeMultiplier: 1,
+      natural: true,
+      labelFa: "تایید تاج طلایی سوپروایزر — بانک اصلی ۱۰۰۰ واحدی",
+      labelEn: "GOLD CROWN APPROVED",
+    };
+  }
+  return {
+    tier: "SILVER",
+    score,
+    stakeMultiplier: 0.5,
+    natural: !adaptive,
+    labelFa: adaptive
+      ? "تایید تاج نقره‌ای — سهمیه تطبیقی (استیک نصفه ۵۰ واحد)"
+      : "تاج نقره‌ای — ریسک حاشیه‌ای، استیک نصفه ۵۰ واحد",
+    labelEn: adaptive ? "SILVER CROWN ADAPTIVE" : "SILVER CROWN MARGINAL",
+  };
+}
+
+/** 4-stage pipeline telemetry bar for the flashcards. */
+export function buildPipeline(m: AnalyzedMatch): PipelineStation[] {
+  const rev = m.reverse;
+  const cop = m.copula;
+  const mc = m.mc;
+  const crown = m.crown;
+  return [
+    {
+      id: 1,
+      label: "1. Markov p_A/p_B",
+      ok: true,
+      detail: `serve ${(rev.pFinalA * 100).toFixed(1)}% / ${(rev.pFinalB * 100).toFixed(1)}% · fusion 65% market + 35% Elo`,
+    },
+    {
+      id: 2,
+      label: "2. Copula ρ",
+      ok: true,
+      detail: cop
+        ? `ρ = ${(cop.rhoSet >= 0 ? "+" : "")}${cop.rhoSet.toFixed(3)} · comeback ${(cop.comebackProb * 100).toFixed(1)}%`
+        : "—",
+    },
+    {
+      id: 3,
+      label: "3. 10k Monte-Carlo",
+      ok: !!mc,
+      detail: mc
+        ? `${mc.sims.toLocaleString("en-US")} sims · H = ${mc.entropy.toFixed(2)} bit · σ = ${mc.sigmaMargin.toFixed(1)}g`
+        : "—",
+    },
+    {
+      id: 4,
+      label: "4. Supervisor Crown",
+      ok: !!crown,
+      detail: crown
+        ? `${crown.tier === "GOLD" ? "GOLD" : "SILVER"} · score ${crown.score}/100`
+        : "—",
+    },
+  ];
+}
+
 export {
+  BANKER_S_MIN,
+  BANKER_HOLD_MIN,
+  BANKER_PROB_MIN,
+  COMBO_CORR_MIN,
+  COMBO_COVER_MIN,
+  CLUSTER_ENTROPY_MAX,
+  CLUSTER_SHARE_MIN,
   ARCH1_MAX_PAIR_LOSS,
   ARCH1_MIN_S,
   ARCH2_MAX_PAIR_LOSS,

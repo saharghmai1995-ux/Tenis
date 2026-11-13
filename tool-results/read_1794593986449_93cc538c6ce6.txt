@@ -1,0 +1,888 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useMemo, useState } from "react";
+     4→import {
+     5→  BadgeCheck,
+     6→  CalendarClock,
+     7→  Copy,
+     8→  Crosshair,
+     9→  Crown,
+    10→  ExternalLink,
+    11→  Gem,
+    12→  Link2,
+    13→  Lock,
+    14→  Rocket,
+    15→  ShieldAlert,
+    16→  ShieldCheck,
+    17→  Sparkles,
+    18→  Target,
+    19→  Wallet,
+    20→} from "lucide-react";
+    21→import { Badge } from "@/components/ui/badge";
+    22→import { Button } from "@/components/ui/button";
+    23→import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+    24→import {
+    25→  Dialog,
+    26→  DialogContent,
+    27→  DialogDescription,
+    28→  DialogHeader,
+    29→  DialogTitle,
+    30→} from "@/components/ui/dialog";
+    31→import { Switch } from "@/components/ui/switch";
+    32→import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+    33→import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+    34→import { TiltCard } from "@/components/tennis/spatial-tilt";
+    35→import { dedupeByKey } from "@/lib/tennis/dedupe";
+    36→import { legLabelOf } from "@/lib/tennis/supervisor";
+    37→import type { AnalyzedMatch, FeedPayload, LineItem, Surface } from "@/lib/tennis/types";
+    38→
+    39→// ─── v4.0 surface identity (official broadcast badge colors) ───────────────
+    40→
+    41→const SURFACE_DOT: Record<Surface, string> = {
+    42→  HARD: "bg-cyan-400",
+    43→  CLAY: "bg-orange-400",
+    44→  GRASS: "bg-emerald-400",
+    45→};
+    46→
+    47→const SURFACE_LABEL: Record<Surface, { en: string; fa: string; chip: string }> = {
+    48→  HARD: { en: "HARD COURT", fa: "هاردکورت", chip: "text-cyan-300 border-cyan-400/40 bg-cyan-400/10" },
+    49→  CLAY: { en: "CLAY COURT", fa: "خاک رس", chip: "text-orange-300 border-orange-400/40 bg-orange-400/10" },
+    50→  GRASS: { en: "GRASS COURT", fa: "چمن", chip: "text-emerald-300 border-emerald-400/40 bg-emerald-400/10" },
+    51→};
+    52→
+    53→const ARCH_STYLE: Record<string, string> = {
+    54→  ARCH1: "border-amber-300/40 bg-amber-300/10 text-amber-300",
+    55→  ARCH2: "border-fuchsia-400/40 bg-fuchsia-400/10 text-fuchsia-300",
+    56→  ARCH3: "border-emerald-400/40 bg-emerald-400/10 text-emerald-300",
+    57→};
+    58→
+    59→function flagSrc(url: string | undefined): string | null {
+    60→  if (!url) return null;
+    61→  return `/api/tennis/img?url=${encodeURIComponent(url)}`;
+    62→}
+    63→
+    64→function SurfaceDot({ surface }: { surface: Surface }) {
+    65→  return (
+    66→    <Tooltip>
+    67→      <TooltipTrigger asChild>
+    68→        <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${SURFACE_DOT[surface]}`} />
+    69→      </TooltipTrigger>
+    70→      <TooltipContent className="text-xs">{SURFACE_LABEL[surface].fa}کورت</TooltipContent>
+    71→    </Tooltip>
+    72→  );
+    73→}
+    74→
+    75→function SurfaceBadge({ surface }: { surface: Surface }) {
+    76→  const s = SURFACE_LABEL[surface];
+    77→  return (
+    78→    <span
+    79→      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[10px] font-extrabold tracking-wider ${s.chip}`}
+    80→      dir="ltr"
+    81→    >
+    82→      <span className={`inline-block h-2 w-2 rounded-full ${SURFACE_DOT[surface]}`} />
+    83→      {s.en}
+    84→    </span>
+    85→  );
+    86→}
+    87→
+    88→// ─── v4.0 Persian date/time + countdown (تاریخ و ساعت دقیق شروع) ───────────
+    89→
+    90→const faDate = (iso: string): string => {
+    91→  const d = new Date(iso);
+    92→  if (Number.isNaN(d.getTime())) return "";
+    93→  return new Intl.DateTimeFormat("fa-IR", {
+    94→    weekday: "long",
+    95→    day: "numeric",
+    96→    month: "long",
+    97→  }).format(d);
+    98→};
+    99→
+   100→const faTime = (iso: string): string => {
+   101→  const d = new Date(iso);
+   102→  if (Number.isNaN(d.getTime())) return "";
+   103→  return new Intl.DateTimeFormat("fa-IR", {
+   104→    hour: "2-digit",
+   105→    minute: "2-digit",
+   106→  }).format(d);
+   107→};
+   108→
+   109→function countdownLabel(iso: string, now: number): string {
+   110→  const t = new Date(iso).getTime();
+   111→  if (!Number.isFinite(t)) return "";
+   112→  const diff = t - now;
+   113→  if (diff <= 0) return "شروع‌شده / در جریان";
+   114→  const mins = Math.floor(diff / 60000);
+   115→  const secs = Math.floor((diff % 60000) / 1000);
+   116→  if (mins >= 60) {
+   117→    return `شروع تا ${Math.floor(mins / 60)} ساعت و ${mins % 60} دقیقه دیگر`;
+   118→  }
+   119→  return `شروع تا ${mins}:${String(secs).padStart(2, "0")} دیگر`;
+   120→}
+   121→
+   122→function MatchClock({ item }: { item: LineItem }) {
+   123→  const [now, setNow] = useState(() => Date.now());
+   124→  useEffect(() => {
+   125→    const t = setInterval(() => setNow(Date.now()), 1000);
+   126→    return () => clearInterval(t);
+   127→  }, []);
+   128→  if (!item.startTime) return <span className="text-[11px] text-muted-foreground">{item.timing.label}</span>;
+   129→  return (
+   130→    <span className="inline-flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-white/75">
+   131→      <CalendarClock className="h-3.5 w-3.5 text-white/50" />
+   132→      <span className="font-bold text-white/90">
+   133→        {faDate(item.startTime)} — ساعت {faTime(item.startTime)}
+   134→      </span>
+   135→      {item.state === "pre" && (
+   136→        <span className="mono-num rounded-md border border-amber-300/30 bg-amber-300/10 px-1.5 py-0.5 text-[10px] text-amber-200" dir="ltr">
+   137→          {countdownLabel(item.startTime, now)}
+   138→        </span>
+   139→      )}
+   140→      {item.state === "in" && (
+   141→        <span className="rounded-md border border-rose-400/30 bg-rose-400/10 px-1.5 py-0.5 text-[10px] font-bold text-rose-200">
+   142→          در حال بازی
+   143→        </span>
+   144→      )}
+   145→    </span>
+   146→  );
+   147→}
+   148→
+   149→// ─── v4.0 player profile strip (flag · rank · seed · Hold% · BP Saved%) ────
+   150→
+   151→function MiniBar({ label, value }: { label: string; value: number }) {
+   152→  const pct = Math.min(100, Math.max(2, value * 100));
+   153→  return (
+   154→    <div className="flex items-center gap-1.5 text-[9px] text-muted-foreground" dir="ltr">
+   155→      <span className="w-20 shrink-0 truncate">{label}</span>
+   156→      <div className="h-1.5 flex-1 rounded-full bg-white/10">
+   157→        <div
+   158→          className={`h-full rounded-full ${value >= 0.8 ? "bg-emerald-400" : value >= 0.6 ? "bg-amber-300" : "bg-rose-400"}`}
+   159→          style={{ width: `${pct}%` }}
+   160→        />
+   161→      </div>
+   162→      <span className="mono-num w-9 text-right">{Math.round(value * 100)}%</span>
+   163→    </div>
+   164→  );
+   165→}
+   166→
+   167→function PlayerProfile({
+   168→  name,
+   169→  short,
+   170→  flag,
+   171→  rank,
+   172→  seed,
+   173→  hold,
+   174→  bps,
+   175→  tour,
+   176→  favorite,
+   177→}: {
+   178→  name: string;
+   179→  short?: string;
+   180→  flag?: string;
+   181→  rank?: number;
+   182→  seed?: number;
+   183→  hold?: number;
+   184→  bps?: number;
+   185→  tour: string;
+   186→  favorite: boolean;
+   187→}) {
+   188→  const src = flagSrc(flag);
+   189→  return (
+   190→    <div className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] p-2.5">
+   191→      <div className="flex items-center gap-2">
+   192→        {src ? (
+   193→          <img
+   194→            src={src}
+   195→            alt={`پرچم ${short ?? name}`}
+   196→            className="h-6 w-6 shrink-0 rounded-md border border-white/15 object-cover"
+   197→            loading="lazy"
+   198→          />
+   199→        ) : (
+   200→          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-white/15 bg-white/5 text-[9px] font-bold text-white/60">
+   201→            {(short ?? name).slice(0, 2).toUpperCase()}
+   202→          </span>
+   203→        )}
+   204→        <div className="min-w-0 flex-1">
+   205→          <div className="flex items-center gap-1.5">
+   206→            <span className="truncate text-xs font-extrabold text-white">{name}</span>
+   207→            {favorite && <Crown className="h-3 w-3 shrink-0 text-amber-300" />}
+   208→          </div>
+   209→          <div className="mono-num mt-0.5 flex items-center gap-1.5 text-[9px] text-muted-foreground" dir="ltr">
+   210→            <span className="font-bold text-white/70">
+   211→              {tour} {rank ? `#${rank}` : "—"}
+   212→            </span>
+   213→            {seed ? <span className="rounded bg-white/10 px-1">Seed #{seed}</span> : null}
+   214→          </div>
+   215→        </div>
+   216→      </div>
+   217→      <div className="mt-1.5 space-y-1">
+   218→        {hold !== undefined && <MiniBar label="Service Hold %" value={hold} />}
+   219→        {bps !== undefined && <MiniBar label="Break Pt Saved %" value={bps} />}
+   220→      </div>
+   221→    </div>
+   222→  );
+   223→}
+   224→
+   225→// ─── v4.0 standard 4-row Type A / Type B market box ────────────────────────
+   226→
+   227→function MarketBox({
+   228→  tone,
+   229→  wingLabel,
+   230→  item,
+   231→}: {
+   232→  tone: "A" | "B" | "single";
+   233→  wingLabel: string;
+   234→  item: LineItem;
+   235→}) {
+   236→  const accent =
+   237→    tone === "A"
+   238→      ? "border-amber-300/30 bg-amber-300/[0.07]"
+   239→      : tone === "B"
+   240→        ? "border-emerald-400/30 bg-emerald-400/[0.07]"
+   241→        : "border-rose-400/30 bg-rose-400/[0.06]";
+   242→  const toneText =
+   243→    tone === "A" ? "text-amber-300" : tone === "B" ? "text-emerald-300" : "text-rose-300";
+   244→  const stake = item.stakePct ?? item.stake;
+   245→  return (
+   246→    <div className={`rounded-xl border p-3 ${accent}`}>
+   247→      {/* row 1 — official English market name */}
+   248→      <div className="flex flex-wrap items-center justify-between gap-2">
+   249→        <span className={`text-[10px] font-black ${toneText}`}>{wingLabel}</span>
+   250→        <span className="mono-num text-[11px] font-extrabold tracking-wide text-white" dir="ltr">
+   251→          MARKET: {item.marketEn ?? item.descEn}
+   252→        </span>
+   253→      </div>
+   254→      {/* row 2 — exact Persian bet translation */}
+   255→      <p className="mt-1.5 text-[13px] font-bold leading-6 text-white/95">
+   256→        {item.marketFa ?? item.desc}
+   257→      </p>
+   258→      {/* row 3 — odds + Markov probability */}
+   259→      <div className="mono-num mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
+   260→        <span>
+   261→          ضریب: <span className="num-capsule font-extrabold text-white">{item.odds.toFixed(2)}x</span>
+   262→        </span>
+   263→        <span className="text-white/25">|</span>
+   264→        <span>
+   265→          احتمال زنجیره مارکوف:{" "}
+   266→          <span className="num-capsule text-white">{(item.prob * 100).toFixed(1)}%</span>
+   267→        </span>
+   268→        {item.targetWindow && (
+   269→          <Tooltip>
+   270→            <TooltipTrigger asChild>
+   271→              <span className="cursor-help text-[10px] text-cyan-300/80" dir="ltr">
+   272→                window [{item.targetWindow[0].toFixed(2)}–{item.targetWindow[1].toFixed(2)}]
+   273→              </span>
+   274→            </TooltipTrigger>
+   275→            <TooltipContent className="text-[10px]">
+   276→              پنجره قیمت رسمی این مارکت در سایت‌های شرط‌بندی
+   277→            </TooltipContent>
+   278→          </Tooltip>
+   279→        )}
+   280→      </div>
+   281→      {/* row 4 — exact dutching stake of the 100-unit match budget */}
+   282→      <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-white/80">
+   283→        <Wallet className="h-3.5 w-3.5 text-amber-300" />
+   284→        <span>
+   285→          مبلغ شرط:{" "}
+   286→          <span className="num-capsule font-extrabold text-amber-200">{stake}</span> واحد
+   287→          {item.stakePct !== undefined && (
+   288→            <>
+   289→              {" "}(
+   290→              <span className="mono-num">{Number(stake).toFixed(1)}%</span> از بودجه این بازی)
+   291→            </>
+   292→          )}
+   293→        </span>
+   294→      </div>
+   295→    </div>
+   296→  );
+   297→}
+   298→
+   299→// ─── v4.0 retirement/settlement rule badge (تسویه مصدومیت) ─────────────────
+   300→
+   301→function RetirementRuleBadge() {
+   302→  return (
+   303→    <Tooltip>
+   304→      <TooltipTrigger asChild>
+   305→        <span className="inline-flex items-center gap-1.5 rounded-lg border border-sky-400/30 bg-sky-400/[0.07] px-2.5 py-1 text-[10px] font-bold text-sky-200">
+   306→          <ShieldCheck className="h-3.5 w-3.5" />
+   307→          قانون تسویه: نیازمند اتمام کامل مسابقه (Full Match Completion — در صورت انصراف، فسخ ۱.۰۰)
+   308→        </span>
+   309→      </TooltipTrigger>
+   310→      <TooltipContent className="max-w-[260px] text-[10px] leading-5">
+   311→        اگر بازیکن پیش از پایان مسابقه انصراف دهد (Retirement)، همه تیپ‌های این کارت با ضریب
+   312→        ۱.۰۰ فسخ می‌شوند و هیچ سودی زیان ندارد — مطابق قانون استاندارد بوک‌میکرهای تنیس.
+   313→      </TooltipContent>
+   314→    </Tooltip>
+   315→  );
+   316→}
+   317→
+   318→// ─── v4.0 click-to-verify SHA-256 hash chip + modal ────────────────────────
+   319→
+   320→function espnUrlOf(eventKey?: string, espnUrl?: string): string {
+   321→  if (espnUrl) return espnUrl;
+   322→  if (eventKey && /^\d+$/.test(eventKey)) {
+   323→    return `https://www.espn.com/tennis/match/_/gameId/${eventKey}`;
+   324→  }
+   325→  return "https://www.espn.com/tennis/";
+   326→}
+   327→
+   328→function HashVerifyChip({
+   329→  hash,
+   330→  eventKey,
+   331→  espnUrl,
+   332→  matchLabel,
+   333→}: {
+   334→  hash: string;
+   335→  eventKey?: string;
+   336→  espnUrl?: string;
+   337→  matchLabel: string;
+   338→}) {
+   339→  const [open, setOpen] = useState(false);
+   340→  const [copied, setCopied] = useState(false);
+   341→  const link = espnUrlOf(eventKey, espnUrl);
+   342→
+   343→  const copyHash = async () => {
+   344→    try {
+   345→      await navigator.clipboard.writeText(hash);
+   346→      setCopied(true);
+   347→      setTimeout(() => setCopied(false), 1600);
+   348→    } catch {
+   349→      /* clipboard unavailable */
+   350→    }
+   351→  };
+   352→
+   353→  return (
+   354→    <>
+   355→      <Tooltip>
+   356→        <TooltipTrigger asChild>
+   357→          <button
+   358→            type="button"
+   359→            onClick={() => setOpen(true)}
+   360→            aria-label="راستی‌آزمایی هش SHA-256"
+   361→            className="mono-num inline-flex items-center gap-1 rounded-lg border border-cyan-400/30 bg-cyan-400/[0.07] px-2 py-1 text-[10px] text-cyan-300 transition-colors hover:bg-cyan-400/15"
+   362→            dir="ltr"
+   363→          >
+   364→            <Lock className="h-3 w-3" />
+   365→            {hash.slice(0, 10).toUpperCase()}
+   366→          </button>
+   367→        </TooltipTrigger>
+   368→        <TooltipContent className="text-[10px]">
+   369→          قفل SHA-256 پیش از مسابقه — کلیک برای راستی‌آزمایی
+   370→        </TooltipContent>
+   371→      </Tooltip>
+   372→
+   373→      <Dialog open={open} onOpenChange={setOpen}>
+   374→        <DialogContent
+   375→          onClick={(e) => e.stopPropagation()}
+   376→          className="max-w-lg border-white/10 bg-[oklch(0.16_0.01_270)]"
+   377→        >
+   378→          <DialogHeader>
+   379→            <DialogTitle className="flex items-center gap-2 text-sm">
+   380→              <BadgeCheck className="h-4 w-4 text-cyan-300" />
+   381→              راستی‌آزمایی قفل SHA-256 پیش از مسابقه
+   382→            </DialogTitle>
+   383→            <DialogDescription className="text-[11px] leading-5">
+   384→              این هش پیش از شروع مسابقه روی کارت حک شده و متن مارکت‌ها و ضرایب را قفل می‌کند —
+   385→              پس از تسویه، هیچ عددی قابل دستکاری نیست.
+   386→            </DialogDescription>
+   387→          </DialogHeader>
+   388→
+   389→          <div className="space-y-3">
+   390→            <div className="rounded-xl border border-white/10 bg-white/[0.04] p-3">
+   391→              <div className="text-[10px] text-muted-foreground">{matchLabel}</div>
+   392→              <p
+   393→                className="mono-num mt-1.5 break-all rounded-lg bg-black/40 p-2.5 text-[11px] leading-5 text-cyan-200"
+   394→                dir="ltr"
+   395→              >
+   396→                {hash}
+   397→              </p>
+   398→            </div>
+   399→            <div className="flex flex-wrap items-center gap-2">
+   400→              <Button
+   401→                type="button"
+   402→                size="sm"
+   403→                variant="outline"
+   404→                onClick={copyHash}
+   405→                className="border-white/15 bg-white/[0.04] text-xs text-white hover:bg-white/10 hover:text-white"
+   406→              >
+   407→                <Copy className="h-3.5 w-3.5" />
+   408→                {copied ? "کپی شد" : "کپی هش"}
+   409→              </Button>
+   410→              <a href={link} target="_blank" rel="noreferrer" className="inline-flex">
+   411→                <Button
+   412→                  type="button"
+   413→                  size="sm"
+   414→                  className="bg-cyan-500/90 text-xs text-black hover:bg-cyan-400"
+   415→                >
+   416→                  <ExternalLink className="h-3.5 w-3.5" />
+   417→                  صفحه رسمی بازی در ESPN Tennis
+   418→                </Button>
+   419→              </a>
+   420→            </div>
+   421→            <p className="text-[10px] leading-5 text-muted-foreground">
+   422→              لینک بازی در <span dir="ltr" className="font-mono">espn.com/tennis</span> برای
+   423→              تطبیق نتیجه نهایی و تسویه قانونی (قانون اتمام کامل مسابقه) درج شده است.
+   424→            </p>
+   425→          </div>
+   426→        </DialogContent>
+   427→      </Dialog>
+   428→    </>
+   429→  );
+   430→}
+   431→
+   432→// ─── shared flashcard header (tournament + metadata + both player profiles) ─
+   433→
+   434→function FlashHeader({ item, matchLabel }: { item: LineItem; matchLabel?: string }) {
+   435→  return (
+   436→    <div className="space-y-2.5">
+   437→      <div className="flex flex-wrap items-center justify-between gap-2">
+   438→        <div className="flex flex-wrap items-center gap-2">
+   439→          <SurfaceBadge surface={item.surface} />
+   440→          <span className="text-[10px] font-bold tracking-wide text-white/70" dir="ltr">
+   441→            {item.tour} · {item.round}
+   442→          </span>
+   443→          <Badge variant="outline" className="border-white/10 bg-white/5 text-[10px] text-muted-foreground">
+   444→            {item.tournament}
+   445→          </Badge>
+   446→        </div>
+   447→        {item.timing.optimal && (
+   448→          <Badge className="border-0 bg-amber-300 text-[10px] font-bold text-black">
+   449→            <Rocket className="h-3 w-3" />
+   450→            {item.timing.code === "T30" ? "T-30m Pre-Warmup" : "In-Play After Early Break"}
+   451→          </Badge>
+   452→        )}
+   453→      </div>
+   454→
+   455→      <div className="flex flex-wrap items-center justify-between gap-2">
+   456→        <MatchClock item={item} />
+   457→        {matchLabel && (
+   458→          <span className="text-[11px] font-bold text-white/85">{matchLabel}</span>
+   459→        )}
+   460→      </div>
+   461→
+   462→      <div className="flex flex-col gap-2 sm:flex-row">
+   463→        <PlayerProfile
+   464→          name={item.playerA}
+   465→          short={item.playerAShort}
+   466→          flag={item.flagA}
+   467→          rank={item.rankA}
+   468→          seed={item.seedA}
+   469→          hold={item.holdA}
+   470→          bps={item.bpsA}
+   471→          tour={item.tour}
+   472→          favorite={item.favorite === "A"}
+   473→        />
+   474→        <PlayerProfile
+   475→          name={item.playerB}
+   476→          short={item.playerBShort}
+   477→          flag={item.flagB}
+   478→          rank={item.rankB}
+   479→          seed={item.seedB}
+   480→          hold={item.holdB}
+   481→          bps={item.bpsB}
+   482→          tour={item.tour}
+   483→          favorite={item.favorite === "B"}
+   484→        />
+   485→      </div>
+   486→    </div>
+   487→  );
+   488→}
+   489→
+   490→function ArchBadge({ item }: { item: LineItem }) {
+   491→  if (!item.archetype) return null;
+   492→  return (
+   493→    <Tooltip>
+   494→      <TooltipTrigger asChild>
+   495→        <Badge
+   496→          variant="outline"
+   497→          className={`gap-1 text-[10px] font-bold ${ARCH_STYLE[item.archetype.code] ?? "border-white/10 bg-white/5 text-muted-foreground"}`}
+   498→        >
+   499→          <Crown className="h-3 w-3" />
+   500→          {item.archetype.labelFa}
+   501→          {item.archetype.adaptive && " (سازگار)"}
+   502→          <span className="mono-num">· {(item.archetype.coverage * 100).toFixed(1)}%</span>
+   503→        </Badge>
+   504→      </TooltipTrigger>
+   505→      <TooltipContent className="text-xs">
+   506→        {item.archetype.labelEn} — پوشش کل فضای پیشامد{" "}
+   507→        <span className="mono-num">{(item.archetype.coverage * 100).toFixed(1)}%</span> · ریسک باخت
+   508→        همزمان <span className="mono-num">{(item.archetype.pairLoss * 100).toFixed(1)}%</span>
+   509→      </TooltipContent>
+   510→    </Tooltip>
+   511→  );
+   512→}
+   513→
+   514→function FlashFooter({ item, matchLabel }: { item: LineItem; matchLabel: string }) {
+   515→  return (
+   516→    <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-white/10 pt-2.5">
+   517→      <RetirementRuleBadge />
+   518→      {item.hashPre && (
+   519→        <HashVerifyChip
+   520→          hash={item.hashPre}
+   521→          eventKey={item.eventKey}
+   522→          espnUrl={item.espnUrl}
+   523→          matchLabel={matchLabel}
+   524→        />
+   525→      )}
+   526→    </div>
+   527→  );
+   528→}
+   529→
+   530→// ─── v4.0 Tab-1 dual flashcard: one card per match, Type A + Type B boxes ──
+   531→
+   532→function DualFlashcard({ pair }: { pair: { A: LineItem; B: LineItem } }) {
+   533→  const { A, B } = pair;
+   534→  const matchLabel = `${A.playerA} × ${A.playerB}`;
+   535→  return (
+   536→    <TiltCard className="rise-in rounded-2xl border border-white/12 bg-white/[0.03]">
+   537→      <div className="p-4">
+   538→        <FlashHeader item={A} matchLabel={matchLabel} />
+   539→        <div className="mt-3 flex flex-wrap items-center gap-2">
+   540→          <ArchBadge item={A} />
+   541→        </div>
+   542→        <div className="mt-3 space-y-2.5">
+   543→          <MarketBox tone="A" wingLabel="تیپ A — دکمه رسمی سایت بت" item={A} />
+   544→          <MarketBox tone="B" wingLabel="تیپ B — دکمه مکمل رسمی" item={B} />
+   545→        </div>
+   546→        <FlashFooter item={A} matchLabel={matchLabel} />
+   547→      </div>
+   548→    </TiltCard>
+   549→  );
+   550→}
+   551→
+   552→// ─── v4.0 Tab-2 Multi-Match Parlay Slip card (legs table + combined odds) ──
+   553→
+   554→function legTime(iso: string | undefined): string {
+   555→  if (!iso) return "—";
+   556→  const t = new Date(iso).getTime();
+   557→  if (!Number.isFinite(t)) return "—";
+   558→  return faTime(iso);
+   559→}
+   560→
+   561→function ParlaySlipCard({ item }: { item: LineItem }) {
+   562→  const legs = item.legs ?? [];
+   563→  const size = legs.length || 2;
+   564→  const matchLabel = legs.map((l) => `${l.favShort ?? l.favName} × ${l.dogShort ?? l.dogName}`).join(" | ");
+   565→  return (
+   566→    <TiltCard className="rise-in rounded-2xl border border-cyan-400/25 bg-cyan-400/[0.04]">
+   567→      <div className="p-4">
+   568→        {/* official parlay slip header */}
+   569→        <div className="flex flex-wrap items-center justify-between gap-2">
+   570→          <span className="inline-flex items-center gap-1.5 text-xs font-black text-cyan-200">
+   571→            <Link2 className="h-4 w-4" />
+   572→            برگه میکس رسمی {size === 3 ? "۳" : "۲"} تایی
+   573→            <span className="mono-num text-[10px] font-bold text-cyan-300/80" dir="ltr">
+   574→              (Multi-Match Parlay Slip)
+   575→            </span>
+   576→          </span>
+   577→          <span className="mono-num rounded-lg border border-cyan-400/30 bg-cyan-400/10 px-2 py-1 text-base font-extrabold text-white" dir="ltr">
+   578→            {item.odds.toFixed(2)}x
+   579→          </span>
+   580→        </div>
+   581→
+   582→        {/* legs table — every base listed separately (v4.5: readable sizes) */}
+   583→        <div className="scroll-slim mt-3 max-h-96 space-y-2 overflow-y-auto pe-1">
+   584→          {legs.map((leg, i) => (
+   585→            <div key={`${leg.eventKey}-${i}`} className="rounded-xl border border-white/10 bg-white/[0.04] p-3">
+   586→              <div className="flex flex-wrap items-center justify-between gap-2">
+   587→                <span className="mono-num text-xs font-black text-cyan-300" dir="ltr">
+   588→                  LEG {i + 1}
+   589→                </span>
+   590→                <span className="text-xs font-bold text-white">
+   591→                  {leg.favName} <span className="text-white/40">×</span> {leg.dogName}
+   592→                </span>
+   593→              </div>
+   594→              <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-white/70">
+   595→                <SurfaceDot surface={leg.surface} />
+   596→                <span>{leg.tournament}</span>
+   597→                <span dir="ltr">· {leg.tour} {leg.round}</span>
+   598→                <span>· ساعت {legTime(leg.startTime)}</span>
+   599→              </div>
+   600→              <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+   601→                <span className="mono-num text-[11px] font-bold text-white/85" dir="ltr">
+   602→                  MARKET: {leg.marketEn}
+   603→                </span>
+   604→                <span className="mono-num text-sm font-extrabold text-amber-200" dir="ltr">
+   605→                  @{leg.odds.toFixed(2)}
+   606→                </span>
+   607→              </div>
+   608→              <div className="mt-1 text-[11px] text-white/60">{leg.marketFa}</div>
+   609→            </div>
+   610→          ))}
+   611→        </div>
+   612→
+   613→        {/* combined odds + suggested stake */}
+   614→        <div className="mt-3 grid grid-cols-3 gap-2">
+   615→          <div className="rounded-xl border border-white/10 bg-white/[0.04] p-2 text-center">
+   616→            <div className="mono-num text-sm font-extrabold text-white" dir="ltr">
+   617→              {item.odds.toFixed(2)}x
+   618→            </div>
+   619→            <div className="mt-0.5 text-[10px] text-white/65">ضریب کل میکس (Combined Odds)</div>
+   620→          </div>
+   621→          <div className="rounded-xl border border-white/10 bg-white/[0.04] p-2 text-center">
+   622→            <div className="mono-num text-sm font-extrabold text-white" dir="ltr">
+   623→              {(item.prob * 100).toFixed(1)}%
+   624→            </div>
+   625→            <div className="mt-0.5 text-[10px] text-white/65">احتمال زنجیره مارکوف</div>
+   626→          </div>
+   627→          <div className="rounded-xl border border-amber-300/30 bg-amber-300/10 p-2 text-center">
+   628→            <div className="mono-num text-sm font-extrabold text-amber-200" dir="ltr">
+   629→              {item.stake} واحد
+   630→            </div>
+   631→            <div className="mt-0.5 text-[10px] text-amber-200/70">مبلغ استیک پیشنهادی</div>
+   632→          </div>
+   633→        </div>
+   634→
+   635→        <FlashFooter item={item} matchLabel={matchLabel || item.descEn} />
+   636→      </div>
+   637→    </TiltCard>
+   638→  );
+   639→}
+   640→
+   641→// ─── v4.0 Tab-3 sniper flashcard (single official market) ──────────────────
+   642→
+   643→function SniperFlashcard({ item }: { item: LineItem }) {
+   644→  const matchLabel = `${item.playerA} × ${item.playerB}`;
+   645→  return (
+   646→    <TiltCard className="rise-in rounded-2xl border border-rose-400/25 bg-rose-400/[0.04]">
+   647→      <div className="p-4">
+   648→        <FlashHeader item={item} matchLabel={matchLabel} />
+   649→        <div className="mt-3">
+   650→          <MarketBox tone="single" wingLabel="تک‌تیرانداز — دکمه رسمی ضریب بالا" item={item} />
+   651→        </div>
+   652→        <FlashFooter item={item} matchLabel={matchLabel} />
+   653→      </div>
+   654→    </TiltCard>
+   655→  );
+   656→}
+   657→
+   658→// ─── Near-gate strip: live 3-archetype candidacy for unapproved matches ────
+   659→
+   660→function NearGateStrip({ matches }: { matches: AnalyzedMatch[] }) {
+   661→  const candidates = useMemo(() => {
+   662→    return matches
+   663→      .filter((m) => m.state !== "post" && !m.veto.vetoed)
+   664→      .slice(0, 40)
+   665→      .map((m) => {
+   666→        const fav = m.favorite;
+   667→        const hold = fav === "A" ? m.markov.gA : m.markov.gB;
+   668→        const sFav = fav === "A" ? m.markov.setWinA : 1 - m.markov.setWinA;
+   669→        const best = [...(m.archEvals ?? [])]
+   670→          .filter((e) => e.eligible)
+   671→          .sort((a, b) => a.pairLoss - b.pairLoss)[0];
+   672→        const anyWindow = (m.archEvals ?? []).some((e) => e.eligible);
+   673→        return { m, hold, sFav, best, anyWindow };
+   674→      })
+   675→      .filter((c) => !c.best)
+   676→      .sort((a, b) => a.sFav - b.sFav)
+   677→      .slice(0, 4);
+   678→  }, [matches]);
+   679→
+   680→  if (candidates.length === 0) return null;
+   681→  return (
+   682→    <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+   683→      <div className="flex items-center gap-2 text-xs font-bold text-white/80">
+   684→        <ShieldAlert className="h-3.5 w-3.5 text-amber-300" />
+   685→        کاندیدهای زیر ذره‌بین سوپروایزر (ارزیابی زنده ۳ الگو)
+   686→      </div>
+   687→      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+   688→        {candidates.map(({ m, hold, sFav }) => (
+   689→          <div key={m.eventKey} className="rounded-xl border border-white/5 bg-white/[0.03] p-2.5">
+   690→            <div className="flex items-center justify-between text-xs">
+   691→              <span className="font-bold">
+   692→                <SurfaceDot surface={m.surface} />{" "}
+   693→                {m.favorite === "A" ? m.playerA.name : m.playerB.name}
+   694→                <span className="text-muted-foreground"> × {m.favorite === "A" ? m.playerB.name : m.playerA.name}</span>
+   695→              </span>
+   696→              <span className="mono-num text-[10px] text-muted-foreground">{m.tournament.slice(0, 16)}</span>
+   697→            </div>
+   698→            <div className="mt-2 space-y-1 text-[10px] text-muted-foreground">
+   699→              <div className="flex items-center gap-2">
+   700→                <span className="w-24">S_fav</span>
+   701→                <div className="h-1.5 flex-1 rounded-full bg-white/10">
+   702→                  <div
+   703→                    className="h-full rounded-full bg-cyan-400"
+   704→                    style={{ width: `${Math.min(100, (sFav / 0.9) * 100)}%` }}
+   705→                  />
+   706→                </div>
+   707→                <span className="mono-num">{(sFav * 100).toFixed(0)}%</span>
+   708→              </div>
+   709→              <div className="flex items-center gap-2">
+   710→                <span className="w-24">Hold fav</span>
+   711→                <div className="h-1.5 flex-1 rounded-full bg-white/10">
+   712→                  <div
+   713→                    className={`h-full rounded-full ${hold >= 0.84 ? "bg-emerald-400" : "bg-amber-400"}`}
+   714→                    style={{ width: `${Math.min(100, (hold / 0.95) * 100)}%` }}
+   715→                  />
+   716→                </div>
+   717→                <span className={`mono-num ${hold >= 0.84 ? "text-emerald-300" : ""}`}>{Math.round(hold * 100)}%</span>
+   718→              </div>
+   719→              <p className="pt-0.5 leading-4 text-muted-foreground/80">
+   720→                خارج از پنجره الگوها — پنجره رقابتی{" "}
+   721→                <span className="mono-num">54% ≤ S_A &lt; 64%</span>
+   722→              </p>
+   723→            </div>
+   724→          </div>
+   725→        ))}
+   726→      </div>
+   727→    </div>
+   728→  );
+   729→}
+   730→
+   731→// ─── Production lines (3 tabs) ─────────────────────────────────────────────
+   732→
+   733→export function ProductionLines({ feed }: { feed: FeedPayload }) {
+   734→  const [booster, setBooster] = useState(true);
+   735→  const { dual, combo2, combo3, sniper, shadow } = feed.lines;
+   736→
+   737→  // v4.0 — the two complementary wings are ONE flashcard per match. Wing
+   738→  // classification uses the official atomic leg map (TS-O25 / GH-F45 are
+   739→  // تیپ B even though they do not start with "B").
+   740→  const dualPairs = useMemo(() => {
+   741→    const byMatch = new Map<string, { A?: LineItem; B?: LineItem }>();
+   742→    for (const item of dual) {
+   743→      const cur = byMatch.get(item.matchId) ?? {};
+   744→      if (legLabelOf(item.leg) === "تیپ B") cur.B = item;
+   745→      else cur.A = item;
+   746→      byMatch.set(item.matchId, cur);
+   747→    }
+   748→    return [...byMatch.values()].filter((p): p is { A: LineItem; B: LineItem } => !!p.A && !!p.B);
+   749→  }, [dual]);
+   750→
+   751→  // v2.0 bug fix — the shadow ledger is grouped ONE row per match (the v1.0
+   752→  // audit saw every match listed twice). Legs stay separate for settlement;
+   753→  // the render unifies them by matchId with the canonical Map dedupe.
+   754→  const shadowGroups = useMemo(() => {
+   755→    const first = dedupeByKey(
+   756→      [...shadow].sort((a, b) => a.matchId.localeCompare(b.matchId)),
+   757→      (s) => s.matchId
+   758→    );
+   759→    return first.slice(0, 10);
+   760→  }, [shadow]);
+   761→
+   762→  // Principal-Lock Booster display: asymmetric staking preview on dual line
+   763→  const boosterNote = booster
+   764→    ? "شتاب‌دهنده نامتقارن فعال: پس از هر برد، سود قفل می‌شود و نیمی از آن به استیک بعدی تزریق می‌گردد (اصل سرمایه همیشه محفوظ)"
+   765→    : "استیک ثابت ۱ واحدی";
+   766→
+   767→  return (
+   768→    <section aria-label="خطوط تولید" className="space-y-4">
+   769→      <Card className="spatial-card rounded-2xl">
+   770→        <CardHeader className="pb-2">
+   771→          <CardTitle className="flex flex-wrap items-center gap-2 text-sm font-bold">
+   772→            <Rocket className="h-4 w-4 text-amber-300" />
+   773→            خطوط تولید سیگنال (۳ لاین مستقل)
+   774→            <span className="text-[11px] font-normal text-muted-foreground">
+   775→              — مارکت‌های اتمی رسمی ATP/WTA · سوپروایزر ۳ الگویی با سهمیه تایید ۶۵٪ · خروجی امروز: {dualPairs.length} مسابقه زوج‌تیپ ({dual.length} بال) ·{" "}
+   776→              {combo2.length + combo3.length} برگه میکس ·{" "}
+   777→              {sniper.length} اسنایپر · {shadow.length} وتو
+   778→            </span>
+   779→          </CardTitle>
+   780→        </CardHeader>
+   781→        <CardContent>
+   782→          <Tabs defaultValue="dual">
+   783→            <TabsList className="grid w-full grid-cols-3 bg-white/5">
+   784→              <TabsTrigger value="dual" className="gap-1.5 text-xs">
+   785→                <Target className="h-3.5 w-3.5" /> زوج‌تیپ اتمی رسمی
+   786→              </TabsTrigger>
+   787→              <TabsTrigger value="combo" className="gap-1.5 text-xs">
+   788→                <Sparkles className="h-3.5 w-3.5" /> برگه میکس رسمی
+   789→              </TabsTrigger>
+   790→              <TabsTrigger value="sniper" className="gap-1.5 text-xs">
+   791→                <Crosshair className="h-3.5 w-3.5" /> تک‌تیرانداز
+   792→              </TabsTrigger>
+   793→            </TabsList>
+   794→
+   795→            <TabsContent value="dual" className="mt-4 space-y-4">
+   796→              <div className="flex items-center justify-between rounded-xl border border-amber-300/20 bg-amber-300/5 px-3.5 py-2.5">
+   797→                <div className="flex items-center gap-2">
+   798→                  <Crown className="h-4 w-4 text-amber-300" />
+   799→                  <div>
+   800→                    <div className="text-xs font-bold text-amber-300">
+   801→                      سوییچ شتاب‌دهنده نامتقارن — Principal-Lock Booster
+   802→                    </div>
+   803→                    <div className="text-[10px] text-muted-foreground">{boosterNote}</div>
+   804→                  </div>
+   805→                </div>
+   806→                <Switch checked={booster} onCheckedChange={setBooster} aria-label="شتاب‌دهنده" />
+   807→              </div>
+   808→
+   809→              {dualPairs.length === 0 ? (
+   810→                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center">
+   811→                  <ShieldAlert className="mx-auto h-8 w-8 text-amber-300/60" />
+   812→                  <p className="mt-3 text-sm font-bold">هیچ الگویی امروز صلاحیت نگرفت</p>
+   813→                  <p className="mx-auto mt-1 max-w-md text-xs leading-6 text-muted-foreground">
+   814→                    سوپروایزر هر مسابقه را با ۳ الگوی رسمی اتمی ارزیابی می‌کند
+   815→                    (تسلط ست‌ها / تفکیک دقیق ست‌ها / گیم‌های سرویس‌زنان) و فقط وقتی ریسک باخت
+   816→                    همزمان زیر <span className="mono-num">9.5%</span> باشد تایید می‌کند.
+   817→                    باقی کارت امروز با سهمیه ۶۵٪ و برچسب «سازگار» صادر می‌شود.
+   818→                  </p>
+   819→                </div>
+   820→              ) : (
+   821→                <div className="grid gap-3 xl:grid-cols-2">
+   822→                  {dualPairs.map((pair) => (
+   823→                    <DualFlashcard key={pair.A.matchId} pair={pair} />
+   824→                  ))}
+   825→                </div>
+   826→              )}
+   827→
+   828→              <NearGateStrip matches={feed.matches} />
+   829→
+   830→              {shadow.length > 0 && (
+   831→                <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-4">
+   832→                  <div className="flex items-center gap-2 text-xs font-bold text-muted-foreground">
+   833→                    <ShieldAlert className="h-3.5 w-3.5" />
+   834→                    🛡️ دفتر سایه — ({shadow.length} تیپ وتوشده، بدون احتساب وین‌ریت)
+   835→                  </div>
+   836→                  {/* v2.0 bug fix: dedupe by match id — one line per match */}
+   837→                  <div className="scroll-slim mt-2 grid max-h-40 gap-1.5 overflow-y-auto">
+   838→                    {shadowGroups.map((s) => (
+   839→                      <div key={s.matchId} className="flex items-center gap-2 rounded-lg border border-white/5 px-2.5 py-1.5 text-[11px]">
+   840→                        <span className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${SURFACE_DOT[s.surface]}`} />
+   841→                        <span className="truncate text-muted-foreground">{s.desc}</span>
+   842→                        <span className="mono-num ms-auto shrink-0 text-[10px] text-white/40">
+   843→                          {s.playerA.split(" ").pop()} × {s.playerB.split(" ").pop()}
+   844→                        </span>
+   845→                      </div>
+   846→                    ))}
+   847→                  </div>
+   848→                </div>
+   849→              )}
+   850→            </TabsContent>
+   851→
+   852→            <TabsContent value="combo" className="mt-4 space-y-3">
+   853→              {[...combo2, ...combo3].length === 0 ? (
+   854→                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
+   855→                  برگه میکس امنی با پنجره هدف <span className="mono-num">2.05x–2.40x</span> (۲تایی) یا{" "}
+   856→                  <span className="mono-num">2.90x–3.80x</span> (۳تایی) یافت نشد — پایه‌های امن سلاطین سرویس
+   857→                  (فاوریت با احتمال برد <span className="mono-num">≥74%</span>) امروز در تداخل رنکینگ هستند.
+   858→                </div>
+   859→              ) : (
+   860→                <div className="grid gap-3 xl:grid-cols-2">
+   861→                  {[...combo2, ...combo3].map((item) => (
+   862→                    <ParlaySlipCard key={`${item.matchId}-${item.leg}`} item={item} />
+   863→                  ))}
+   864→                </div>
+   865→              )}
+   866→            </TabsContent>
+   867→
+   868→            <TabsContent value="sniper" className="mt-4 space-y-3">
+   869→              {sniper.length === 0 ? (
+   870→                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
+   871→                  تیر خالصی در پنجره هدف <span className="mono-num">3.40x–4.60x</span> پیدا نشد — اسنایپر فقط
+   872→                  در بازی‌های نزدیک سیگنال صادر می‌کند (SET BETTING — FAVORITE WINS 2-1).
+   873→                </div>
+   874→              ) : (
+   875→                <div className="grid gap-3 xl:grid-cols-2">
+   876→                  {sniper.map((item) => (
+   877→                    <SniperFlashcard key={`${item.matchId}-${item.leg}`} item={item} />
+   878→                  ))}
+   879→                </div>
+   880→              )}
+   881→            </TabsContent>
+   882→          </Tabs>
+   883→        </CardContent>
+   884→      </Card>
+   885→    </section>
+   886→  );
+   887→}
+   888→

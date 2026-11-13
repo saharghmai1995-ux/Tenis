@@ -104,6 +104,16 @@ const LEG_LABEL: Record<string, string> = {
   "B": "تیپ B",
   "B-ALT": "تیپ B",
   "B-U225": "تیپ B",
+  // ─── v5.0 · 5-Regime legs ──────────────────────────────────────────────
+  "MW-FAV": "بانکر",
+  "SH-F15": "بانکر",
+  "RC-FWU215": "تیپ اصلی",
+  "RC-O215": "پوشش",
+  "RC-FWO205": "تیپ اصلی",
+  "RC-U205": "پوشش",
+  "CL-F20U195": "سناریو ۱",
+  "CL-F20G20": "سناریو ۲",
+  "CL-F21": "سناریو ۳",
 };
 
 function legLabelOf(leg: string): string {
@@ -158,6 +168,7 @@ export async function buildLedgerPayload(
     createdAt: string;
   }
   const dual = new Map<string, DualAgg>();
+  const cluster = new Map<DualAgg["matchId"], DualAgg>();
   const singles: { p: PickWithMatch; leg: LedgerLeg }[] = [];
 
   for (const p of all) {
@@ -198,16 +209,16 @@ export async function buildLedgerPayload(
     // SHADOW rows stay in the disjoint shadow ledger — never in the record
   }
 
-  const dualRows: LedgerMatchRow[] = [...dual.values()].map((a) => {
+  // v5.0 — one shared mapper for match-level multi-wing positions (DUAL 2
+  // wings, CLUSTER 3 dutching scenarios)
+  const aggRowOf = (a: DualAgg, line: ProductionLine): LedgerMatchRow => {
     const decided = !a.anyPending && a.legs.every((l) => l.status !== "PENDING");
     const status: LedgerMatchRow["status"] = !decided
       ? "PENDING"
       : a.winner
         ? "WON"
         : "LOST";
-    // doc formula: netMatchProfit = Σ(winningSlipStake × winningSlipOdds) − (stakeA + stakeB)
-    // (ARCH2 wings can BOTH win — fav loses set 1 then wins 2-1 — every
-    // winning wing is settled into the match-level net)
+    // doc formula: netMatchProfit = Σ(winningSlipStake × winningSlipOdds) − total stake
     const wonReturn = a.legs
       .filter((l) => l.status === "WON")
       .reduce((s, l) => s + l.odds * l.stake, 0);
@@ -215,9 +226,9 @@ export async function buildLedgerPayload(
     const archCode = a.meta.arch;
     const fallback = archCode ? ARCH_FALLBACK[archCode] : undefined;
     return {
-      id: `DUAL:${a.matchId}`,
+      id: `${line}:${a.matchId}`,
       matchId: a.matchId,
-      line: "DUAL" as ProductionLine,
+      line,
       matchLabel: `${a.match.playerA} × ${a.match.playerB}`,
       tournament: a.match.tournament,
       tour: a.match.tour as Tour,
@@ -246,7 +257,10 @@ export async function buildLedgerPayload(
       settledAt: decided ? a.settledAt : undefined,
       createdAt: a.createdAt,
     };
-  });
+  };
+
+  const dualRows: LedgerMatchRow[] = [...dual.values()].map((a) => aggRowOf(a, "DUAL"));
+  const clusterRows: LedgerMatchRow[] = [...cluster.values()].map((a) => aggRowOf(a, "CLUSTER"));
 
   const singleRows: LedgerMatchRow[] = singles.map(({ p, leg }) => {
     const decided = leg.status === "WON" || leg.status === "LOST";
@@ -275,7 +289,7 @@ export async function buildLedgerPayload(
   });
 
   // latest first, bounded
-  const rows = [...dualRows, ...singleRows]
+  const rows = [...dualRows, ...clusterRows, ...singleRows]
     .sort(
       (a, b) =>
         (b.settledAt ?? b.createdAt).localeCompare(a.settledAt ?? a.createdAt)
@@ -335,7 +349,7 @@ export async function buildLedgerPayload(
   ];
 
   // ── combined stats (official record only — shadow excluded, match level) ──
-  const official = [...dualRows, ...singleRows];
+  const official = [...dualRows, ...clusterRows, ...singleRows];
   const decidedRows = official.filter((r) => r.status !== "PENDING");
   const combinedWonCount = decidedRows.filter((r) => r.status === "WON").length;
   const combinedProfit = decidedRows.reduce((s, r) => s + r.profit, 0);
@@ -452,7 +466,7 @@ export async function buildLedgerPayload(
   return {
     stats: {
       combinedWinRate: decidedRows.length > 0 ? combinedWonCount / decidedRows.length : 0,
-      // v4.5 — core system win rate (DUAL + COMBO only; sniper excluded)
+      // v5.0 — core system win rate (DUAL + BANKER + COMBO + CLUSTER; sniper excluded)
       coreWinRate: coreDecided.length > 0 ? coreWon / coreDecided.length : 0,
       // v4.5 — stake-weighted win rate over the official record
       stakeWeightedWinRate: combinedStake > 0 ? wonStake / combinedStake : 0,
@@ -464,6 +478,18 @@ export async function buildLedgerPayload(
       settled: decidedRows.length,
       streak,
       bestWin,
+      // ─── v5.0 · Live Bankroll Audit Inspector — exact algebraic identity ────
+      // bank = bankStart + Σ(profit of WON positions) + Σ(profit of LOST positions)
+      winsGross:
+        Math.round(
+          decidedRows.filter((r) => r.status === "WON").reduce((s, r) => s + r.profit, 0) * 100
+        ) / 100,
+      lossesGross:
+        Math.round(
+          decidedRows.filter((r) => r.status === "LOST").reduce((s, r) => s + r.profit, 0) * 100
+        ) / 100,
+      winsCount: combinedWonCount,
+      lossesCount: decidedRows.length - combinedWonCount,
     },
     groups,
     rows,

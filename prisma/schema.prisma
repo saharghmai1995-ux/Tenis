@@ -73,6 +73,13 @@ model TennisMatch {
   timing  String? // T-30m Pre-Warmup | In-Play After Early Break | ...
   hashPre String?
 
+  // ── v5.0 Copula-Markov-MonteCarlo pipeline ──
+  rho       Float?  // Gaussian copula ρ (Station 2)
+  mcScore   Int?    // 10k Monte-Carlo score 0..100 (Station 4)
+  mcEntropy Float?  // Shannon entropy of the match (Station 3)
+  regime    String? // BANKER | COMBO | CLUSTER | DUAL_HEDGE | ACCUMULATOR
+  crownTier String? // GOLD | SILVER
+
   // ── Settlement
   resultSetsA Int?
   resultSetsB Int?
@@ -92,8 +99,8 @@ model TennisPick {
   id      String     @id @default(cuid())
   matchId String
   match   TennisMatch @relation(fields: [matchId], references: [id], onDelete: Cascade)
-  line    String // DUAL | COMBO | SNIPER | SHADOW
-  leg     String // A | B | B-O205 | COMBO-2 | COMBO-3 | SNIPER-<key>
+  line    String // DUAL | COMBO | SNIPER | SHADOW | BANKER | CLUSTER
+  leg     String // A | B | COMBO-2 | SNIPER-<key> | MW-FAV | SH-F15 | RC-* | CL-*
   desc    String
   odds    Float
   prob    Float

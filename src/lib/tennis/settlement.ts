@@ -215,6 +215,63 @@ function settlePick(
       const won = result.totalGames >= 21;
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
+    // ─── v5.0 · COMBO regime wings (main + cover on the DUAL line) ────────
+    if (pick.leg === "RC-FWU215") {
+      // FAVORITE WIN & UNDER 21.5 GAMES
+      const won = favWonMatch && result.totalGames <= 21;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (pick.leg === "RC-O215") {
+      // cover — TOTAL GAMES OVER 21.5
+      const won = result.totalGames >= 22;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (pick.leg === "RC-FWO205") {
+      // FAVORITE WIN & OVER 20.5 GAMES
+      const won = favWonMatch && result.totalGames >= 21;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (pick.leg === "RC-U205") {
+      // cover — TOTAL GAMES UNDER 20.5
+      const won = result.totalGames <= 20;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    return { status: "VOID", profit: 0 };
+  }
+
+  // ─── v5.0 · BANKER — single safe button (MW-FAV / SH-F15) ────────────
+  if (pick.line === "BANKER") {
+    if (pick.leg === "MW-FAV") {
+      // MATCH WINNER — FAVORITE
+      const won = favWonMatch;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (pick.leg === "SH-F15") {
+      // SET HANDICAP — FAVORITE −1.5 SETS (favorite wins 2-0)
+      const won = favWon20;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    return { status: "VOID", profit: 0 };
+  }
+
+  // ─── v5.0 · CLUSTER — 3 exact set/game scenarios (dutching) ──────────
+  if (pick.line === "CLUSTER") {
+    if (pick.leg === "CL-F20U195") {
+      // scenario 1 — favorite fast 2-0 under 19.5 games
+      const won = favWon20 && result.totalGames <= 19;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (pick.leg === "CL-F20G20") {
+      // scenario 2 — favorite close 2-0 (20-22 games / tie-break)
+      const won = favWon20 && result.totalGames >= 20 && result.totalGames <= 22;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (pick.leg === "CL-F21") {
+      // scenario 3 — favorite wins 2-1
+      const target: ResultCode = side === "A" ? "2-1" : side === "B" ? "1-2" : "2-1";
+      const won = favWonMatch && result.code === target;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
     return { status: "VOID", profit: 0 };
   }
 
