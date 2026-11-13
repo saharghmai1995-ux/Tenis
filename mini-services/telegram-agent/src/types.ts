@@ -7,12 +7,25 @@ export type PosterKind =
   | "BRIEFING" // VIP morning briefing — today's cards + discipline + vetoes
   | "AGGREGATE" // daily aggregate — results grid + win rate
   | "WEEKLY" // weekly report — 7-day performance
-  | "NEWS" // ESPN football news poster (English)
+  | "NEWS" // LIVE tennis newswire poster (English) — news + live board + fitness
   | "ACADEMY" // BET terminology academy lesson (English educational poster)
   | "BANNER" // hourly marketing banner
   | "FTRESULTS"; // full-time settled results + win rate
 
-export type ThemeSurface = "HARD" | "CLAY" | "GRASS" | "FOOTBALL" | "ACADEMY" | "MARKETING" | "RESULTS";
+export type ThemeSurface = "HARD" | "CLAY" | "GRASS" | "LIVE" | "ACADEMY" | "MARKETING" | "RESULTS";
+
+/** one live scoreboard row on the NEWS poster */
+export interface PosterLiveRow {
+  label: string;
+  value: string;
+  state: "LIVE" | "UPCOMING" | "FINAL";
+}
+
+/** one fitness-watch row on the NEWS poster */
+export interface PosterFitnessRow {
+  label: string;
+  tag: string;
+}
 
 export interface PosterSlipBox {
   /** market key code, e.g. SB-F20 / TS-O25 (Latin sanitizer enforced) */
@@ -67,13 +80,17 @@ export interface PosterRequest {
   stats?: PosterStat[];
   rows?: PosterRow[];
   bullets?: string[];
-  /** news block (NEWS kind) */
+  /** news block (NEWS kind) — LIVE tennis newswire */
   news?: {
     headline: string;
     description: string;
     source: string;
     published?: string;
     tag?: string;
+    /** live scoreboard rows (LIVE first) */
+    live?: PosterLiveRow[];
+    /** fitness watch rows (injury/fitness radar) */
+    fitness?: PosterFitnessRow[];
   };
   /** academy block (ACADEMY kind) */
   lesson?: {
@@ -112,8 +129,8 @@ export type JobId =
   | "flashcards"
   | "vip_aggregate"
   | "weekly_report"
-  | "espn_news_am"
-  | "espn_news_pm"
+  | "tennis_news_am"
+  | "tennis_news_pm"
   | "academy_am"
   | "academy_pm"
   | "free_card"
@@ -161,11 +178,12 @@ export interface PostLogRow {
 export interface AgentStatus {
   ok: true;
   bot: { username: string; live: boolean };
-  chats: { public?: string; vip?: string };
+  chats: { public?: string; vip?: string; vipTitle?: string };
   uptimeSeconds: number;
   jobs: (JobSpec & JobRunState)[];
   recentPosts: PostLogRow[];
   flashQueue: { cursor: number; total: number; dateKey: string };
   academy: { nextLesson: number; total: number };
   dataFeed: { lastWarmOk: boolean; lastWarmAt?: string; matches: number; approved: number };
+  radar: { news: number; live: number; liveNow: number; fitness: number };
 }

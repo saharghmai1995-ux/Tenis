@@ -970,11 +970,12 @@ function drawNews(P: Painter, req: PosterRequest): void {
   const nw = req.news;
   if (!nw) return;
 
-  // BREAKING tag
+  // LIVE TENNIS tag
   P.ctx.fillStyle = "rgba(255,93,93,0.18)";
   P.ctx.fillRect(24, 100, 240, 56);
   drawPixelBorder(P.ctx, 24, 100, 240, 56, RED);
-  P.text("BREAKING", 144, 137, fMono(26), CREAM, "center");
+  P.text("LIVE", 74, 137, fMono(26), CREAM, "center");
+  P.text("TENNIS", 170, 137, fMono(26), RED, "center");
   if (nw.tag) {
     P.chip(nw.tag, 284, 110, { font: fMono(19), fg: GOLD, border: GOLD, bg: "rgba(255,209,102,0.08)", h: 38, padX: 14 });
   }
@@ -984,7 +985,7 @@ function drawNews(P: Painter, req: PosterRequest): void {
 
   // description
   const descY = headBottom + 44;
-  const descBottom = P.wrapped(nw.description, 24, descY, w - 48, fMono(21, "normal"), GREY, 33, 6);
+  const descBottom = P.wrapped(nw.description, 24, descY, w - 48, fMono(21, "normal"), GREY, 33, 5);
 
   // source chip + date
   const srcY = descBottom + 34;
@@ -993,16 +994,66 @@ function drawNews(P: Painter, req: PosterRequest): void {
     P.text(nw.published, w - 24, srcY + 27, fMono(18, "normal"), GREY, "right");
   }
 
-  // soccer art zone
-  const artY = srcY + 90;
-  P.ctx.globalAlpha = 0.5;
-  drawSprite(ctx, SPRITES.GOAL, w / 2 - 192, artY, 24);
-  P.ctx.globalAlpha = 1;
-  drawSprite(ctx, SPRITES.SOCCERBALL, w / 2 - 40, artY + 180, 9);
-  P.ctx.globalAlpha = 0.95;
-  drawSprite(ctx, SPRITES.WHISTLE, 170, artY + 230, 6);
-  drawSprite(ctx, SPRITES.STAR, 830, artY + 150, 3);
-  drawSprite(ctx, SPRITES.STAR, 900, artY + 260, 2);
+  // ── LIVE SCOREBOARD panel ────────────────────────────────────────────────
+  const liveRows = (nw.live ?? []).slice(0, 4);
+  const sbY = srcY + 96;
+  const rowH = 46;
+  const sbH = 78 + Math.max(1, liveRows.length) * rowH;
+  P.panel(24, sbY, w - 48, sbH, PANEL);
+  drawPixelBorder(P.ctx, 24, sbY, w - 48, sbH, CYAN);
+  P.text("LIVE SCOREBOARD", 64, sbY + 42, fMono(21), CYAN);
+  drawSprite(ctx, SPRITES.PULSE, w - 130, sbY + 22, 4);
+  if (liveRows.length === 0) {
+    P.text("NO MATCHES ON COURT RIGHT NOW - WATCH FOR UPDATES", 64, sbY + 86, fMono(19, "normal"), GREY);
+  }
+  liveRows.forEach((r, i) => {
+    const ry = sbY + 78 + i * rowH;
+    const lamp = r.state === "LIVE" ? RED : r.state === "UPCOMING" ? GOLD : GREEN;
+    P.ctx.fillStyle = lamp;
+    P.ctx.fillRect(52, ry - 13, 12, 12);
+    if (r.state === "LIVE") {
+      P.ctx.fillStyle = "rgba(255,93,93,0.35)";
+      P.ctx.fillRect(48, ry - 17, 20, 20);
+    }
+    P.text(P.fit(r.label, 560, fMono(20, "normal")), 78, ry, fMono(20, "normal"), CREAM);
+    P.text(P.fit(r.value, 380, fMono(20, "normal")), w - 60, ry, fMono(20), lamp, "right");
+    if (i < liveRows.length - 1) {
+      P.ctx.fillStyle = "rgba(255,255,255,0.06)";
+      P.ctx.fillRect(52, ry + 16, w - 110, 2);
+    }
+  });
+
+  // ── FITNESS WATCH panel ──────────────────────────────────────────────────
+  const fitRows = (nw.fitness ?? []).slice(0, 3);
+  const fwY = sbY + sbH + 34;
+  const fRowH = 44;
+  const fwH = 74 + Math.max(1, fitRows.length) * fRowH;
+  P.panel(24, fwY, w - 48, fwH, PANEL);
+  drawPixelBorder(P.ctx, 24, fwY, w - 48, fwH, RED);
+  P.text("FITNESS WATCH", 112, fwY + 42, fMono(21), RED);
+  drawSprite(ctx, SPRITES.MEDKIT, 54, fwY + 20, 4);
+  if (fitRows.length === 0) {
+    P.text("NO FITNESS ALERTS IN THE CURRENT NEWS CYCLE", 104, fwY + 84, fMono(19, "normal"), GREY);
+  }
+  fitRows.forEach((r, i) => {
+    const ry = fwY + 84 + i * fRowH;
+    P.text(P.fit(r.label, 640, fMono(20, "normal")), 104, ry, fMono(20, "normal"), CREAM);
+    P.chipRight(r.tag, w - 60, ry - 22, { font: fMono(15), fg: GOLD, border: "#3d4654", bg: "rgba(255,209,102,0.07)", h: 30, padX: 10 });
+  });
+
+  // tennis art zone (tennis symbols per director spec)
+  const artY = fwY + fwH + 40;
+  const artRoom = P.h - artY - 150;
+  if (artRoom > 110) {
+    P.ctx.globalAlpha = 0.5;
+    drawSprite(ctx, SPRITES.RACKET, 120, artY, 9);
+    P.ctx.globalAlpha = 0.9;
+    drawSprite(ctx, SPRITES.BALL, w / 2 - 64, artY + 24, 8);
+    drawSprite(ctx, SPRITES.TV, w - 320, artY + 8, 6);
+    P.ctx.globalAlpha = 0.95;
+    drawSprite(ctx, SPRITES.STAR, 60, artY + 80, 3);
+    drawSprite(ctx, SPRITES.STAR, w - 90, artY + 110, 2);
+  }
   P.ctx.globalAlpha = 1;
 }
 
@@ -1343,13 +1394,13 @@ export function samplePoster(kind: PosterKind): PosterRequest {
           { label: "DAY: SUN", value: "+11.0" },
         ],
         rows: [
-          { label: "MON - 9 PICKS TENNIS + FOOTBALL", value: "+6.5U", status: "WIN" },
+          { label: "MON - 9 PICKS TENNIS ONLY", value: "+6.5U", status: "WIN" },
           { label: "TUE - 8 PICKS TENNIS ONLY", value: "-2.0U", status: "LOSS" },
-          { label: "WED - 11 PICKS ALL SPORTS", value: "+9.0U", status: "WIN" },
-          { label: "THU - 10 PICKS ALL SPORTS", value: "+3.5U", status: "WIN" },
-          { label: "FRI - 12 PICKS ALL SPORTS", value: "-1.5U", status: "LOSS" },
-          { label: "SAT - 11 PICKS ALL SPORTS", value: "+12.0U", status: "WIN" },
-          { label: "SUN - 10 PICKS ALL SPORTS", value: "+11.0U", status: "WIN" },
+          { label: "WED - 11 PICKS TENNIS ONLY", value: "+9.0U", status: "WIN" },
+          { label: "THU - 10 PICKS TENNIS ONLY", value: "+3.5U", status: "WIN" },
+          { label: "FRI - 12 PICKS TENNIS ONLY", value: "-1.5U", status: "LOSS" },
+          { label: "SAT - 11 PICKS TENNIS ONLY", value: "+12.0U", status: "WIN" },
+          { label: "SUN - 10 PICKS TENNIS ONLY", value: "+11.0U", status: "WIN" },
         ],
         hash: "D9A0B3C5E7",
         footerNote: "FULL HISTORY IN VIP PINNED POST",
@@ -1357,19 +1408,28 @@ export function samplePoster(kind: PosterKind): PosterRequest {
     case "NEWS":
       return {
         kind,
-        title: "FOOTBALL NEWSWIRE",
-        subtitle: "GLOBAL TRANSFER DESK",
-        theme: "FOOTBALL",
+        title: "TENNIS NEWSWIRE",
+        subtitle: "LIVE DESK - FITNESS RADAR",
+        theme: "LIVE",
         stage: "ST 06-07",
         news: {
-          tag: "TRANSFER",
-          headline: "REAL MADRID SIGN BRAZILIAN WONDERKID IN 95M EURO DEAL",
+          tag: "ATP",
+          headline: "SINNER OVERRUNS ZVEREV TO CLINCH A SPOT IN THE ATP FINALS SHOWDOWN",
           description:
-            "REAL MADRID HAVE COMPLETED THE SIGNING OF THE 18-YEAR-OLD BRAZILIAN SENSATION ON A SIX-YEAR CONTRACT. THE DEAL MAKES HIM THE MOST EXPENSIVE TEENAGER IN CLUB HISTORY. HE JOINS PRE-SEASON TRAINING NEXT WEEK AND IS EXPECTED TO COMPETE FOR A STARTING SPOT IMMEDIATELY.",
+            "JANNIK SINNER CLOSED THE ROUND-ROBIN STAGE WITH A STRAIGHT-SETS WIN OVER ALEXANDER ZVEREV, 6-4 6-3. THE SERVE HELD AT 78% FIRST-SERVE POINTS AND THE RETURN GAME BROKE THREE TIMES. ZVEREV MUST NOW WAIT FOR THE SECOND COURT TO DECIDE HIS SEMIFINAL FAITH.",
           source: "ESPN",
-          published: "JUL 06 2025 - 09:42",
+          published: "NOV 12 2026 - 21:42",
+          live: [
+            { label: "ALCARAZ v RUNE - ATP FINALS", value: "6-3 4-6 3-2 - SET 3", state: "LIVE" },
+            { label: "SINNER v ZVEREV - ATP FINALS", value: "6-4 6-3 - FINAL", state: "FINAL" },
+            { label: "SWIATEK v GAAF - WTA FINALS", value: "SCHEDULED 19:30", state: "UPCOMING" },
+          ],
+          fitness: [
+            { label: "ALCARAZ PASSES FITNESS TEST ON ANKLE AHEAD OF SEMIFINAL", tag: "FITNESS" },
+            { label: "MEDVEDEV WITHDRAWS FROM STOCKHOLM OPEN WITH SHOULDER STRAIN", tag: "WITHDRAWAL" },
+          ],
         },
-        footerNote: "MORE AT ESPN.COM",
+        footerNote: "MORE AT ESPN.COM/TENNIS",
       };
     case "ACADEMY":
       return {

@@ -25,7 +25,10 @@ if git push origin main >/dev/null 2>&1; then
   exit 0
 fi
 
-# anonymous push failed — try embedded credentials if present in env
+# anonymous push failed — try token from env or scripts/.gh-token (gitignored)
+if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" && -f /home/z/my-project/scripts/.gh-token ]]; then
+  GH_TOKEN="$(cat /home/z/my-project/scripts/.gh-token)"
+fi
 if [[ -n "${GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" ]]; then
   TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
   git remote set-url origin "https://${TOKEN}@github.com/saharghmai1995-ux/Tenis.git"

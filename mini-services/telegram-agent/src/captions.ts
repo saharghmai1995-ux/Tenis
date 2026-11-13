@@ -11,18 +11,18 @@ import { ACADEMY } from "./academy";
 import { LEG_DETAIL_EN } from "./data";
 import type { CardMatch } from "./data";
 import type { SettledRow } from "./data";
-import type { SoccerNewsItem } from "./espn";
+import type { TennisNewsItem, LiveTennisMatch, FitnessItem } from "./espn";
 
 const fa = (n: number): string => n.toLocaleString("fa-IR");
 const faOdds = (n: number): string => n.toFixed(2).replace(/[0-9]/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[+d]);
 
 // ─── LLM Persian translation ───────────────────────────────────────────────
 
-const TRANSLATE_SYSTEM = `تو مترجم حرفه‌ای خبر ورزشی برای کانال فارسی‌زبان هستی. متن انگلیسی خبر فوتبال را به فارسی روان، دقیق و کامل ترجمه کن.
+const TRANSLATE_SYSTEM = `تو مترجم حرفه‌ای خبر ورزشی تنیس برای کانال فارسی‌زبان هستی. متن انگلیسی خبر تنیس را به فارسی روان، دقیق و کامل ترجمه کن.
 قوانین سخت:
-1) خروجی فقط فارسی باشد — حتی نام برندها و نهادها هم فارسی نوشته شوند: ESPN → ای‌اس‌پی‌ان، FIFA → فیفا، UEFA → یوفا، Premier League → لیگ برتر انگلیس. هیچ حرف انگلیسی/لاتین در خروجی ممنوع است.
-2) اسامی باشگاه‌ها، بازیکنان و مربیان به فارسیِ رایج برگردان: رئال مادرید، منچسترسیتی، لیورپول، بارسلونا، کریستیانو رونالدو...
-3) اعداد را با ارقام فارسی (۱۲۳) بنویس.
+1) خروجی فقط فارسی باشد — حتی نام برندها و نهادها هم فارسی نوشته شوند: ESPN → ای‌اس‌پی‌ان، ATP → اِی‌تی‌پی، WTA → دبلیو‌تی‌اِی، Grand Slam → گرند اسلم. هیچ حرف انگلیسی/لاتین در خروجی ممنوع است.
+2) اسامی بازیکنان تنیس به فارسیِ رایج برگردان: سینر، آلکاراس، دجوکوویچ، مدودف، زورف، سوئاتک، گاوف، ریباکینا، گاگن، تسیتسیپاس، رونی، دی‌مینار، فریتس، موررا...
+3) اعداد را با ارقام فارسی (۱۲۳) بنویس و امتیازها را مثل ۶-۴ ۶-۳ بنویس.
 4) ساختار خروجی دقیقاً این باشد:
 عنوان: <ترجمه عنوان>
 <ترجمه کامل متن خبر در یک یا دو پاراگراف روان>
@@ -33,12 +33,11 @@ const BRAND_FA: [RegExp, string][] = [
   [/ESPN/gi, "ای‌اس‌پی‌ان"],
   [/FIFA/gi, "فیفا"],
   [/UEFA/gi, "یوفا"],
-  [/AFC/gi, "اِی‌اف‌سی"],
-  [/CAF/gi, "کاف"],
-  [/CONMEBOL/gi, "کونمبول"],
-  [/F1|Formula 1/gi, "فرمول یک"],
   [/ATP/gi, "اِی‌تی‌پی"],
   [/WTA/gi, "دبلیو‌تی‌اِی"],
+  [/ITF/gi, "آی‌تی‌اف"],
+  [/Grand Slam/gi, "گرند اسلم"],
+  [/Wimbledon/gi, "ویمبلدون"],
   [/UCL/gi, "لیگ قهرمانان اروپا"],
 ];
 
@@ -64,6 +63,8 @@ export async function translateNewsToPersian(
     if (!m) throw new Error("translation format mismatch");
     let titleFa = m[1].trim();
     let bodyFa = m[2].trim() || titleFa;
+    // strip model artifacts: "متن خبر:" style labels at body start
+    bodyFa = bodyFa.replace(/^(متن\s*خبر|متن|body)\s*[:：]\s*/i, "").trim();
     // clean residual Latin brand tokens
     for (const [re, fa] of BRAND_FA) {
       titleFa = titleFa.replace(re, fa);
@@ -77,13 +78,13 @@ export async function translateNewsToPersian(
       titleFa =
         firstClause.length >= 15 && !/[A-Za-z]{2,}/.test(firstClause)
           ? firstClause.slice(0, 120)
-          : "خبر مهم فوتبال از ای‌اس‌پی‌ان";
+          : "خبر مهم تنیس از ای‌اس‌پی‌ان";
     }
     return { titleFa, bodyFa, ok: true };
   } catch (e) {
     console.error("[caption] translation fallback:", e instanceof Error ? e.message : e);
     return {
-      titleFa: "خبر مهم فوتبال از ESPN",
+      titleFa: "خبر مهم تنیس از ESPN",
       bodyFa:
         "ترجمه خودکار این خبر در این لحظه در دسترس نبود؛ پوستر انگلیسی خبر را در همین پست می‌بینید. ترجمه کامل فارسی در پست بعدی همان خبر ارائه می‌شود.",
       ok: false,
@@ -165,7 +166,8 @@ export function captionFreeCard(card: CardMatch): string {
 export function captionBriefing(
   cards: CardMatch[],
   vetoed: CardMatch[],
-  quota: { poolSize: number; approved: number; adaptive: number }
+  quota: { poolSize: number; approved: number; adaptive: number },
+  fitness: FitnessItem[] = []
 ): string {
   const top = cards.slice(0, 6);
   const lines: string[] = [
@@ -211,6 +213,14 @@ export function captionBriefing(
       lines.push(`⛔️ ${v.playerA} × ${v.playerB} — دلیل: ${v.vetoReasonFa ?? "خارج از دامنه مدل"}`)
     );
     lines.push("بازی‌های وتوشده به «دفتر سایه» می‌روند و هیچ کارتی از آن‌ها چاپ نمی‌شود.");
+  }
+  if (fitness.length > 0) {
+    lines.push("");
+    lines.push("🩺 وضعیت جسمانی بازیکنان کلیدی (رادار ESPN):");
+    for (const f of fitness.slice(0, 3)) {
+      lines.push(`• ${f.headline}`);
+    }
+    lines.push("قبل از ورود روی هر کارت، وضعیت بدنی بازیکن را از این ستون چک کنید؛ آسیب‌دیدگیِ اعلام‌شده = خروج فوری از کارت.");
   }
   return lines.join("\n") + FOOT;
 }
@@ -303,19 +313,56 @@ export function captionFtResults(
   return lines.join("\n") + FOOT;
 }
 
-export function captionNews(item: SoccerNewsItem, tr: { titleFa: string; bodyFa: string }): string {
-  return [
+export function captionNews(
+  item: TennisNewsItem,
+  tr: { titleFa: string; bodyFa: string },
+  live: LiveTennisMatch[] = [],
+  fitness: FitnessItem[] = []
+): string {
+  const lines: string[] = [
     BRAND,
-    "⚽️ خبرهای فوتبال — منبع ESPN",
+    "🎾 اخبار زنده تنیس — منبع ESPN",
     "",
     `📰 ${tr.titleFa}`,
     "",
     tr.bodyFa,
-    "",
-    `🏷 دسته: ${item.leagueFa}`,
-    "🌐 منبع اصلی: ESPN (پوستر انگلیسی خبر در همین پست)",
-    FOOT,
-  ].join("\n");
+  ];
+  const liveNow = live.filter((m) => m.state === "in").slice(0, 4);
+  const upcoming = live.filter((m) => m.state === "pre").slice(0, 3);
+  if (liveNow.length > 0 || upcoming.length > 0) {
+    lines.push("");
+    lines.push("📡 تابلوی زنده مسابقات:");
+    for (const m of liveNow) {
+      const score = m.scoreLine ? m.scoreLine.replace(/-/g, "-") : "";
+      lines.push(`🔴 ${m.playerA} در برابر ${m.playerB} — ${score ? score + " | " : ""}${m.detail}`);
+    }
+    for (const m of upcoming) {
+      lines.push(`⏳ پیش‌رو: ${m.playerA} در برابر ${m.playerB} — ${m.tournament}`);
+    }
+  } else {
+    lines.push("");
+    lines.push("📡 در این لحظه بازی‌ زنده‌ای روی نت نیست؛ به‌محض شروع مسابقات، تابلوی زنده در پست بعدی اعلام می‌شود.");
+  }
+  if (fitness.length > 0) {
+    lines.push("");
+    lines.push("🩺 رادار وضعیت جسمانی بازیکنان:");
+    const tagFa: Record<string, string> = {
+      INJURY: "آسیب‌دیدگی",
+      FITNESS: "آمادگی جسمانی",
+      WITHDRAWAL: "کناره‌گیری",
+      COMEBACK: "بازگشت",
+      RECOVERY: "بهبود و ریکاوری",
+    };
+    for (const f of fitness.slice(0, 3)) {
+      lines.push(`• [${tagFa[f.tag] ?? f.tag}] ${f.headline} — (ترجمه کوتاه در پست‌های بعدی)`);
+    }
+    lines.push("هر خبر مهمِ وضعیت جسمانی در همین ستون پایش و در پست‌های خبری ترجمه کامل می‌شود.");
+  }
+  lines.push("");
+  lines.push(`🏷 بخش: ${item.tourFa}`);
+  lines.push("🌐 منبع اصلی: ESPN Tennis (پوستر انگلیسی خبر در همین پست)");
+  lines.push(FOOT);
+  return lines.join("\n");
 }
 
 export function captionAcademy(lessonIndex: number): string {

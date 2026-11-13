@@ -9,7 +9,8 @@ import { store } from "./store";
 import { telegram } from "./telegram";
 import { dataHub, LEG_DETAIL_EN } from "./data";
 import type { CardMatch } from "./data";
-import { fetchFootballNews, type SoccerNewsItem } from "./espn";
+import { fetchTennisRadar, peekRadar, type TennisNewsItem, type LiveTennisMatch, type FitnessItem } from "./espn";
+import type { PosterLiveRow, PosterFitnessRow } from "./types";
 import { ACADEMY } from "./academy";
 import * as cap from "./captions";
 import { renderPoster } from "./poster/engine";
@@ -141,6 +142,11 @@ function isLive(): boolean {
   return CONFIG.live;
 }
 
+/** resolved VIP chat id: env first, then auto-discovered channel */
+function vipChatId(): string {
+  return CONFIG.vipChatId || store.kvGet("vipChatId") || "";
+}
+
 export function setLive(on: boolean): void {
   liveOverride = on;
   store.kvSet("live", on ? "1" : "0");
@@ -191,7 +197,7 @@ async function deliver(
     console.log(`[job:${jobId}] DRY-RUN ${kind} → ${target} (${Math.round(png.length / 1024)}KB)`);
     return { status: "DRY-RUN" };
   }
-  const chatId = target === "vip" ? CONFIG.vipChatId : CONFIG.publicChatId;
+  const chatId = target === "vip" ? vipChatId() : CONFIG.publicChatId;
   if (!chatId) {
     store.logPost({
       at: new Date().toISOString(),
@@ -372,22 +378,42 @@ function aggregateRequest(
   } as PosterRequest;
 }
 
-function newsRequest(item: SoccerNewsItem): PosterRequest {
+function newsRequest(
+  item: TennisNewsItem,
+  live: LiveTennisMatch[],
+  fitness: FitnessItem[]
+): PosterRequest {
+  const liveRows: PosterLiveRow[] = live.slice(0, 4).map((m) => ({
+    label: `${m.shortA ?? m.playerA} v ${m.shortB ?? m.playerB} - ${m.tournament}`.slice(0, 42),
+    value:
+      m.state === "in"
+        ? `${m.scoreLine || "LIVE"} - ${m.detail}`.slice(0, 34)
+        : m.state === "pre"
+          ? `SCHEDULED - ${m.detail}`.slice(0, 34)
+          : `${m.scoreLine || "FT"} - ${m.detail}`.slice(0, 34),
+    state: m.state === "in" ? ("LIVE" as const) : m.state === "pre" ? ("UPCOMING" as const) : ("FINAL" as const),
+  }));
+  const fitRows: PosterFitnessRow[] = fitness.slice(0, 3).map((f) => ({
+    label: f.headline.toUpperCase(),
+    tag: f.tag,
+  }));
   return {
     kind: "NEWS",
-    title: "FOOTBALL NEWSWIRE",
-    theme: "FOOTBALL",
+    title: "TENNIS NEWSWIRE",
+    theme: "LIVE",
     news: {
-      headline: item.headline,
-      description: item.description,
+      headline: item.headline.toUpperCase(),
+      description: item.description.toUpperCase(),
       source: "ESPN",
       published: item.published
         ? new Date(item.published).toLocaleDateString("en-GB", { timeZone: TZ })
         : undefined,
-      tag: item.league,
+      tag: item.tour,
+      live: liveRows,
+      fitness: fitRows,
     },
     stage: stageLabel(),
-    footerNote: "MORE AT ESPN.COM",
+    footerNote: "MORE AT ESPN.COM/TENNIS",
   } as PosterRequest;
 }
 
@@ -454,8 +480,10 @@ const handlers: Record<JobId, Handler> = {
     const vetoed = vetoedRowsOf(dataHub.cards());
     if (approved.length === 0 && vetoed.length === 0) return { status: "SKIPPED", error: "no cards today" };
     const quota = { ...dataHub.quota(), adaptive: dataHub.cards().filter((c) => c.adaptive).length };
+    // fitness radar feeds the morning discipline block too
+    const radar = await fetchTennisRadar().catch(() => null);
     const png = await render(briefingRequest(approved, vetoed, quota));
-    const caption = cap.captionBriefing(approved, vetoed, quota);
+    const caption = cap.captionBriefing(approved, vetoed, quota, radar?.fitness ?? []);
     return deliver("vip_briefing", "vip", "BRIEFING", caption, png);
   },
 
@@ -493,18 +521,18 @@ const handlers: Record<JobId, Handler> = {
     const png = await render(aggregateRequest("WEEKLY REPORT - 7 DAY LEDGER", "WEEKLY", stats, rows));
     const caption = cap.captionWeekly(stats, rows);
     const out1 = await deliver("weekly_report", "public", "WEEKLY", caption, png);
-    if (CONFIG.vipChatId) {
+    if (vipChatId()) {
       const out2 = await deliver("weekly_report", "vip", "WEEKLY", caption, png);
       return out1.status === "SENT" || out2.status === "SENT" ? out1 : out2;
     }
     return out1;
   },
 
-  async espn_news_am() {
-    return postNews("espn_news_am");
+  async tennis_news_am() {
+    return postNews("tennis_news_am");
   },
-  async espn_news_pm() {
-    return postNews("espn_news_pm");
+  async tennis_news_pm() {
+    return postNews("tennis_news_pm");
   },
 
   async academy_am() {
@@ -559,13 +587,13 @@ const handlers: Record<JobId, Handler> = {
 };
 
 async function postNews(jobId: JobId): Promise<PostOutcome> {
-  const items = await fetchFootballNews();
-  const fresh = items.find((i) => !store.hasNews(i.id));
-  if (!fresh) return { status: "SKIPPED", error: "no fresh news" };
-  store.markNews(fresh.id);
+  const radar = await fetchTennisRadar();
+  const fresh = radar.news.find((i) => !store.hasNews(i.id)) ?? radar.news[0];
+  if (!fresh) return { status: "SKIPPED", error: "no tennis news available" };
+  if (!store.hasNews(fresh.id)) store.markNews(fresh.id);
   const tr = await cap.translateNewsToPersian(fresh.headline, fresh.description);
-  const png = await render(newsRequest(fresh));
-  const caption = cap.captionNews(fresh, tr);
+  const png = await render(newsRequest(fresh, radar.live, radar.fitness));
+  const caption = cap.captionNews(fresh, tr, radar.live, radar.fitness);
   return deliver(jobId, "public", "NEWS", caption, png);
 }
 
@@ -636,12 +664,46 @@ export function startScheduler(): void {
   setInterval(() => {
     void ensureWarm();
   }, 5 * 60_000);
+  // tennis radar keep-warm (news/live/fitness cache stays hot)
+  setInterval(() => {
+    void fetchTennisRadar().catch(() => null);
+  }, 4 * 60_000);
+  // VIP channel auto-discovery — the moment the bot becomes admin of (or
+  // receives any update from) the VIP channel, its numeric id is captured.
+  setInterval(() => {
+    void discoverVipLoop();
+  }, 30_000);
   console.log(
     `[scheduler] started - ${JOB_SPECS.length} jobs - live=${isLive()} - tz=${TZ}`
   );
   for (const job of JOB_SPECS) {
     const next = nextRunAt.get(job.id);
     console.log(`[scheduler] ${job.id.padEnd(18)} next=${next ? new Date(next).toISOString() : "-"}`);
+  }
+  void discoverVipLoop();
+}
+
+/** capture the VIP channel id from any chat the bot can see */
+async function discoverVipLoop(): Promise<void> {
+  try {
+    const chats = await telegram.discoverChats();
+    for (const ch of chats) {
+      const isPublic = !!ch.username && CONFIG.publicChatId.includes(ch.username);
+      const isChannelish = ch.type === "channel" || ch.type === "supergroup";
+      if (isChannelish && ch.id) {
+        store.kvSet(`chatSeen:${ch.id}`, JSON.stringify(ch));
+      }
+      if (isChannelish && !isPublic && ch.id) {
+        const idStr = String(ch.id);
+        if (vipChatId() !== idStr) {
+          store.kvSet("vipChatId", idStr);
+          store.kvSet("vipChatTitle", ch.title ?? "");
+          console.log(`[discover] VIP chat captured: ${idStr} (${ch.title ?? ch.type})`);
+        }
+      }
+    }
+  } catch {
+    /* discovery is best-effort */
   }
 }
 
@@ -670,10 +732,11 @@ export function status(): AgentStatus {
     } as JobSpec & JobRunState;
   });
   const f = dataHub.getFeed();
+  const radar = peekRadar();
   return {
     ok: true,
     bot: { username: "Aineobet_bot", live: isLive() },
-    chats: { public: CONFIG.publicChatId, vip: CONFIG.vipChatId || undefined },
+    chats: { public: CONFIG.publicChatId, vip: vipChatId() || undefined, vipTitle: store.kvGet("vipChatTitle") || undefined },
     uptimeSeconds: Math.round((Date.now() - BOOT_AT) / 1000),
     jobs,
     recentPosts: store.recentPosts(20),
@@ -691,6 +754,12 @@ export function status(): AgentStatus {
       lastWarmAt: dataHub.lastAt,
       matches: f?.matches.length ?? 0,
       approved: dataHub.approvedPool().length,
+    },
+    radar: {
+      news: radar?.news.length ?? 0,
+      live: radar?.live.length ?? 0,
+      liveNow: radar?.live.filter((m) => m.state === "in").length ?? 0,
+      fitness: radar?.fitness.length ?? 0,
     },
   };
 }

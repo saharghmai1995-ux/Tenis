@@ -38,16 +38,17 @@ export const CONFIG = loadConfig();
 // Tehran-anchored schedule table (Times are Asia/Tehran local):
 //   VIP     : briefing 10:00 · flashcards every 90s · aggregate 21:00
 //   Weekly  : Friday 22:00 (both channels)
-//   Public  : ESPN news 09:30 & 16:30 · academy 11:30 & 18:30 ·
-//             free card 10:30 · banner hourly :15 · FT results 20:00 ·
-//             nightly aggregate 23:00
+//   Public  : LIVE TENNIS news 09:30 & 16:30 (news + live board + fitness) ·
+//             academy 11:30 & 18:30 · free card 10:30 · banner hourly :15 ·
+//             FT results 20:00 · nightly aggregate 23:00
+// FOOTBALL NEWS: CANCELLED per director — replaced by live tennis + fitness.
 export const JOB_SPECS: JobSpec[] = [
   { id: "vip_briefing", label: "VIP Morning Briefing", labelFa: "بریفینگ صبح کانال VIP", cron: "0 0 10 * * *", target: "vip", enabled: true },
   { id: "flashcards", label: "VIP Flash Cards (every 90s)", labelFa: "فلش‌کارت‌های VIP (هر ۹۰ ثانیه)", everySeconds: 90, target: "vip", enabled: true },
   { id: "vip_aggregate", label: "VIP Daily Aggregate", labelFa: "برآیند روزانه VIP", cron: "0 0 21 * * *", target: "vip", enabled: true },
   { id: "weekly_report", label: "Weekly Report (Fri 22:00, both)", labelFa: "گزارش هفتگی (جمعه ۲۲:۰۰، هر دو کانال)", cron: "0 0 22 * * 5", target: "both", enabled: true },
-  { id: "espn_news_am", label: "ESPN Football News (09:30)", labelFa: "خبرهای فوتبال ESPN (۰۹:۳۰)", cron: "0 30 9 * * *", target: "public", enabled: true },
-  { id: "espn_news_pm", label: "ESPN Football News (16:30)", labelFa: "خبرهای فوتبال ESPN (۱۶:۳۰)", cron: "0 30 16 * * *", target: "public", enabled: true },
+  { id: "tennis_news_am", label: "Tennis Live News (09:30)", labelFa: "اخبار زنده تنیس + وضعیت جسمانی (۰۹:۳۰)", cron: "0 30 9 * * *", target: "public", enabled: true },
+  { id: "tennis_news_pm", label: "Tennis Live News (16:30)", labelFa: "اخبار زنده تنیس + وضعیت جسمانی (۱۶:۳۰)", cron: "0 30 16 * * *", target: "public", enabled: true },
   { id: "academy_am", label: "BET Academy Lesson (11:30)", labelFa: "آکادمی اصطلاحات BET (۱۱:۳۰)", cron: "0 30 11 * * *", target: "public", enabled: true },
   { id: "academy_pm", label: "BET Academy Lesson (18:30)", labelFa: "آکادمی اصطلاحات BET (۱۸:۳۰)", cron: "0 30 18 * * *", target: "public", enabled: true },
   { id: "free_card", label: "Free Card of the Day (10:30)", labelFa: "کارت رایگان روزانه (۱۰:۳۰)", cron: "0 30 10 * * *", target: "public", enabled: true },

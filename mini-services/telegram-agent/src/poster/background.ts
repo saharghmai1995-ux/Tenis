@@ -34,7 +34,7 @@ const THEME_SKY: Record<ThemeSurface, [string, string]> = {
   HARD: ["#12122a", "#05050d"],
   CLAY: ["#221016", "#0b0609"],
   GRASS: ["#0c1e14", "#050d09"],
-  FOOTBALL: ["#0b1e12", "#04100a"],
+  LIVE: ["#0e1322", "#04070d"],
   ACADEMY: ["#0a2016", "#03120b"],
   MARKETING: ["#220f1a", "#0c040e"],
   RESULTS: ["#121a24", "#050a0f"],
@@ -136,8 +136,8 @@ export function drawBackground(
     case "GRASS":
       drawCourt(ctx, rng, theme, w, h);
       break;
-    case "FOOTBALL":
-      drawFootball(ctx, rng, w, h);
+    case "LIVE":
+      drawLiveArena(ctx, rng, w, h);
       break;
     case "ACADEMY":
       drawAcademy(ctx, rng, w, h);
@@ -314,56 +314,71 @@ function drawCourt(
   ctx.globalAlpha = 1;
 }
 
-// ─── football pitch ─────────────────────────────────────────────────────────
+// ─── LIVE tennis broadcast arena (night studio) ───────────────────────────
 
-function drawFootball(ctx: SKRSContext2D, rng: Rng, w: number, h: number): void {
-  const pitchTop = h * 0.30;
-  const pitchBot = h * 0.90;
-  const stripeH = 78;
-  let i = 0;
-  for (let y = pitchTop; y < pitchBot; y += stripeH, i++) {
-    ctx.globalAlpha = 0.85;
-    ctx.fillStyle = i % 2 === 0 ? "#15582e" : "#1a6636";
-    ctx.fillRect(0, y, w, Math.min(stripeH, pitchBot - y));
-    ctx.globalAlpha = 1;
+function drawLiveArena(ctx: SKRSContext2D, rng: Rng, w: number, h: number): void {
+  // broadcast floor: faint center-court stripes (very low contrast)
+  const floorTop = h * 0.42;
+  for (let i = 0; i < 8; i++) {
+    ctx.globalAlpha = 0.14;
+    ctx.fillStyle = i % 2 === 0 ? "#1a2a44" : "#15223a";
+    ctx.fillRect(0, floorTop + i * ((h * 0.5) / 8), w, (h * 0.5) / 8);
   }
-  // markings
-  ctx.strokeStyle = "rgba(240,248,240,0.45)";
-  ctx.lineWidth = 5;
-  const midY = (pitchTop + pitchBot) / 2;
-  ctx.beginPath();
-  ctx.moveTo(40, pitchTop);
-  ctx.lineTo(w - 40, pitchTop);
-  ctx.moveTo(40, pitchBot);
-  ctx.lineTo(w - 40, pitchBot);
-  ctx.moveTo(40, midY);
-  ctx.lineTo(w - 40, midY);
-  ctx.stroke();
-  ctx.beginPath();
-  ctx.ellipse(w / 2, midY, 150, 88, 0, 0, Math.PI * 2);
-  ctx.stroke();
-  // penalty boxes
-  ctx.strokeRect(w / 2 - 300, pitchTop, 600, 120);
-  ctx.strokeRect(w / 2 - 300, pitchBot - 120, 600, 120);
+  ctx.globalAlpha = 1;
 
-  // GOAL sprite large at top center
-  ctx.globalAlpha = 0.55;
-  drawSprite(ctx, SPRITES.GOAL, w / 2 - 144, pitchTop - 60, 18);
-  // SOCCERBALLs
-  drawSprite(ctx, SPRITES.SOCCERBALL, w * 0.66, midY - 170, 11);
-  drawSprite(ctx, SPRITES.SOCCERBALL, w * 0.24, midY + 130, 6);
-
-  // corner flags
-  const flag = (x: number, y: number): void => {
-    ctx.fillStyle = "#e8eef2";
-    ctx.fillRect(x, y - 54, 4, 54);
+  // giant LED wall band with pixel "LIVE" ticker blocks
+  const ledY = h * 0.235;
+  ctx.globalAlpha = 0.5;
+  ctx.fillStyle = "#070b16";
+  ctx.fillRect(60, ledY, w - 120, 74);
+  for (let x = 60; x < w - 60; x += 18) {
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = rng.chance(0.72) ? "#123a5c" : "#0a1a30";
+    ctx.fillRect(x, ledY + 6, 12, 62);
+  }
+  // glowing LIVE dots across the LED wall
+  for (let i = 0; i < 3; i++) {
+    const bx = 120 + i * ((w - 240) / 3);
+    ctx.globalAlpha = 0.75;
     ctx.fillStyle = "#ff5d5d";
-    ctx.fillRect(x + 4, y - 54, 22, 14);
-  };
-  flag(44, pitchTop + 2);
-  flag(w - 48, pitchTop + 2);
-  flag(44, pitchBot - 2);
-  flag(w - 48, pitchBot - 2);
+    ctx.fillRect(bx, ledY + 26, 26, 10);
+    ctx.fillRect(bx + 36, ledY + 26, 62, 10);
+  }
+  ctx.globalAlpha = 1;
+
+  // broadcast camera silhouette left + giant TV right
+  ctx.globalAlpha = 0.4;
+  drawSprite(ctx, SPRITES.TV, w / 2 - 120, h * 0.60, 14);
+  ctx.globalAlpha = 0.3;
+  drawSprite(ctx, SPRITES.PULSE, 90, h * 0.56, 12);
+  drawSprite(ctx, SPRITES.PULSE, w - 300, h * 0.36, 10);
+  ctx.globalAlpha = 1;
+
+  // giant BALL + RACKET flanking (tennis symbols per director spec)
+  ctx.globalAlpha = 0.18;
+  drawSprite(ctx, SPRITES.BALL, 26, h * 0.44, 17);
+  drawSprite(ctx, SPRITES.RACKET, w - 280, h * 0.42, 17);
+  ctx.globalAlpha = 1;
+
+  // service-line pixels + net band hint on the floor
+  ctx.globalAlpha = 0.28;
+  ctx.strokeStyle = "#4dd6ff";
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(w * 0.14, h * 0.86);
+  ctx.lineTo(w * 0.86, h * 0.86);
+  ctx.stroke();
+  const net = SPRITES.NET;
+  for (let x = w * 0.18; x < w * 0.8; x += net.w * 4) {
+    drawSprite(ctx, net, x, h * 0.70, 4, { p: "#2c384c", t: "#3c4a60", s: "#31405a" });
+  }
+  ctx.globalAlpha = 1;
+
+  // scattered star sparkles
+  for (let i = 0; i < 6; i++) {
+    ctx.globalAlpha = rng.range(0.18, 0.4);
+    drawSprite(ctx, SPRITES.STAR, rng.int(30, w - 60), rng.int(120, h - 220), rng.int(2, 3));
+  }
   ctx.globalAlpha = 1;
 }
 
