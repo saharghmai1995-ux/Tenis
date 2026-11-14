@@ -274,15 +274,14 @@ function timingEn(code?: string, label?: string): string {
   return "TIMING LOCKED";
 }
 
-// ─── flashcard anti-repeat engine (director fix: no more duplicate cards) ──
-// Every match rests at least FLASH_MIN_REPEAT_MS between posts, carries a
-// daily post cap, and rotates through 4 spotlight angles so consecutive
-// cards of the same match are never identical. When everything is resting
-// the job SKIPS instead of re-posting a duplicate.
+// ─── flashcard ONE-POST policy (director fix: هر بازی فقط یک‌بار ارسال شود) ─
+// Each approved match is posted EXACTLY ONCE per Tehran day. The 90s loop
+// exists only so a newly-appearing match gets its single card fast; a match
+// that already has its card is NEVER re-posted — no 6-minute repeat loops,
+// no angle rotations, no duplicate cards. When every pool match has its
+// card the job SKIPS instead of posting anything.
 
-export const FLASH_MIN_REPEAT_MS = 20 * 60_000; // 20 min per-match cooldown
-export const FLASH_MAX_PER_DAY = 12; // max posts per match per Tehran day
-const FLASH_ANGLES = ["FULL CARD", "VALUE SPOTLIGHT", "MARKET DEPTH", "MODEL X-RAY"] as const;
+export const FLASH_MAX_PER_DAY = 1; // hard cap: one post per match per Tehran day
 
 export interface FlashAngle {
   label: string;
@@ -291,65 +290,16 @@ export interface FlashAngle {
   insightFa: string;
 }
 
-const ANGLE_LABEL_FA: Record<(typeof FLASH_ANGLES)[number], string> = {
-  "FULL CARD": "کارت کامل",
-  "VALUE SPOTLIGHT": "کانون ارزش",
-  "MARKET DEPTH": "عمق بازار",
-  "MODEL X-RAY": "اشعه ایکس مدل",
-};
+const FULL_CARD_LABEL_FA = "کارت کامل";
 
-export function angleFor(card: CardMatch, rotation: number): FlashAngle {
-  const angle = FLASH_ANGLES[rotation % FLASH_ANGLES.length];
+export function angleFor(card: CardMatch, _rotation = 0): FlashAngle {
   const cov = Math.round((card.coverage ?? 0) * 100);
-  const favName = (card.favorite === "A" ? card.playerA : card.playerB).toUpperCase();
-  switch (angle) {
-    case "VALUE SPOTLIGHT": {
-      const slips = [card.slipA, card.slipB].filter((s): s is NonNullable<typeof s> => !!s);
-      const best = [...slips].sort((a, b) => (b.edge ?? -9) - (a.edge ?? -9))[0];
-      if (best && best.edge > 0.02) {
-        const wingEn = best === card.slipA ? "TYPE A" : "TYPE B";
-        const wingFa = best === card.slipA ? "تیپ A" : "تیپ B";
-        const edge = (best.edge * 100).toFixed(1);
-        return {
-          label: angle,
-          labelFa: ANGLE_LABEL_FA[angle],
-          insightEn: `${wingEn} CARRIES +${edge}% MODEL EDGE AT ODDS ${best.odds.toFixed(2)} - PRICE ABOVE FAIR VALUE.`,
-          insightFa: `${wingFa} دارای ٪${edge} ارزش مدل با ضریب ${best.odds.toFixed(2)} است؛ قیمت بالاتر از ارزش منصفانه بازار.`,
-        };
-      }
-      return {
-        label: angle,
-        labelFa: ANGLE_LABEL_FA[angle],
-        insightEn: "NO OVERPRICED WINDOW RIGHT NOW - BOTH WINGS TRADE NEAR FAIR VALUE. DISCIPLINE STAKES ONLY.",
-        insightFa: "در این لحظه شانه خالی کردن بازار دیده نمی‌شود؛ هر دو تیپ نزدیک ارزش منصفانه‌اند و فقط استیک انضباطی توصیه می‌شود.",
-      };
-    }
-    case "MARKET DEPTH": {
-      const timing = timingEn(card.timingCode, card.timingLabel);
-      return {
-        label: angle,
-        labelFa: ANGLE_LABEL_FA[angle],
-        insightEn: `ARCHETYPE ${card.archLabelEn?.toUpperCase() ?? "SUPERVISED PATTERN"} DETECTED - OFFICIAL ENTRY WINDOW ${timing}. NO LATE MOVES.`,
-        insightFa: "الگوی بازی از دروازه‌های سوپروایزر عبور کرده است؛ پنجره رسمی ورود همان تایمینگ اعلام‌شده است و ورود خارج از پنجره ممنوع.",
-      };
-    }
-    case "MODEL X-RAY": {
-      const p = Math.round((card.favWinProb ?? 0.5) * 100);
-      return {
-        label: angle,
-        labelFa: ANGLE_LABEL_FA[angle],
-        insightEn: `MODEL X-RAY: ${favName} WINS ${p}% OF SIMULATED PATHS - MARKET AND SURFACE RATING FUSED AT 65/35.`,
-        insightFa: `بر اساس شبیه‌سازی مدل، ${favName} در ٪${p} از مسیرهای ممکن برنده است؛ ترکیب ۶۵/۳۵ بازار و ریتینگ سطح زمین.`,
-      };
-    }
-    default:
-      return {
-        label: "FULL CARD",
-        labelFa: ANGLE_LABEL_FA["FULL CARD"],
-        insightEn: `DUAL-WING STRUCTURE ONLINE - TYPE A + TYPE B TOGETHER COVER ${cov}% OF ALL POSSIBLE SCORE ROUTES.`,
-        insightFa: `ساختار دوپایی فعال است: ترکیب تیپ A و تیپ B حدود ٪${cov} از همه مسیرهای نتیجه بازی را پوشش می‌دهد.`,
-      };
-  }
+  return {
+    label: "FULL CARD",
+    labelFa: FULL_CARD_LABEL_FA,
+    insightEn: `DUAL-WING STRUCTURE ONLINE - TYPE A + TYPE B TOGETHER COVER ${cov}% OF ALL POSSIBLE SCORE ROUTES.`,
+    insightFa: `ساختار دوپایی فعال است: ترکیب تیپ A و تیپ B حدود ٪${cov} از همه مسیرهای نتیجه بازی را پوشش می‌دهد.`,
+  };
 }
 
 interface FlashHistEntry {
@@ -640,35 +590,28 @@ const handlers: Record<JobId, Handler> = {
     const pool = dataHub.approvedPool();
     if (pool.length === 0) return { status: "SKIPPED", error: "flash pool empty" };
     const hist = loadFlashHist(dateKey);
-    const now = Date.now();
-    const eligible = pool.filter((c) => {
-      const h = hist[c.eventKey];
-      if (!h) return true;
-      return now - h.at >= FLASH_MIN_REPEAT_MS && h.c < FLASH_MAX_PER_DAY;
-    });
+    // ONE-POST POLICY: a match is eligible only if it has NEVER been posted
+    // today — exactly one card per game, then it never repeats this day.
+    const eligible = pool.filter((c) => !hist[c.eventKey]);
     if (eligible.length === 0) {
       return {
         status: "SKIPPED",
-        error: `anti-repeat cooldown active - ${pool.length} match(es) resting`,
+        error: `one-post policy - all ${pool.length} match(es) already have their card today`,
       };
     }
-    // fewest posts today first (even rotation) → longest rest → best coverage
+    // soonest kick-off first → the most urgent match gets its single card first
     eligible.sort((a, b) => {
-      const ca = hist[a.eventKey]?.c ?? 0;
-      const cb = hist[b.eventKey]?.c ?? 0;
-      if (ca !== cb) return ca - cb;
-      const ta = hist[a.eventKey]?.at ?? 0;
-      const tb = hist[b.eventKey]?.at ?? 0;
+      const ta = a.startTime ? new Date(a.startTime).getTime() : Number.MAX_SAFE_INTEGER;
+      const tb = b.startTime ? new Date(b.startTime).getTime() : Number.MAX_SAFE_INTEGER;
       if (ta !== tb) return ta - tb;
       return (b.coverage ?? 0) - (a.coverage ?? 0);
     });
     const card = eligible[0];
-    const rotation = hist[card.eventKey]?.c ?? 0;
-    hist[card.eventKey] = { c: rotation + 1, at: now };
+    hist[card.eventKey] = { c: 1, at: Date.now() };
     saveFlashHist(dateKey, hist);
     store.kvSet("flashCursor", String(Object.values(hist).reduce((s, e) => s + e.c, 0)));
-    const angle = angleFor(card, rotation);
-    const png = await render(flashcardRequest(card, "FLASHCARD", angle, rotation + 1));
+    const angle = angleFor(card, 0);
+    const png = await render(flashcardRequest(card, "FLASHCARD", angle, 1));
     const caption = cap.captionFlashcard(card, !!card.adaptive, angle);
     return deliver("flashcards", "vip", "FLASHCARD", caption, png);
   },
@@ -915,12 +858,9 @@ export function status(): AgentStatus {
   const flashEntries = loadFlashHist(flashDateKey);
   const flashPool = dataHub.approvedPool();
   const postsToday = Object.values(flashEntries).reduce((s, e) => s + e.c, 0);
+  // one-post policy: "cooldownActive" = every pool match already has its card
   const cooldownActive =
-    flashPool.length > 0 &&
-    flashPool.every((c) => {
-      const h = flashEntries[c.eventKey];
-      return !!h && (Date.now() - h.at < FLASH_MIN_REPEAT_MS || h.c >= FLASH_MAX_PER_DAY);
-    });
+    flashPool.length > 0 && flashPool.every((c) => !!flashEntries[c.eventKey]);
   return {
     ok: true,
     bot: { username: meCached()?.username ?? "Neotenisbot", live: isLive() },
@@ -934,7 +874,7 @@ export function status(): AgentStatus {
       dateKey: flashDateKey,
       postsToday,
       cooldownActive,
-      cooldownMinutes: Math.round(FLASH_MIN_REPEAT_MS / 60_000),
+      cooldownMinutes: 0,
     },
     academy: {
       nextLesson: Number(store.kvGet("academyNext") ?? "1"),

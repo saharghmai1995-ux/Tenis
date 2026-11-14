@@ -243,7 +243,7 @@ export function SupervisorMonitor() {
               label: "فلش‌کارت امروز",
               value:
                 st.flashQueue.postsToday !== undefined
-                  ? `${st.flashQueue.postsToday} پست${st.flashQueue.cooldownActive ? " · استراحت ضدتکرار" : ""}`
+                  ? `${st.flashQueue.postsToday} کارت${st.flashQueue.cooldownActive ? " · هر بازی فقط یک‌بار" : ""}`
                   : `${st.flashQueue.cursor}/${st.flashQueue.total}`,
             },
             {
