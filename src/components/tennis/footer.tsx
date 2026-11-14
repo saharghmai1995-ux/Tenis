@@ -7,7 +7,7 @@ export function TennisFooter() {
     <footer className="mt-auto border-t border-white/10 bg-background/90 backdrop-blur-xl">
       <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-2 px-4 py-3">
         <p className="mono-num text-[10px] uppercase tracking-[0.22em] text-muted-foreground">
-          NEOBET TENNIS QUANT • @AINEOBET • SHA-256 LOCKED • v5.0
+          NEOBET TENNIS QUANT • @AINEOBET • SHA-256 LOCKED • v5.5
         </p>
         <p className="flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground">
           <span className="inline-flex items-center gap-1">

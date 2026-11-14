@@ -568,14 +568,18 @@ function gaussianCopulaCorr(x: number[], y: number[], pBinomial: number): number
   return Math.max(-1, Math.min(1, sxy / Math.sqrt(sxx * syy)));
 }
 
-// ─── v5.0 · Monte-Carlo Composite Score (0–100) ────────────────────────────
-/** Crown score shown on the telemetry bar: coverage × risk × sharpness blend. */
-export function monteCarloScore(mc: MonteCarloResult, pairLoss: number, sharpe: number): number {
-  const coverageScore = Math.max(0, Math.min(1, 1 - pairLoss / 0.25)); // 0..1
-  const entropyPenalty = mc.entropyNormalized; // lower entropy → higher score
-  const sharpeScore = Math.max(0, Math.min(1, sharpe / 0.6));
-  const concentration = Math.min(1, mc.topScenariosMass / 0.8);
-  const raw =
-    42 * coverageScore + 18 * (1 - entropyPenalty) + 26 * sharpeScore + 14 * concentration;
-  return Math.round(Math.max(0, Math.min(100, raw)));
+// ─── v5.5 · Monte-Carlo Success Score (0–100) ──────────────────────────────
+/**
+ * v5.5 — Monte-Carlo SUCCESS score (master prompt §3).
+ * BUG FIXED: the v5.0 formula printed a weighted telemetry blend that read as
+ * a FAILURE probability on the cards (MC 18/100, MC 19/100 for 88–94%
+ * favorites). The score IS the favorite's Monte-Carlo match-win probability:
+ *   score = Math.round(winProb × 100)   → MC 88/100 … MC 94/100
+ */
+export function monteCarloScore(mc: MonteCarloResult, favorite: "A" | "B"): number {
+  const winProb =
+    favorite === "A"
+      ? mc.outcomes.p20 + mc.outcomes.p21
+      : mc.outcomes.p12 + mc.outcomes.p02;
+  return Math.round(Math.max(0, Math.min(1, winProb)) * 100);
 }

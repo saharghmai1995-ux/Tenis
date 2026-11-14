@@ -101,6 +101,8 @@ export interface RegimeDecision {
   stakePlanFa?: string;
   /** simultaneous-loss probability of the routed position (crown gate) */
   pairLoss?: number;
+  /** v5.5 — Monte-Carlo/Copula joint coverage of the routed position (1 − pairLoss) */
+  coverage?: number;
   /** granted by the 65% adaptive quota → SILVER crown + half stakes */
   adaptive?: boolean;
   /** BANKER — primary leg price & probability */
@@ -348,6 +350,15 @@ export interface TimingInfo {
   optimal: boolean;
 }
 
+/** v5.5 — light Station-3 summary for legacy telemetry consumers
+ *  (banker-pool ranking + entropy stamp of the persisted row). */
+export interface McSummaryLite {
+  /** favorite-oriented match-win probability of the 10k copula Monte-Carlo */
+  bankerProb: number;
+  /** Shannon entropy of the 4 scorelines (nats) */
+  entropy: number;
+}
+
 export interface AnalyzedMatch extends EspnMatch {
   weather?: WeatherInfo;
   market?: MarketOdds;
@@ -365,6 +376,7 @@ export interface AnalyzedMatch extends EspnMatch {
   dbId?: string;
   // ─── v5.0 · Copula-Markov-MonteCarlo pipeline & 5-regime router ───────────
   copula?: CopulaTelemetry;        // STATION 2
+  mc?: McSummaryLite;              // STATION 3 light summary (legacy telemetry)
   monteCarlo?: MonteCarloResult;   // STATION 3 (authoritative distributions)
   regime?: RegimeDecision;         // STATION 4 routing decision
   crown?: CrownInfo;               // 👑 GOLD / 🥈 SILVER badge

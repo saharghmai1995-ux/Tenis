@@ -17,8 +17,9 @@ import { fetchPolymarketOdds, matchMarket } from "./polymarket";
 import { fetchCityWeather } from "./weather";
 import { bo3Outcomes, breakPointSavedProb, fullMarkov, matchWinProbA } from "./markov";
 import { removeMargin, reverseAnalysis } from "./solver";
-import { orientMonteCarlo, simulateMatch10000 } from "./montecarlo";
-import type { McSim } from "./montecarlo";
+// v5.5 — the ghost Station-3 twin (montecarlo.ts) is retired; the one
+// authoritative copula Monte-Carlo engine lives in ./copula (runMonteCarlo).
+import { deriveCopulaTelemetry, runMonteCarlo } from "./copula";
 import {
   buildSlips,
   dutchStakes,
@@ -32,12 +33,13 @@ import {
   routeRegimeAdaptive,
   assignCrown,
   finalizeRegimeScore,
+  forceRegimeRoute,
+  STANDARD_MATCH_STAKE,
 } from "./supervisor";
 import type { QuotaTelemetry } from "./supervisor";
-import { deriveCopulaTelemetry, runMonteCarlo } from "./copula";
 import { canonicalMatchString, sha256 } from "./hash";
 import { extractSettleableResult, runSettlement } from "./settlement";
-import { buildLedgerPayload } from "./ledger";
+import { buildLedgerPayload, normalizeStakeUnits } from "./ledger";
 import { dedupeByKey, matchContentKey } from "./dedupe";
 import type {
   AnalyzedMatch,
@@ -146,7 +148,7 @@ function lockHashOf(m: AnalyzedMatch): string | undefined {
     slipBOdds = m.slips.B.odds;
   } else if (m.regime && m.crown) {
     slipAText = m.regime.marketEn;
-    slipAOdds = m.regime.odds;
+    slipAOdds = m.regime.price ?? m.regime.prob;
     slipBText = m.regime.marketFa;
     slipBOdds = m.regime.prob;
   } else {
@@ -226,18 +228,19 @@ function timingOf(m: EspnMatch, favorite: "A" | "B"): TimingInfo {
 }
 
 /**
- * Full v5.0 analysis pipeline for a single match (works for pre / in / post):
+ * Full v5.5 analysis pipeline for a single match (works for pre / in / post):
  * Station 1 — market fusion (65% market + 35% surface Elo)
- * Station 2 — Gaussian copula dependency matrix (markov.ts)
- * Station 3 — 10,000 game-by-game Monte-Carlo (montecarlo.ts)
+ * Station 2 — Gaussian copula telemetry (markov.ts)
+ * Station 3 — 10,000 game-by-game copula Monte-Carlo (copula.runMonteCarlo).
  * Station 4 — 5-regime Sharpe router + crown tier + SHA-256 lock.
- * Returns the match AND the transient per-sim tuples (never serialized).
+ * v5.5 — returns the analyzed match only; the transient per-sim tuple map of
+ * the ghost twin is gone (nothing consumed it after the v5.0 router rework).
  */
 function analyzeMatch(
   m: EspnMatch,
   market: MarketOdds | undefined,
   weather?: WeatherInfo
-): { analyzed: AnalyzedMatch; sims: McSim[] } {
+): AnalyzedMatch {
   let marketProbA: number | undefined;
   let marketOddsA: number | undefined;
   let method: "shin" | "power" = "shin";
@@ -267,15 +270,6 @@ function analyzeMatch(
   const favorite: "A" | "B" = winA >= 0.5 ? "A" : "B";
   const favWinProb = favorite === "A" ? winA : 1 - winA;
 
-  // ── Station 3 — 10,000 game-by-game Monte-Carlo with copula coupling ──
-  const seed = nameHash32(m.eventKey.toLowerCase());
-  const oriented = orientMonteCarlo(
-    simulateMatch10000(mk.gA, mk.gB, mk.copula, seed),
-    favorite,
-    mk.copula
-  );
-  const { sims, ...mcSummary } = oriented;
-
   const am: AnalyzedMatch = {
     ...m,
     weather,
@@ -284,8 +278,6 @@ function analyzeMatch(
     markov: mk,
     favorite,
     favWinProb,
-    copula: mk.copula,
-    mc: mcSummary,
     veto: { vetoed: false, code: "NONE" },
     dualEligible: false,
     slips: {},
@@ -293,9 +285,21 @@ function analyzeMatch(
     copula: cop,
   };
 
-  // ── v5.0 STATION 3 — 10,000 game-by-game Monte Carlo ─────────────────────
+  // ── v5.5 STATION 3 — 10,000 game-by-game copula Monte-Carlo ─────────────
+  // BUG FIXED: the ghost v5.0 twin (montecarlo.ts simulateMatch10000) was
+  // called with `mk.copula` — a field fullMarkov NEVER produced — so EVERY
+  // match threw «Cannot read properties of undefined (reading 'rhoSet')» and
+  // the whole analyzed pool was silently dropped (empty lines, empty cards).
+  // The one authoritative Station-3 engine is copula.runMonteCarlo; the light
+  // summary below feeds the legacy telemetry consumers (banker-pool ranking,
+  // rowOf entropy stamp).
   const mc = runMonteCarlo(rev.pFinalA, rev.pFinalB, cop, favorite);
   am.monteCarlo = mc;
+  const pFavWinMc =
+    favorite === "A"
+      ? mc.outcomes.p20 + mc.outcomes.p21
+      : mc.outcomes.p12 + mc.outcomes.p02;
+  am.mc = { bankerProb: pFavWinMc, entropy: mc.entropy };
 
   const archReport = evaluateArchetypes(am);
   am.archEvals = archReport.evals;
@@ -325,9 +329,17 @@ function analyzeMatch(
   am.regime = finalizeRegimeScore(
     route.decision,
     mc,
-    route.selected?.pairLoss ?? 1 - favWinProb
+    favorite
   );
   am.dualEligible = !am.veto.vetoed && am.regime.code === "DUAL-HEDGE" && !!am.slips.A;
+  // ── v5.5 — crown badge assigned at the analysis source (history matches
+  // included): GOLD when the Monte-Carlo SUCCESS percentage lands ≥ 85/100.
+  am.crown = assignCrown(
+    !!am.regime.adaptive,
+    am.regime.pairLoss ?? 1 - favWinProb,
+    am.regime.sharpe,
+    am.regime.mcScore
+  );
   am.pipeline = {
     station1Markov: {
       ok: true,
@@ -343,13 +355,18 @@ function analyzeMatch(
     station3MonteCarlo: { ok: true, label: "10k Monte-Carlo", runs: mc.runs },
     station4Supervisor: {
       ok: am.regime.code !== "VETOED",
-      label: "Supervisor Crown",
+      label:
+        am.crown.tier === "GOLD"
+          ? "GOLD CROWN"
+          : am.crown.tier === "SILVER"
+            ? "SILVER CROWN"
+            : "Approved",
       score: am.regime.mcScore,
     },
   };
   am.timing = timingOf(m, favorite);
   am.hashPre = lockHashOf(am);
-  return { analyzed: am, sims };
+  return am;
 }
 
 export async function buildFeed(force = false): Promise<FeedPayload> {
@@ -421,18 +438,15 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
         )
       : new Map<string, MarketOdds>();
 
-    // ── per-match analysis (unified v5.0 path for pre / in / post) ────────
-    // 4-station pipeline per match; raw 10k MC tuples stay in a transient map
+    // ── per-match analysis (unified v5.5 path for pre / in / post) ────────
+    // 4-station pipeline per match — no transient tuple map anymore
     const analyzed: AnalyzedMatch[] = [];
-    const simsByEvent = new Map<string, McSim[]>();
     for (const m of unique) {
       try {
         const key = `${m.playerA.name}__${m.playerB.name}`;
         const market = m.state === "post" ? undefined : marketMap.get(key);
         const weather = m.city ? weatherByCity.get(m.city.toLowerCase()) : undefined;
-        const { analyzed: am, sims } = analyzeMatch(m, market, weather);
-        analyzed.push(am);
-        simsByEvent.set(m.eventKey, sims);
+        analyzed.push(analyzeMatch(m, market, weather));
       } catch (e) {
         console.error("[engine] analysis failed", m.eventKey, e);
       }
@@ -440,31 +454,16 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
 
     // ── v5.0 · guaranteed 65% supervisor approval quota (regime edition) ──
     // Natural 5-regime approvals count first; remaining slots are granted the
-    // least-risk regime adaptively (🥈 SILVER crown · half stakes) until
+    // least-risk regime adaptively (🥈 SILVER crown · FULL 100u stake) until
     // ≥ 65% of today's main-tour card (min 12) is approved.
     const quota = enforceApprovalQuotaV5(analyzed);
+    // ── v5.5 · 5-REGIME DISTRIBUTION ALLOCATOR (master prompt §2) ──────────
+    // The approved pool must populate ALL 5 regimes — under-filled regimes
+    // are topped up by re-routing the best-fit champion-pair matches.
+    allocateFiveRegimes(analyzed);
     // adaptive approvals received fresh slips → recompute the SHA-256 lock
     for (const m of analyzed) {
       if (m.regime) m.hashPre = lockHashOf(m);
-    }
-    // v5.0 crown badges — 👑 GOLD for natural low-risk/high-Sharpe positions,
-    // 🥈 SILVER for adaptive quota grants, none for standard approvals
-    for (const m of analyzed) {
-      if (m.state === "post" || !m.regime || m.regime.code === "VETOED" || m.veto.vetoed) continue;
-      const pairLoss = m.regime.pairLoss ?? 1 - m.favWinProb;
-      m.crown = assignCrown(
-        !!m.regime.adaptive,
-        pairLoss,
-        m.regime.sharpe,
-        m.regime.mcScore
-      );
-      if (m.pipeline) {
-        m.pipeline.station4Supervisor = {
-          ok: true,
-          label: m.crown.tier === "GOLD" ? "GOLD CROWN" : m.crown.tier === "SILVER" ? "SILVER CROWN" : "Approved",
-          score: m.regime.mcScore,
-        };
-      }
     }
 
     // ── v2.0 · 7-day historical auto-settlement ────────────────────────────
@@ -476,6 +475,9 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
 
     // ── persist → build lines → persist picks → settle → ledger
     await persistMatches(analyzed);
+    // ── v5.5 — the 100-unit stake law: rewrite every 1u/2u/50u/60u legacy
+    // stake in the database so NO ledger row can ever break the standard.
+    await normalizeStakeUnits();
     const lines = buildLines(analyzed);
     const settledItems = [
       ...lines.dual,
@@ -573,7 +575,8 @@ export function enforceApprovalQuotaV5(analyzed: AnalyzedMatch[]): QuotaTelemetr
 
     for (const m of candidates) {
       const { decision, pairLoss } = routeRegimeAdaptive(m, m.monteCarlo!);
-      m.regime = finalizeRegimeScore(decision, m.monteCarlo!, pairLoss);
+      m.regime = finalizeRegimeScore(decision, m.monteCarlo!, m.favorite);
+      m.crown = assignCrown(true, pairLoss, m.regime.sharpe, m.regime.mcScore);
       m.veto = { vetoed: false, code: "NONE" };
       // DUAL-HEDGE adaptive grants ride the official ARCH1 atomic slips
       if (decision.code === "DUAL-HEDGE") {
@@ -599,7 +602,96 @@ export function enforceApprovalQuotaV5(analyzed: AnalyzedMatch[]): QuotaTelemetr
   return telemetry;
 }
 
+// ─── v5.5 · 5-Regime Distribution Allocator (master prompt §2) ──────────────
+// The natural max-Sharpe router concentrates almost the whole approved pool
+// on the champion DUAL-HEDGE pair, which starves the 4 other regime rows of
+// the «دفترکل افرازی ۵ رژیم» table (they showed 0 (0) | +0.0). The allocator
+// enforces the master-prompt distribution law: every regime must hold its
+// share of ACTIVE cards (today) and SETTLED cards (7-day history) —
+//   ⚖️ زوج‌تیپ طلایی مکمل · 🏦 بانکر امن سرویس (S_A ≥ 0.70) ·
+//   🧩 کمبوی کاپولا + پوشش · 🎯 خوشه نتیجه دقیق · 🔗 آکومولاتور (line-level)
+// The best-fit matches for an under-filled regime are re-routed from the
+// DUAL-HEDGE surplus (fit = regime-specific Monte-Carlo/Copula feature):
+//   BANKER  → highest S_fav favorites        (service dominators)
+//   COMBO   → highest fav×games copula mass  (dominant-favorite games lines)
+//   CLUSTER → highest top-3 scenario mass    (low-entropy exact matches)
+// Each match still carries EXACTLY ONE regime card; nothing is double-counted.
+const REGIME_MIN_CARDS = 3; // minimum active cards per regime (5-regime law)
+
+function allocateFiveRegimes(analyzed: AnalyzedMatch[], includePost = false): void {
+  const pool = analyzed.filter(
+    (m) =>
+      (includePost || m.state !== "post") &&
+      !m.veto.vetoed &&
+      !!m.monteCarlo &&
+      !!m.regime &&
+      m.regime.code !== "VETOED"
+  );
+  // v5.5 — even a small approved card must be distributed (a 4-match late-day
+  // pool still fills 1 banker + 1 combo + 1 cluster from the dual surplus)
+  if (pool.length < 2) return;
+
+  const counts: Record<string, number> = {
+    BANKER: 0,
+    COMBO: 0,
+    CLUSTER: 0,
+    "DUAL-HEDGE": 0,
+  };
+  for (const m of pool) counts[m.regime!.code] = (counts[m.regime!.code] ?? 0) + 1;
+  const minPer = Math.max(1, Math.min(REGIME_MIN_CARDS, Math.floor(pool.length / 3)));
+
+  const fill = (code: "BANKER" | "COMBO" | "CLUSTER", fitOf: (m: AnalyzedMatch) => number) => {
+    const need = Math.max(0, minPer - (counts[code] ?? 0));
+    if (need <= 0) return;
+    // never strip the champion pair below its own minimum share
+    const maxTake = Math.max(0, (counts["DUAL-HEDGE"] ?? 0) - minPer);
+    const take = Math.min(need, maxTake);
+    if (take <= 0) return;
+    const cands = pool
+      .filter((m) => m.regime!.code === "DUAL-HEDGE")
+      .sort((a, b) => fitOf(b) - fitOf(a))
+      .slice(0, take);
+    for (const m of cands) {
+      const forced = forceRegimeRoute(m, m.monteCarlo!, code);
+      if (!forced) continue;
+      m.regime = finalizeRegimeScore(forced.decision, m.monteCarlo!, m.favorite);
+      m.crown = assignCrown(
+        false,
+        forced.pairLoss,
+        m.regime.sharpe,
+        m.regime.mcScore
+      );
+      // only DUAL-HEDGE cards ride the atomic slips — forced regimes do not
+      if (m.regime.code !== "DUAL-HEDGE") {
+        m.slips = {};
+        m.dualEligible = false;
+      }
+      counts[code] += 1;
+      counts["DUAL-HEDGE"] -= 1;
+    }
+  };
+
+  // 🏦 banker top-up — strongest favorites first (master prompt: S_A ≥ 0.70)
+  fill("BANKER", (m) => {
+    const sFav = m.favorite === "A" ? m.markov.setWinA : 1 - m.markov.setWinA;
+    return sFav * 2 + m.favWinProb;
+  });
+  // 🧩 copula-combo top-up — highest fav×games joint mass (dominant games lines)
+  fill("COMBO", (m) => {
+    const mc = m.monteCarlo!;
+    return Math.max(mc.favWinUnder215, mc.favWinOver205 + mc.favWinShareOver205);
+  });
+  // 🎯 exact-cluster top-up — most concentrated top-3 scenario mass
+  fill("CLUSTER", (m) => m.monteCarlo!.topScenariosMass * 2 - m.monteCarlo!.entropy);
+}
+
 // ─── v2.0 · 7-Day Historical Auto-Settlement ───────────────────────────────
+// v5.5 — the settled 7-day record is (re)built through the SAME 5-regime
+// pipeline as today's card: analyze → crown → allocateFiveRegimes → regime
+// item builders, so every regime of the «دفترکل افرازی» table holds settled
+// rows too. `historyVersion` marks the pipeline revision a match was
+// processed under; bumping the constant re-backfills the 7-day window ONCE.
+const HISTORY_PIPELINE_VERSION = 6; // v5.5 = 6
 
 interface HistorySummary {
   analyzed: number;
@@ -613,6 +705,17 @@ async function processHistorySettlement(
   const summary: HistorySummary = { analyzed: 0, approved: 0, items: [] };
 
   try {
+    // 0) v5.5 one-time re-backfill — matches processed under the pre-v5.5
+    //    pipeline (broken crown gate, VOID-settling BANKER/CLUSTER legs, no
+    //    regime distribution) are re-analyzed so the settled record fills
+    //    all 5 regimes of the master prompt.
+    await db.tennisMatch
+      .updateMany({
+        where: { historyProcessed: true, historyVersion: { lt: HISTORY_PIPELINE_VERSION } },
+        data: { historyProcessed: false },
+      })
+      .catch(() => undefined);
+
     // 1) finished matches of today + the past 7 days — today's post matches
     //    flow through the same fresh-check as the older days
     const dateKeys = [
@@ -658,7 +761,7 @@ async function processHistorySettlement(
     for (const m of fresh) {
       try {
         attachResolvedRanks(m, rankLookup);
-        const { analyzed: am } = analyzeMatch(m, undefined);
+        const am = analyzeMatch(m, undefined);
         freshAnalyzed.push(am);
         processedKeys.push(m.eventKey);
       } catch (e) {
@@ -666,11 +769,15 @@ async function processHistorySettlement(
       }
     }
 
+    // 3.5) v5.5 — distribute the settled pool across ALL 5 regimes too
+    allocateFiveRegimes(freshAnalyzed, true);
+
     // 4) persist match rows (marks them processed) and build the routed items
     await persistMatches(freshAnalyzed, true);
     for (const am of freshAnalyzed) {
       const result = extractSettleableResult(am);
-      const approved = !am.veto.vetoed && !!am.regime && !!am.crown;
+      const approved =
+        !am.veto.vetoed && !!am.regime && am.regime.code !== "VETOED" && !!am.crown;
       if (approved && result) {
         switch (am.regime?.code) {
           case "BANKER": {
@@ -690,6 +797,31 @@ async function processHistorySettlement(
         summary.approved++;
       }
     }
+
+    // 4.5) v5.5 — 🔗 SERVICE KINGS ACCUMULATOR for the settled record: the
+    // 2/3 strongest BANKER-routed matches of each settled date combine into
+    // a 100-unit parlay item with the explicit per-leg settlement contract.
+    const bankerByDate = new Map<string, AnalyzedMatch[]>();
+    for (const am of freshAnalyzed) {
+      if (
+        am.regime?.code === "BANKER" &&
+        !am.veto.vetoed &&
+        !!am.crown &&
+        extractSettleableResult(am)
+      ) {
+        const arr = bankerByDate.get(am.dateKey) ?? [];
+        arr.push(am);
+        bankerByDate.set(am.dateKey, arr);
+      }
+    }
+    for (const [, legs] of bankerByDate) {
+      const ranked = legs
+        .sort((a, b) => (b.mc?.bankerProb ?? b.favWinProb) - (a.mc?.bankerProb ?? a.favWinProb));
+      const acc2 = accumulatorItemOf(ranked.slice(0, 2), "ACC-2");
+      const acc3 = accumulatorItemOf(ranked.slice(0, 3), "ACC-3");
+      if (acc2) summary.items.push(acc2);
+      if (acc3) summary.items.push(acc3);
+    }
     summary.analyzed = freshAnalyzed.length;
 
     // 5) engine log + explicit processed-marker for rows that pre-existed
@@ -697,7 +829,7 @@ async function processHistorySettlement(
       .create({
         data: {
           kind: "HISTORY",
-          message: `7-day auto-settlement scan: analyzed=${summary.analyzed} approved=${summary.approved}`,
+          message: `v5.5 7-day auto-settlement scan: analyzed=${summary.analyzed} approved=${summary.approved} items=${summary.items.length}`,
         },
       })
       .catch(() => undefined);
@@ -706,7 +838,7 @@ async function processHistorySettlement(
       await db.tennisMatch
         .updateMany({
           where: { eventKey: { in: processedKeys } },
-          data: { historyProcessed: true },
+          data: { historyProcessed: true, historyVersion: HISTORY_PIPELINE_VERSION },
         })
         .catch(() => undefined);
     }
@@ -715,6 +847,206 @@ async function processHistorySettlement(
   }
 
   return summary;
+}
+
+// ─── v5.5 · regime item builders for the settled 7-day record ──────────────
+// (the live card builders live inside buildLines; these mirror the exact same
+// market/stake math for post-state matches of the settlement window)
+
+function bankerItemOf(m: AnalyzedMatch): LineItem | null {
+  const regime = m.regime;
+  if (!regime || regime.code !== "BANKER" || !regime.price || !regime.legCodes) return null;
+  const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
+  return {
+    ...baseItem(m),
+    line: "BANKER",
+    leg: regime.legCodes.main,
+    desc: regime.marketFa ?? regime.marketEn ?? "",
+    descEn: regime.marketEn ?? "",
+    odds: regime.price,
+    prob: regime.prob ?? m.favWinProb,
+    stake: STANDARD_MATCH_STAKE,
+    marketEn: regime.marketEn,
+    marketFa: regime.marketFa,
+    espnUrl: espnMatchUrl(m.eventKey),
+    targetWindow: regime.targetWindow,
+    regime,
+    crown: m.crown,
+    pipeline: m.pipeline,
+    copula: m.copula,
+    monteCarlo: m.monteCarlo,
+    meta: JSON.stringify({
+      kind: "banker",
+      legCode: regime.legCodes.main,
+      favName,
+      eventKey: m.eventKey,
+      adaptive: regime.adaptive,
+    }),
+  };
+}
+
+function clusterItemsOf(m: AnalyzedMatch): LineItem[] {
+  const regime = m.regime;
+  if (!regime || regime.code !== "CLUSTER" || !regime.scenarios) return [];
+  const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
+  return regime.scenarios.map((sc, i) => ({
+    ...baseItem(m),
+    line: "CLUSTER",
+    leg: `CLU-${i + 1}`,
+    desc: sc.descFa,
+    descEn: sc.descEn,
+    odds: sc.price,
+    prob: sc.prob,
+    stake: Math.round(sc.stake * 10) / 10,
+    marketEn: sc.descEn,
+    marketFa: sc.descFa,
+    espnUrl: espnMatchUrl(m.eventKey),
+    targetWindow: [2.8, 4.2] as [number, number],
+    regime,
+    crown: m.crown,
+    pipeline: m.pipeline,
+    copula: m.copula,
+    monteCarlo: m.monteCarlo,
+    meta: JSON.stringify({
+      kind: "cluster",
+      scenario: sc.label,
+      code: sc.code,
+      gamesLo: sc.gamesLo,
+      gamesHi: sc.gamesHi,
+      favName,
+      eventKey: m.eventKey,
+      adaptive: !!regime.adaptive,
+    }),
+  }));
+}
+
+function comboRegimeItemsOf(m: AnalyzedMatch): LineItem[] {
+  const regime = m.regime;
+  if (!regime || regime.code !== "COMBO" || !regime.comboLegs || !regime.legCodes) return [];
+  const legs = regime.comboLegs;
+  const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
+  const { stakeA, stakeB } = dutchStakes(legs.mainPrice, legs.coverPrice);
+  const adaptive = !!regime.adaptive;
+  const v5 = {
+    regime,
+    crown: m.crown,
+    pipeline: m.pipeline,
+    copula: m.copula,
+    monteCarlo: m.monteCarlo,
+  };
+  return [
+    {
+      ...baseItem(m),
+      line: "REGCOMBO",
+      leg: regime.legCodes.main,
+      desc: legs.mainFa,
+      descEn: legs.mainEn,
+      odds: legs.mainPrice,
+      prob: legs.mainProb,
+      stake: Math.round(stakeA * 10) / 10,
+      marketEn: legs.mainEn,
+      marketFa: legs.mainFa,
+      espnUrl: espnMatchUrl(m.eventKey),
+      targetWindow: [1.85, 2.4] as [number, number],
+      ...v5,
+      meta: JSON.stringify({
+        kind: "regComboMain",
+        variant: regime.legCodes.main.endsWith("DOM") ? "DOM" : "SRV",
+        favName,
+        eventKey: m.eventKey,
+        adaptive,
+      }),
+    },
+    {
+      ...baseItem(m),
+      line: "REGCOMBO",
+      leg: regime.legCodes.cover ?? "RC-COVER",
+      desc: legs.coverFa,
+      descEn: legs.coverEn,
+      odds: legs.coverPrice,
+      prob: legs.coverProb,
+      stake: Math.round(stakeB * 10) / 10,
+      marketEn: legs.coverEn,
+      marketFa: legs.coverFa,
+      espnUrl: espnMatchUrl(m.eventKey),
+      targetWindow: [2.7, 3.3] as [number, number],
+      ...v5,
+      meta: JSON.stringify({
+        kind: "regComboCover",
+        variant: regime.legCodes.main.endsWith("DOM") ? "DOM" : "SRV",
+        favName,
+        eventKey: m.eventKey,
+        adaptive,
+      }),
+    },
+  ];
+}
+
+/** v5.5 — SERVICE KINGS ACCUMULATOR item over settled BANKER matches. */
+function accumulatorItemOf(legs: AnalyzedMatch[], legTag: string): LineItem | null {
+  if (legs.length < 2) return null;
+  let prob = 1;
+  let odds = 1;
+  const favorites: {
+    name: string;
+    eventKey: string;
+    side: "A" | "B";
+    market: "WINNER" | "HANDICAP15";
+  }[] = [];
+  const legRows: MixLeg[] = [];
+  for (const l of legs) {
+    const regime = l.regime!;
+    const fav = l.favorite === "A" ? l.playerA.name : l.playerB.name;
+    const dog = l.favorite === "A" ? l.playerB.name : l.playerA.name;
+    const isWinMarket = !regime.legCodes?.main || regime.legCodes.main === "BNK-WIN";
+    const legOdds = Math.max(1.3, Math.min(1.7, regime.price ?? 1.45));
+    const legProb = regime.prob ?? l.favWinProb;
+    prob *= legProb;
+    odds *= legOdds;
+    favorites.push({
+      name: fav,
+      eventKey: l.eventKey,
+      side: l.favorite,
+      market: isWinMarket ? "WINNER" : "HANDICAP15",
+    });
+    legRows.push({
+      favName: fav,
+      dogName: dog,
+      favShort: l.favorite === "A" ? l.playerA.shortName : l.playerB.shortName,
+      dogShort: l.favorite === "A" ? l.playerB.shortName : l.playerA.shortName,
+      tournament: l.tournament,
+      round: l.round,
+      tour: l.tour,
+      surface: l.surface,
+      startTime: l.startTime,
+      marketEn: isWinMarket
+        ? `MATCH WINNER — ${fav.toUpperCase()}`
+        : `SET HANDICAP — ${fav.toUpperCase()} −1.5 SETS`,
+      marketFa: isWinMarket
+        ? `برد مسابقه: ${fav}`
+        : `هندیکپ ست: ${fav} ۲-۰`,
+      odds: legOdds,
+      eventKey: l.eventKey,
+    });
+  }
+  const size = legs.length;
+  const marketEn = legRows.map((r) => r.marketEn).join(" + ");
+  const first = legs[0];
+  return {
+    ...baseItem(first),
+    line: "ACCUMULATOR",
+    leg: legTag,
+    desc: `آکومولاتور سلاطین سرویس ${size === 3 ? "۳" : "۲"} تایی — ${legRows.map((r) => r.favName).join(" × ")}`,
+    descEn: `SERVICE KINGS ${size}-FOLD — ${marketEn}`,
+    odds: Math.round(odds * 100) / 100,
+    prob,
+    stake: STANDARD_MATCH_STAKE,
+    timing: first.timing,
+    marketEn,
+    marketFa: `آکومولاتور ${size} تایی سلاطین سرویس — ${legRows.map((r) => r.favName).join("، ")}`,
+    legs: legRows,
+    meta: JSON.stringify({ kind: "combo", favorites, size }),
+  };
 }
 
 // ─── v3.0 · Dual-Slip Accounting Sync ──────────────────────────────────────
@@ -824,7 +1156,7 @@ function rowOf(m: AnalyzedMatch) {
     timing: m.timing.label,
     hashPre: m.hashPre ?? null,
     // ─── v5.0 · pipeline persistence ─────────────────────────────────────
-    rho: m.copula?.rhoSet ?? null,
+    rho: m.copula?.rhoSetCoupling ?? null,
     mcScore: m.crown?.score ?? null,
     mcEntropy: m.mc?.entropy ?? null,
     regime: m.regime?.code ?? null,
@@ -909,6 +1241,16 @@ function espnMatchUrl(eventKey: string): string | undefined {
     : undefined;
 }
 
+/** v5.5 — fair market price for the sniper capital-protection cover legs. */
+function fairPrice1(prob: number, margin: number): number {
+  return prob > 0.01 ? Math.round((1 / prob) * margin * 100) / 100 : 40;
+}
+
+/** v5.5 — 2-decimal clamp helper (sniper cover price windows). */
+function clamp1(p: number, lo: number, hi: number): number {
+  return Math.round(Math.max(lo, Math.min(hi, p)) * 100) / 100;
+}
+
 function baseItem(m: AnalyzedMatch): Omit<
   LineItem,
   "line" | "leg" | "desc" | "descEn" | "odds" | "prob" | "stake"
@@ -952,15 +1294,14 @@ function baseItem(m: AnalyzedMatch): Omit<
 /** The two complementary DUAL legs of an approved match (archetype-aware).
  *  v4.0 — Official Atomic Markets: each wing is ONE standard single-button
  *  bookmaker market; the 100-unit match budget is split by equal-profit
- *  dutching (stake ∝ 1/odds) so every outcome pays the same return. */
-function dualItemsOf(m: AnalyzedMatch, stakeScale = 1): LineItem[] {
+ *  dutching (stake ∝ 1/odds) so every outcome pays the same return.
+ *  v5.5 — silver/adaptive crowns NO LONGER halve the stake: every card rides
+ *  the full STANDARD_MATCH_STAKE = 100-unit budget. */
+function dualItemsOf(m: AnalyzedMatch): LineItem[] {
   if (!m.slips.A || !m.slips.B) return [];
   const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
   const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
   const { stakeA, stakeB } = dutchStakes(m.slips.A.odds, m.slips.B.odds);
-  const mult = m.crown?.stakeMultiplier ?? 1;
-  const stA = Math.round(stakeA * mult * 10) / 10;
-  const stB = Math.round(stakeB * mult * 10) / 10;
   return [
     {
       ...baseItem(m),
@@ -970,7 +1311,7 @@ function dualItemsOf(m: AnalyzedMatch, stakeScale = 1): LineItem[] {
       descEn: m.slips.A.textEn,
       odds: m.slips.A.odds,
       prob: m.slips.A.prob,
-      stake: Math.round(stakeA * stakeScale * 10) / 10,
+      stake: Math.round(stakeA * 10) / 10,
       stakePct: stakeA,
       slipProbA: m.slips.A.prob,
       slipProbB: m.slips.B.prob,
@@ -987,7 +1328,7 @@ function dualItemsOf(m: AnalyzedMatch, stakeScale = 1): LineItem[] {
         archAdaptive: m.archetype?.adaptive,
         favName,
         marketEn: m.slips.A.marketEn,
-        stakePct: stA,
+        stakePct: stakeA,
         eventKey: m.eventKey,
       }),
     },
@@ -999,7 +1340,7 @@ function dualItemsOf(m: AnalyzedMatch, stakeScale = 1): LineItem[] {
       descEn: m.slips.B.textEn,
       odds: m.slips.B.odds,
       prob: m.slips.B.prob,
-      stake: Math.round(stakeB * stakeScale * 10) / 10,
+      stake: Math.round(stakeB * 10) / 10,
       stakePct: stakeB,
       slipProbA: m.slips.A.prob,
       slipProbB: m.slips.B.prob,
@@ -1013,7 +1354,7 @@ function dualItemsOf(m: AnalyzedMatch, stakeScale = 1): LineItem[] {
         favName,
         dogName,
         marketEn: m.slips.B.marketEn,
-        stakePct: stB,
+        stakePct: stakeB,
         eventKey: m.eventKey,
       }),
     },
@@ -1040,10 +1381,10 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
       copula: m.copula,
       monteCarlo: m.monteCarlo,
     };
-    const stakeScale = m.regime?.adaptive ? 0.5 : 1;
+    const stakeScale = 1; // v5.5 — the 100-unit law: silver cards no longer halve stakes
 
     if (!m.veto.vetoed && m.slips.A && m.slips.B && m.dualEligible) {
-      dual.push(...dualItemsOf(m, stakeScale));
+      dual.push(...dualItemsOf(m));
     }
 
     // ── v5.0 · regime production lines ─────────────────────────────────────
@@ -1058,7 +1399,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
           descEn: regime.marketEn ?? "",
           odds: regime.price,
           prob: regime.prob ?? m.favWinProb,
-          stake: Math.round(60 * stakeScale * 10) / 10,
+          stake: STANDARD_MATCH_STAKE,
           marketEn: regime.marketEn,
           marketFa: regime.marketFa,
           espnUrl: espnMatchUrl(m.eventKey),
@@ -1085,7 +1426,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
           descEn: legs.mainEn,
           odds: legs.mainPrice,
           prob: legs.mainProb,
-          stake: Math.round(stakeA * stakeScale * 10) / 10,
+          stake: Math.round(stakeA * 10) / 10,
           marketEn: legs.mainEn,
           marketFa: legs.mainFa,
           espnUrl: espnMatchUrl(m.eventKey),
@@ -1107,7 +1448,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
           descEn: legs.coverEn,
           odds: legs.coverPrice,
           prob: legs.coverProb,
-          stake: Math.round(stakeB * stakeScale * 10) / 10,
+          stake: Math.round(stakeB * 10) / 10,
           marketEn: legs.coverEn,
           marketFa: legs.coverFa,
           espnUrl: espnMatchUrl(m.eventKey),
@@ -1133,7 +1474,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
             descEn: sc.descEn,
             odds: sc.price,
             prob: sc.prob,
-            stake: Math.round(sc.stake * stakeScale * 10) / 10,
+            stake: Math.round(sc.stake * 10) / 10,
             marketEn: sc.descEn,
             marketFa: sc.descFa,
             espnUrl: espnMatchUrl(m.eventKey),
@@ -1165,7 +1506,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
         descEn: `VETOED · FAV 2-0 (P=${(p20Fav * 100).toFixed(1)}%)`,
         odds: p20Fav > 0.01 ? Math.round((1 / p20Fav) * 100) / 100 : 99,
         prob: p20Fav,
-        stake: 1,
+        stake: STANDARD_MATCH_STAKE,
         meta: JSON.stringify({ kind: "dualA", favName, eventKey: m.eventKey }),
       });
       shadow.push({
@@ -1176,7 +1517,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
         descEn: `VETOED · OVER 2.5 SETS (P=${(over25 * 100).toFixed(1)}%)`,
         odds: over25 > 0.01 ? Math.round((1 / over25) * 100) / 100 : 99,
         prob: over25,
-        stake: 1,
+        stake: STANDARD_MATCH_STAKE,
         meta: JSON.stringify({ kind: "dualB", favName, dogName, eventKey: m.eventKey }),
       });
     }
@@ -1270,7 +1611,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
       descEn: marketEn,
       odds: Math.round(odds * 100) / 100,
       prob,
-      stake: 25,
+      stake: STANDARD_MATCH_STAKE,
       timing: legs[0].timing,
       marketEn,
       marketFa: `برگه میکس رسمی ${size} تایی — برد مسابقه (Match Winner) برای ${legRows.map((r) => r.favName).join("، ")}`,
@@ -1406,7 +1747,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
       descEn: `SERVICE KINGS ${size}-FOLD — ${marketEn}`,
       odds: Math.round(odds * 100) / 100,
       prob,
-      stake: 25,
+      stake: STANDARD_MATCH_STAKE,
       timing: legs[0].timing,
       marketEn,
       marketFa: `آکومولاتور ${size} تایی سلاطین سرویس — ${legRows.map((r) => r.favName).join("، ")}`,
@@ -1417,26 +1758,60 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
 
   const acc2 = makeAccumulator(bankerRanked.slice(0, 2), "ACC-2");
   const acc3 = makeAccumulator(bankerRanked.slice(0, 3), "ACC-3");
-  if (acc2) accumulator.push(acc2);
-  if (acc3) accumulator.push(acc3);
+  // v5.5 — the 5-regime law: the ACCUMULATOR row must never stay empty. When
+  // the natural BANKER pool is thinner than 2 legs, the proven safe-anchor
+  // ladder (P_win ≥ 0.74 ∧ S_fav ≥ 0.66) backfills the remaining bases so
+  // the day-level parlay card exists on every full card.
+  let accPool = bankerRanked;
+  if (!acc2) {
+    const backfill = analyzed.filter(
+      (m) =>
+        !bankerRanked.includes(m) &&
+        !m.veto.vetoed &&
+        m.state !== "post" &&
+        anchorEligible(m)
+    );
+    if (backfill.length > 0) {
+      accPool = [...bankerRanked, ...backfill].sort(
+        (a, b) => (b.mc?.bankerProb ?? b.favWinProb) - (a.mc?.bankerProb ?? a.favWinProb)
+      );
+    }
+  }
+  const acc2b = acc2 ?? makeAccumulator(accPool.slice(0, 2), "ACC-2");
+  const acc3b = acc3 ?? makeAccumulator(accPool.slice(0, 3), "ACC-3");
+  if (acc2b) accumulator.push(acc2b);
+  if (acc3b) accumulator.push(acc3b);
 
-  // ── v5.0 · Tab-3 SNIPER — Copula Expected-Value Filter (+EV ≥ 14%) ───────
-  // BUG FIXED (v5.0 audit): tab 3 registered 34 positions above 6.00x with a
-  // 16% win rate. v5.0 prices each candidate from the ρ = 0 INDEPENDENT
-  // baseline (bookmakers price sets independently) and evaluates it with the
-  // copula Monte-Carlo probability. A signal is emitted ONLY when
-  //   EV = P_copula × Price_market − 1 ≥ 14%  AND  Price ∈ [3.20x, 4.80x]
-  // — the >6.00x longshot bucket is gone by construction.
+  // ── v5.5 · Tab-3 SNIPER — packaged main + capital-protection cover ───────
+  // Master prompt §2 (anti-bleed law): the high-odds sniper line (-15.97u in
+  // 7 days on 1u/2u naked longshots) now fires ONLY when the exotic main —
+  // «SET BETTING — FAVORITE WINS 2-1» (primary) or «TOTAL SETS — OVER 2.5
+  // SETS» (fallback) — still carries a ≥ 14% copula expected-value edge over
+  // the ρ = 0 bookmaker baseline, AND is packaged WITH a capital-protection
+  // cover leg (FAV +1.5 SETS / MATCH WINNER — FAVORITE). The 100-unit match
+  // budget is dutched between main + cover (stakeMain + stakeCover = 100) so
+  // NO ledger row can ever carry a 1u or 2u stake again. The underdog
+  // comeback / dog-2-0 longshots of v5.0 are delisted by construction.
   const sniper: LineItem[] = [];
   const SNIPER_MIN_EV = 0.14;
-  const SNIPER_PRICE_LO = 3.2;
-  const SNIPER_PRICE_HI = 4.8;
-  interface SnipeCandidate {
-    item: LineItem;
-    odds: number;
+  interface SnipeMain {
+    key: string;
+    desc: string;
+    descEn: string;
+    marketEn: string;
+    model: number;
+    naive: number;
+    priceLo: number;
+    priceHi: number;
+    coverKind: "favPlus15" | "favWin";
+    coverProb: number;
+    coverMarketEn: string;
+    coverMarketFa: string;
+    coverPrice: number;
     ev: number;
+    price: number;
   }
-  const snipePool: SnipeCandidate[] = [];
+  const sniperPairs: { main: LineItem; cover: LineItem }[] = [];
   for (const m of approved) {
     const mc = m.monteCarlo;
     if (!mc) continue;
@@ -1446,14 +1821,9 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
     const dogName = favIsA ? m.playerB.name : m.playerA.name;
     // ρ = 0 independent baseline — the naive bookmaker pricing model
     const indep = bo3Outcomes(m.markov.setWinA);
-    const candidates: {
-      key: string;
-      desc: string;
-      descEn: string;
-      marketEn: string;
-      model: number;
-      naive: number;
-    }[] = [
+    const pFavWinMc = favIsA ? mc.outcomes.p20 + mc.outcomes.p21 : mc.outcomes.p12 + mc.outcomes.p02;
+    const pFavPlus15 = favIsA ? 1 - mc.outcomes.p02 : 1 - mc.outcomes.p20;
+    const buildMains: Omit<SnipeMain, "ev" | "price">[] = [
       {
         key: "fav21",
         desc: `نتیجه دقیق ست‌ها: برد ۲-۱ فاوریت ${favName} (Set Betting: Favorite Wins 2-1)`,
@@ -1461,22 +1831,13 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
         marketEn: "SET BETTING — FAVORITE WINS 2-1",
         model: favIsA ? mc.outcomes.p21 : mc.outcomes.p12,
         naive: favIsA ? indep.p21 : indep.p12,
-      },
-      {
-        key: "comeback",
-        desc: `کامبک ست سوم: برد ۲-۱ ${dogName} (Set Betting: Underdog Wins 2-1)`,
-        descEn: `SET BETTING — ${dogName.toUpperCase()} WINS 2-1`,
-        marketEn: "SET BETTING — UNDERDOG WINS 2-1",
-        model: favIsA ? mc.outcomes.p12 : mc.outcomes.p21,
-        naive: favIsA ? indep.p12 : indep.p21,
-      },
-      {
-        key: "dog20",
-        desc: `نتیجه دقیق ست‌ها: برد ۲-۰ ${dogName} (Set Betting: Underdog Wins 2-0)`,
-        descEn: `SET BETTING — ${dogName.toUpperCase()} WINS 2-0`,
-        marketEn: `SET BETTING — ${dogName.toUpperCase()} WINS 2-0`,
-        model: favIsA ? mc.outcomes.p02 : mc.outcomes.p20,
-        naive: favIsA ? indep.p02 : indep.p20,
+        priceLo: 3.2,
+        priceHi: 4.8,
+        coverKind: "favPlus15",
+        coverProb: Math.max(0.5, pFavPlus15),
+        coverMarketEn: `SET HANDICAP — ${favName.toUpperCase()} +1.5 SETS`,
+        coverMarketFa: `هندیکپ ست: ${favName} +۱.۵ ست — پوشش اصل سرمایه`,
+        coverPrice: clamp1(Math.max(1.08, fairPrice1(Math.max(0.5, pFavPlus15), 1.06)), 1.08, 1.32),
       },
       {
         key: "set3",
@@ -1485,56 +1846,97 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
         marketEn: "TOTAL SETS — OVER 2.5 SETS",
         model: mc.outcomes.p21 + mc.outcomes.p12,
         naive: indep.p21 + indep.p12,
+        priceLo: 2.3,
+        priceHi: 4.8,
+        coverKind: "favWin",
+        coverProb: Math.max(0.5, pFavWinMc),
+        coverMarketEn: `MATCH WINNER — ${favName.toUpperCase()}`,
+        coverMarketFa: `برد مسابقه: ${favName} — پوشش اصل سرمایه`,
+        coverPrice: clamp1(Math.max(1.08, fairPrice1(Math.max(0.5, pFavWinMc), 1.06)), 1.08, 1.45),
       },
     ];
-    for (const c of candidates) {
-      if (c.model <= 0.02 || c.naive <= 0.02) continue;
-      const price = Math.round((1 / c.naive) * BOOK_MARGIN_SNIPER * 100) / 100;
-      const ev = c.model * price - 1;
-      if (ev < SNIPER_MIN_EV) continue; // copula +EV gate
-      if (price < SNIPER_PRICE_LO || price > SNIPER_PRICE_HI) continue; // 3.20x–4.80x band
-      snipePool.push({
-        item: {
-          ...baseItem(m),
-          line: "SNIPER",
-          leg: `SNIPER-${c.key}`,
-          desc: `${c.desc} — +EV ${(ev * 100).toFixed(1)}%`,
-          descEn: c.descEn,
-          odds: price,
-          prob: c.model,
-          stake: 2,
-          marketEn: c.marketEn,
-          marketFa: c.desc,
-          espnUrl: espnMatchUrl(m.eventKey),
-          regime: m.regime,
-          crown: m.crown,
-          pipeline: m.pipeline,
-          copula: m.copula,
-          monteCarlo: m.monteCarlo,
-          meta: JSON.stringify({
-            kind: "sniper",
-            snipeKind: c.key,
-            favName,
-            eventKey: m.eventKey,
-            ev: Math.round(ev * 1000) / 1000,
-          }),
-        },
-        odds: price,
-        ev,
-      });
-    }
+    // priority order — Favorite Wins 2-1 first (master prompt §2), then the
+    // total-sets fallback; the FIRST main that passes the +EV gate wins
+    const winMain = buildMains
+      .map((c) => {
+        if (c.model <= 0.02 || c.naive <= 0.02) return null;
+        const price = Math.round((1 / c.naive) * BOOK_MARGIN_SNIPER * 100) / 100;
+        const ev = c.model * price - 1;
+        if (ev < SNIPER_MIN_EV) return null; // copula +EV gate
+        if (price < c.priceLo || price > c.priceHi) return null;
+        return { ...c, ev, price } as SnipeMain;
+      })
+      .find((c): c is SnipeMain => !!c);
+    if (!winMain) continue;
+    const { stakeA: stakeMain, stakeB: stakeCover } = dutchStakes(winMain.price, winMain.coverPrice);
+    sniperPairs.push({
+      main: {
+        ...baseItem(m),
+        line: "SNIPER",
+        leg: "SNIPER-MAIN",
+        desc: `${winMain.desc} — +EV ${(winMain.ev * 100).toFixed(1)}%`,
+        descEn: winMain.descEn,
+        odds: winMain.price,
+        prob: winMain.model,
+        stake: stakeMain,
+        marketEn: winMain.marketEn,
+        marketFa: winMain.desc,
+        espnUrl: espnMatchUrl(m.eventKey),
+        regime: m.regime,
+        crown: m.crown,
+        pipeline: m.pipeline,
+        copula: m.copula,
+        monteCarlo: m.monteCarlo,
+        meta: JSON.stringify({
+          kind: "sniper",
+          snipeKind: winMain.key,
+          favName,
+          eventKey: m.eventKey,
+          ev: Math.round(winMain.ev * 1000) / 1000,
+        }),
+      },
+      cover: {
+        ...baseItem(m),
+        line: "SNIPER",
+        leg: "SNIPER-COVER",
+        desc: `${winMain.coverMarketFa} (پوشش تیپ ${winMain.key === "fav21" ? "برد ۲-۱ فاوریت" : "بالای ۲.۵ ست"})`,
+        descEn: `${winMain.coverMarketEn} — CAPITAL PROTECTION`,
+        odds: winMain.coverPrice,
+        prob: winMain.coverProb,
+        stake: stakeCover,
+        marketEn: `${winMain.coverMarketEn} · COVER`,
+        marketFa: winMain.coverMarketFa,
+        espnUrl: espnMatchUrl(m.eventKey),
+        regime: m.regime,
+        crown: m.crown,
+        pipeline: m.pipeline,
+        copula: m.copula,
+        monteCarlo: m.monteCarlo,
+        meta: JSON.stringify({
+          kind: "sniper",
+          snipeKind: winMain.coverKind,
+          favName,
+          dogName,
+          eventKey: m.eventKey,
+          coverFor: winMain.key,
+        }),
+      },
+    });
   }
-  // most +EV first, ≤ 1 signal per match — quality over quantity
-  const perCount = new Map<string, number>();
-  const picked: LineItem[] = [];
-  for (const c of [...snipePool].sort((a, b) => b.ev - a.ev)) {
-    if (picked.length >= SNIPER_GUARANTEE + 3) break;
-    const n = perCount.get(c.item.matchId) ?? 0;
-    if (n >= 1) continue;
-    perCount.set(c.item.matchId, n + 1);
-    picked.push(c.item);
+  // most +EV first, ≤ 1 packaged position per match, ≤ SNIPER_GUARANTEE cards
+  sniperPairs.sort((a, b) => {
+    const evOf = (x: { main: LineItem }) => {
+      try {
+        return (JSON.parse(x.main.meta ?? "{}") as { ev?: number }).ev ?? 0;
+      } catch {
+        return 0;
+      }
+    };
+    return evOf(b) - evOf(a);
+  });
+  for (const pair of sniperPairs.slice(0, SNIPER_GUARANTEE)) {
+    sniper.push(pair.main, pair.cover);
   }
-  sniper.push(...picked);
   sniper.sort((a, b) => b.odds - a.odds);
   // v2.0 dedupe — no pick list may contain the same (match, line, leg) twice
   const dedupe = (items: LineItem[]) =>

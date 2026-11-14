@@ -31,6 +31,12 @@ import type {
 
 const BANK_START = 1000;
 
+// ─── v5.5 · STANDARD MATCH STAKE mirror (ledger side of the 100-unit law) ──
+// Every ledger row — dual pairs, bankers, copula combos, exact clusters,
+// accumulators, mix parlays, snipers — is normalized to the SAME 100-unit
+// match budget; 1u / 2u / 50u / 60u stakes are rewritten on every build.
+const STANDARD_MATCH_STAKE = 100;
+
 interface PickWithMatch {
   id: string;
   matchId: string;
@@ -107,17 +113,31 @@ const LEG_LABEL: Record<string, string> = {
   // ─── v5.0 · 5-Regime legs ──────────────────────────────────────────────
   "MW-FAV": "بانکر",
   "SH-F15": "بانکر",
+  "BNK-WIN": "بانکر امن",
+  "BNK-SH15": "بانکر امن",
   "RC-FWU215": "تیپ اصلی",
   "RC-O215": "پوشش",
   "RC-FWO205": "تیپ اصلی",
   "RC-U205": "پوشش",
+  "RC-MAIN-DOM": "تیپ اصلی",
+  "RC-MAIN-SRV": "تیپ اصلی",
+  "RC-COVER-DOM": "پوشش",
+  "RC-COVER-SRV": "پوشش",
   "CL-F20U195": "سناریو ۱",
   "CL-F20G20": "سناریو ۲",
   "CL-F21": "سناریو ۳",
+  "CLU-1": "سناریو ۱",
+  "CLU-2": "سناریو ۲",
+  "CLU-3": "سناریو ۳",
+  // ─── v5.5 · sniper packaged position (main + capital-protection cover) ──
+  "SNIPER-MAIN": "اسنایپر — تیپ اصلی",
+  "SNIPER-COVER": "پوشش اصل سرمایه",
 };
 
 function legLabelOf(leg: string): string {
-  return LEG_LABEL[leg] ?? (leg.startsWith("B") ? "تیپ B" : "تیپ A");
+  if (LEG_LABEL[leg]) return LEG_LABEL[leg];
+  if (leg.startsWith("SNIPER-")) return "اسنایپر";
+  return leg.startsWith("B") ? "تیپ B" : "تیپ A";
 }
 
 function buildLeg(p: PickWithMatch): LedgerLeg {
@@ -139,6 +159,63 @@ function parseMeta(metaStr: string | null): PickMeta {
     return metaStr ? (JSON.parse(metaStr) as PickMeta) : {};
   } catch {
     return {};
+  }
+}
+
+/**
+ * v5.5 — the 100-unit stake law (master prompt §1, mandatory in ledger.ts).
+ * Idempotent migration that rewrites every legacy stake in the database:
+ *   1) single-leg cards (BANKER 60u / mix 25u / accumulator 25u / shadow 1u)
+ *      → exactly STANDARD_MATCH_STAKE (100u);
+ *   2) multi-wing positions (DUAL / REGCOMBO / CLUSTER / SNIPER) → every
+ *      match group rescaled proportionally so the wings sum EXACTLY to 100u
+ *      (silver-era 50u halves and legacy 50/50 splits included);
+ *   3) 1u / 2u naked sniper stakes of the bleeding era are gone by the same
+ *      rescale — no ledger row can ever carry them again.
+ * Wing profits are re-derived from (odds × stake) at read time, so the
+ * accounting identity stays intact after the rewrite.
+ */
+export async function normalizeStakeUnits(): Promise<void> {
+  try {
+    await db.tennisPick.updateMany({
+      where: {
+        line: { in: ["BANKER", "COMBO", "ACCUMULATOR", "SHADOW"] },
+        stake: { not: STANDARD_MATCH_STAKE },
+      },
+      data: { stake: STANDARD_MATCH_STAKE },
+    });
+
+    const legs = await db.tennisPick.findMany({
+      where: { line: { in: ["DUAL", "REGCOMBO", "CLUSTER", "SNIPER"] } },
+      select: { id: true, matchId: true, line: true, stake: true },
+    });
+    const groups = new Map<string, { id: string; stake: number }[]>();
+    for (const l of legs) {
+      const key = `${l.line}|${l.matchId}`;
+      const arr = groups.get(key) ?? [];
+      arr.push({ id: l.id, stake: l.stake });
+      groups.set(key, arr);
+    }
+    for (const group of groups.values()) {
+      if (group.length === 0) continue;
+      const sum = group.reduce((s, g) => s + g.stake, 0);
+      if (sum <= 0) continue;
+      const scaled = group.map((g) => ({
+        id: g.id,
+        stake: Math.round((g.stake / sum) * STANDARD_MATCH_STAKE * 10) / 10,
+      }));
+      const drift =
+        Math.round((STANDARD_MATCH_STAKE - scaled.reduce((s, g) => s + g.stake, 0)) * 10) / 10;
+      const biggest = scaled.reduce((a, b) => (b.stake > a.stake ? b : a));
+      biggest.stake = Math.round((biggest.stake + drift) * 10) / 10;
+      for (const g of scaled) {
+        const before = group.find((x) => x.id === g.id)!.stake;
+        if (Math.abs(g.stake - before) < 0.05) continue;
+        await db.tennisPick.update({ where: { id: g.id }, data: { stake: g.stake } });
+      }
+    }
+  } catch (e) {
+    console.error("[ledger] 100-unit stake normalization failed", e);
   }
 }
 
@@ -169,12 +246,17 @@ export async function buildLedgerPayload(
   }
   const dual = new Map<string, DualAgg>();
   const cluster = new Map<DualAgg["matchId"], DualAgg>();
+  // v5.5 — REGCOMBO (main + cover) and the packaged SNIPER position
+  // (main + capital-protection cover) also group into ONE match row so the
+  // SHA-256 record keeps exactly one row per match across ALL regimes.
+  const regCombo = new Map<DualAgg["matchId"], DualAgg>();
+  const sniperAgg = new Map<DualAgg["matchId"], DualAgg>();
   const singles: { p: PickWithMatch; leg: LedgerLeg }[] = [];
 
-  for (const p of all) {
-    const leg = buildLeg(p);
-    if (p.line === "DUAL") {
-      const agg = dual.get(p.matchId) ?? {
+  const aggFor = (map: Map<string, DualAgg>, p: PickWithMatch): DualAgg => {
+    let agg = map.get(p.matchId);
+    if (!agg) {
+      agg = {
         matchId: p.matchId,
         legs: [],
         match: p.match,
@@ -184,25 +266,38 @@ export async function buildLedgerPayload(
         settledAt: (p.settledAt ?? p.createdAt).toISOString(),
         createdAt: p.createdAt.toISOString(),
       };
+      map.set(p.matchId, agg);
+    }
+    return agg;
+  };
+
+  const pushAgg = (map: Map<string, DualAgg>, p: PickWithMatch, leg: LedgerLeg) => {
+    const agg = aggFor(map, p);
+    agg.legs.push(leg);
+    agg.stake += leg.stake;
+    if (leg.status === "PENDING") agg.anyPending = true;
+    if (leg.status === "WON") agg.winner = leg;
+    const t = (p.settledAt ?? p.createdAt).toISOString();
+    if (t > agg.settledAt) agg.settledAt = t;
+  };
+
+  for (const p of all) {
+    const leg = buildLeg(p);
+    if (p.line === "DUAL") {
+      const agg = aggFor(dual, p);
       // prefer the meta of wing A (carries the archetype lock)
       if (leg.leg.startsWith("A") && !agg.meta.arch && parseMeta(p.meta).arch) {
         agg.meta = parseMeta(p.meta);
       }
-      agg.legs.push(leg);
-      agg.stake += leg.stake;
-      if (leg.status === "PENDING") agg.anyPending = true;
-      if (leg.status === "WON") agg.winner = leg;
-      const t = (p.settledAt ?? p.createdAt).toISOString();
-      if (t > agg.settledAt) agg.settledAt = t;
+      pushAgg(dual, p, leg);
       dual.set(p.matchId, agg);
-    } else if (
-      p.line === "COMBO" ||
-      p.line === "SNIPER" ||
-      p.line === "BANKER" ||
-      p.line === "REGCOMBO" ||
-      p.line === "CLUSTER" ||
-      p.line === "ACCUMULATOR"
-    ) {
+    } else if (p.line === "REGCOMBO") {
+      pushAgg(regCombo, p, leg);
+    } else if (p.line === "SNIPER") {
+      pushAgg(sniperAgg, p, leg);
+    } else if (p.line === "CLUSTER") {
+      pushAgg(cluster, p, leg);
+    } else if (p.line === "COMBO" || p.line === "BANKER" || p.line === "ACCUMULATOR") {
       // v4.5 — VOID rows (buggy-era settlements) stay out of the official record
       if (p.status !== "VOID") singles.push({ p, leg });
     }
@@ -261,6 +356,8 @@ export async function buildLedgerPayload(
 
   const dualRows: LedgerMatchRow[] = [...dual.values()].map((a) => aggRowOf(a, "DUAL"));
   const clusterRows: LedgerMatchRow[] = [...cluster.values()].map((a) => aggRowOf(a, "CLUSTER"));
+  const regComboRows: LedgerMatchRow[] = [...regCombo.values()].map((a) => aggRowOf(a, "REGCOMBO"));
+  const sniperRows: LedgerMatchRow[] = [...sniperAgg.values()].map((a) => aggRowOf(a, "SNIPER"));
 
   const singleRows: LedgerMatchRow[] = singles.map(({ p, leg }) => {
     const decided = leg.status === "WON" || leg.status === "LOST";
@@ -289,7 +386,7 @@ export async function buildLedgerPayload(
   });
 
   // latest first, bounded
-  const rows = [...dualRows, ...clusterRows, ...singleRows]
+  const rows = [...dualRows, ...clusterRows, ...regComboRows, ...sniperRows, ...singleRows]
     .sort(
       (a, b) =>
         (b.settledAt ?? b.createdAt).localeCompare(a.settledAt ?? a.createdAt)
@@ -319,11 +416,11 @@ export async function buildLedgerPayload(
   const groups: LineStats[] = [
     lineStatsOf("DUAL", dualRows),
     lineStatsOf("BANKER", singleRows.filter((r) => r.line === "BANKER")),
-    lineStatsOf("REGCOMBO", singleRows.filter((r) => r.line === "REGCOMBO")),
-    lineStatsOf("CLUSTER", singleRows.filter((r) => r.line === "CLUSTER")),
+    lineStatsOf("REGCOMBO", regComboRows),
+    lineStatsOf("CLUSTER", clusterRows),
     lineStatsOf("ACCUMULATOR", singleRows.filter((r) => r.line === "ACCUMULATOR")),
     lineStatsOf("COMBO", singleRows.filter((r) => r.line === "COMBO")),
-    lineStatsOf("SNIPER", singleRows.filter((r) => r.line === "SNIPER")),
+    lineStatsOf("SNIPER", sniperRows),
     lineStatsOf(
       "SHADOW",
       all
@@ -349,7 +446,7 @@ export async function buildLedgerPayload(
   ];
 
   // ── combined stats (official record only — shadow excluded, match level) ──
-  const official = [...dualRows, ...clusterRows, ...singleRows];
+  const official = [...dualRows, ...clusterRows, ...regComboRows, ...sniperRows, ...singleRows];
   const decidedRows = official.filter((r) => r.status !== "PENDING");
   const combinedWonCount = decidedRows.filter((r) => r.status === "WON").length;
   const combinedProfit = decidedRows.reduce((s, r) => s + r.profit, 0);
@@ -364,6 +461,8 @@ export async function buildLedgerPayload(
     ...singleRows.filter(
       (r) => r.line === "COMBO" || r.line === "ACCUMULATOR" || r.line === "BANKER"
     ),
+    ...regComboRows,
+    ...clusterRows,
   ];
   const coreDecided = coreRows.filter((r) => r.status !== "PENDING");
   const coreWon = coreDecided.filter((r) => r.status === "WON").length;

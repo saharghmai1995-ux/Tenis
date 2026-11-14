@@ -2,8 +2,7 @@
 // Hierarchy:  Point → Game → Set → Match   (no draws in tennis)
 // Reference: Standard tennis Markov equations + Kovalchik (2016)
 
-import type { ArchMetrics, CopulaInfo, MatchJointCell, ResultCode, SetJointCell } from "./types";
-import { buildCopula, matchJointCellsCopula } from "./copula";
+import type { ArchMetrics, MatchJointCell, ResultCode, SetJointCell } from "./types";
 
 // ─── Layer 1 · Closed-form Service-Game Hold Probability G(p) ──────────────
 /**

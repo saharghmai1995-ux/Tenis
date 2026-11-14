@@ -88,6 +88,8 @@ model TennisMatch {
 
   // ── v2.0 7-day historical auto-settlement marker
   historyProcessed Boolean @default(false)
+  // ── v5.5 pipeline revision of the settlement processing (re-backfill marker)
+  historyVersion   Int     @default(0)
 
   picks TennisPick[]
 

@@ -239,43 +239,11 @@ function settlePick(
     return { status: "VOID", profit: 0 };
   }
 
-  // ─── v5.0 · BANKER — single safe button (MW-FAV / SH-F15) ────────────
-  if (pick.line === "BANKER") {
-    if (pick.leg === "MW-FAV") {
-      // MATCH WINNER — FAVORITE
-      const won = favWonMatch;
-      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
-    }
-    if (pick.leg === "SH-F15") {
-      // SET HANDICAP — FAVORITE −1.5 SETS (favorite wins 2-0)
-      const won = favWon20;
-      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
-    }
-    return { status: "VOID", profit: 0 };
-  }
-
-  // ─── v5.0 · CLUSTER — 3 exact set/game scenarios (dutching) ──────────
-  if (pick.line === "CLUSTER") {
-    if (pick.leg === "CL-F20U195") {
-      // scenario 1 — favorite fast 2-0 under 19.5 games
-      const won = favWon20 && result.totalGames <= 19;
-      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
-    }
-    if (pick.leg === "CL-F20G20") {
-      // scenario 2 — favorite close 2-0 (20-22 games / tie-break)
-      const won = favWon20 && result.totalGames >= 20 && result.totalGames <= 22;
-      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
-    }
-    if (pick.leg === "CL-F21") {
-      // scenario 3 — favorite wins 2-1
-      const target: ResultCode = side === "A" ? "2-1" : side === "B" ? "1-2" : "2-1";
-      const won = favWonMatch && result.code === target;
-      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
-    }
-    return { status: "VOID", profit: 0 };
-  }
-
-  // ── v5.0 · regime markets (BANKER / REGCOMBO / CLUSTER) ──────────────────
+  // ─── v5.5 · UNIFIED REGIME SETTLEMENT (BANKER / CLUSTER / REGCOMBO) ────
+  // BUG FIXED (v5.5 audit): the old early-return branches only knew the
+  // MW-FAV / SH-F15 / CL-F20U195 … legacy leg codes, so every v5.0
+  // BNK-WIN / BNK-SH15 banker pick and every CLU-1..3 cluster leg settled as
+  // VOID and the 4 new regime rows of the record table stayed at 0 (0) | +0.0.
   if (pick.line === "BANKER" || pick.line === "REGCOMBO" || pick.line === "CLUSTER") {
     const favWonMatch =
       side === "A"
@@ -285,13 +253,25 @@ function settlePick(
           : false;
     const favWon20 =
       side === "A" ? result.code === "2-0" : side === "B" ? result.code === "0-2" : false;
-    const dogSide = side === "A" ? "B" : "A";
-    const set1Winner = result.set1Games.a > result.set1Games.b ? "A" : "B";
-    const dogWonSet1 = set1Winner === dogSide;
     const total = result.totalGames;
 
-    // 🔗 CLUSTER — exact scenario: set-score code + total-games band
+    // 🎯 CLUSTER — exact scenario: set-score code + total-games band.
+    // Settles BOTH the legacy CL-F20U195… legs and the v5.0 CLU-1..3 legs
+    // (every cluster pick carries {code, gamesLo, gamesHi} in its meta).
     if (pick.line === "CLUSTER") {
+      if (pick.leg === "CL-F20U195") {
+        const won = favWon20 && total <= 19;
+        return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+      }
+      if (pick.leg === "CL-F20G20") {
+        const won = favWon20 && total >= 20 && total <= 22;
+        return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+      }
+      if (pick.leg === "CL-F21") {
+        const target: ResultCode = side === "A" ? "2-1" : side === "B" ? "1-2" : "2-1";
+        const won = favWonMatch && result.code === target;
+        return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+      }
       const target = meta.code as ResultCode | undefined;
       if (!target) return { status: "VOID", profit: 0 };
       const lo = meta.gamesLo ?? 12;
@@ -300,13 +280,14 @@ function settlePick(
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
 
-    // 🏦 BANKER — MATCH WINNER (BNK-WIN) or SET HANDICAP −1.5 (BNK-SH15)
+    // 🏦 BANKER — MATCH WINNER (BNK-WIN) / SET HANDICAP −1.5 (BNK-SH15)
+    // plus the legacy atomic codes (MW-FAV / SH-F15).
     if (pick.line === "BANKER") {
       const leg = pick.leg;
-      if (leg === "BNK-WIN") {
+      if (leg === "BNK-WIN" || leg === "MW-FAV") {
         return { status: favWonMatch ? "WON" : "LOST", profit: profitOf(favWonMatch) };
       }
-      if (leg === "BNK-SH15") {
+      if (leg === "BNK-SH15" || leg === "SH-F15") {
         return { status: favWon20 ? "WON" : "LOST", profit: profitOf(favWon20) };
       }
       return { status: "VOID", profit: 0 };
@@ -342,6 +323,24 @@ function settlePick(
       const target: ResultCode = side === "A" ? "2-1" : side === "B" ? "1-2" : "2-1";
       const won = result.code === target;
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    // ─── v5.5 · sniper capital-protection cover legs ──────────────────────
+    if (kind === "favPlus15") {
+      // SET HANDICAP — FAVORITE +1.5 SETS: pays whenever the favorite takes
+      // at least ONE set (covers every path except the underdog 2-0 shock)
+      const favSets = side === "A" ? result.setsA : side === "B" ? result.setsB : 0;
+      const won = favSets >= 1;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (kind === "favWin") {
+      // MATCH WINNER — FAVORITE (capital-protection cover of the total-sets main)
+      const favWon =
+        side === "A"
+          ? result.setsA > result.setsB
+          : side === "B"
+            ? result.setsB > result.setsA
+            : false;
+      return { status: favWon ? "WON" : "LOST", profit: profitOf(favWon) };
     }
     if (kind === "tiebreak") {
       const won = result.set1Games.tiebreak;

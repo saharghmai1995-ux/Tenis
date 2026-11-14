@@ -16,15 +16,9 @@ sleep 2
 # 1. stop the stale dev chain (pattern-based + explicit pids as fallback)
 pkill -TERM -f "next dev -p 3000" 2>/dev/null
 pkill -TERM -f "next-server" 2>/dev/null
-for pid in 3557 3559 3560 3561 3573; do
-  kill -TERM "$pid" 2>/dev/null
-done
 sleep 3
 pkill -KILL -f "next dev -p 3000" 2>/dev/null
 pkill -KILL -f "next-server" 2>/dev/null
-for pid in 3557 3559 3560 3561 3573; do
-  kill -KILL "$pid" 2>/dev/null
-done
 
 # 2. wait until :3000 is actually free
 free=0
@@ -38,8 +32,10 @@ done
 echo "── [reboot] port3000_free=$free at $(date -Is) ──"
 
 # 3. start the studio (up to 2 attempts), foreground = durable chain
-cd /home/z/tenis-repo || exit 1
-export PATH="/home/z/tenis-repo/node_modules/.bin:$PATH"
+# v5.5 — the canonical project root is /home/z/my-project (the deleted
+# /home/z/tenis-repo path used to resurrect a stale server from a dead inode).
+cd /home/z/my-project || exit 1
+export PATH="/home/z/my-project/node_modules/.bin:$PATH"
 export NEXT_TELEMETRY_DISABLED=1
 
 for attempt in 1 2; do

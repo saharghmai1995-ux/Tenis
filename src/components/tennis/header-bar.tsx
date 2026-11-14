@@ -74,7 +74,7 @@ export function HeaderBar({ onRefresh, refreshing, lastUpdated, sources }: Heade
                 NeoTennis Markov Quant
               </span>
               <Badge className="border-0 bg-amber-300/15 px-1.5 py-0 text-[9px] font-bold text-amber-300">
-                v5.0
+                v5.5
               </Badge>
               <Badge variant="outline" className="gap-1 border-cyan-400/30 bg-cyan-400/5 px-1.5 py-0 text-[9px] font-bold text-cyan-300">
                 Core Win-Rate · Safe Anchors
