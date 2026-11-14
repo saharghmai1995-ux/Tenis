@@ -667,7 +667,7 @@ function ArchBadge({ item }: { item: LineItem }) {
 
 // ─── v5.0 · 👑 Crown badge (GOLD / SILVER holographic) ─────────────────────
 
-function CrownBadge({ item }: { item: LineItem }) {
+function CrownBadgeV5({ item }: { item: LineItem }) {
   const c = item.crown;
   if (!c || c.tier === "NONE") return null;
   const gold = c.tier === "GOLD";
@@ -733,7 +733,7 @@ function RegimeBadge({ item }: { item: LineItem }) {
 // ─── v5.0 · 4-station pipeline telemetry bar ────────────────────────────────
 // [✅ 1. Markov p_A/p_B] ➔ [✅ 2. Copula ρ] ➔ [✅ 3. 10k Monte-Carlo] ➔ [👑 4. Supervisor Crown]
 
-function PipelineBar({ item }: { item: LineItem }) {
+function PipelineBarV5({ item }: { item: LineItem }) {
   const p = item.pipeline;
   if (!p) return null;
   const crownIcon = p.station4Supervisor.label.includes("GOLD")
@@ -804,10 +804,10 @@ function V5Panel({ item }: { item: LineItem }) {
       {(item.regime || hasCrown) && (
         <div className="flex flex-wrap items-center gap-1.5">
           <RegimeBadge item={item} />
-          <CrownBadge item={item} />
+          <CrownBadgeV5 item={item} />
         </div>
       )}
-      <PipelineBar item={item} />
+      <PipelineBarV5 item={item} />
     </div>
   );
 }
@@ -1254,17 +1254,6 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
       (p): p is { main: LineItem; cover: LineItem } => !!p.main && !!p.cover
     );
   }, [regCombo]);
-
-  // v5.0 — CLUSTER scenarios grouped per match (3 dutched legs)
-  const clusterGroups = useMemo(() => {
-    const byMatch = new Map<string, LineItem[]>();
-    for (const item of cluster) {
-      const arr = byMatch.get(item.matchId) ?? [];
-      arr.push(item);
-      byMatch.set(item.matchId, arr);
-    }
-    return [...byMatch.values()];
-  }, [cluster]);
 
   // Principal-Lock Booster display: asymmetric staking preview on dual line
   const boosterNote = booster
