@@ -1,0 +1,770 @@
+     1→// ─── Telegram Supervisor Agent — Scheduler & Job Handlers ──────────────────
+     2→// Asia/Tehran cron engine (fixed +03:30 since Iran abolished DST in 2022 —
+     3→// verified via Intl tz database at runtime). Every job: build 16-Bit poster →
+     4→// build FULL Persian caption → render → post (or dry-run log). All core
+     5→// logic is browser-independent; the engine feed is warmed server-side.
+     6→
+     7→import { CONFIG, JOB_SPECS } from "./config";
+     8→import { store } from "./store";
+     9→import { telegram } from "./telegram";
+    10→import { dataHub, LEG_DETAIL_EN } from "./data";
+    11→import type { CardMatch } from "./data";
+    12→import { fetchTennisRadar, peekRadar, type TennisNewsItem, type LiveTennisMatch, type FitnessItem } from "./espn";
+    13→import type { PosterLiveRow, PosterFitnessRow } from "./types";
+    14→import { ACADEMY } from "./academy";
+    15→import * as cap from "./captions";
+    16→import { renderPoster } from "./poster/engine";
+    17→import { registerFonts } from "./poster/engine";
+    18→import type { JobId, JobRunState, JobSpec, PosterRequest, AgentStatus, PosterKind } from "./types";
+    19→import { mkdirSync, writeFileSync } from "node:fs";
+    20→import path from "node:path";
+    21→
+    22→const TZ = "Asia/Tehran";
+    23→const BOOT_AT = Date.now();
+    24→
+    25→// ─── Tehran helpers (Intl-driven, DST-proof) ───────────────────────────────
+    26→
+    27→const partsFmt = new Intl.DateTimeFormat("en-GB", {
+    28→  timeZone: TZ,
+    29→  year: "numeric",
+    30→  month: "2-digit",
+    31→  day: "2-digit",
+    32→  hour: "2-digit",
+    33→  minute: "2-digit",
+    34→  second: "2-digit",
+    35→  hour12: false,
+    36→});
+    37→const dowFmt = new Intl.DateTimeFormat("en-US", { timeZone: TZ, weekday: "short" });
+    38→
+    39→export function tehranFields(ms = Date.now()): {
+    40→  y: number; mon: number; dom: number; h: number; min: number; s: number; dow: number;
+    41→} {
+    42→  const parts = partsFmt.formatToParts(new Date(ms));
+    43→  const get = (t: string) => Number(parts.find((p) => p.type === t)?.value ?? 0);
+    44→  const wd = dowFmt.format(new Date(ms)).toUpperCase();
+    45→  return {
+    46→    y: get("year"),
+    47→    mon: get("month"),
+    48→    dom: get("day"),
+    49→    h: get("hour") % 24,
+    50→    min: get("minute"),
+    51→    s: get("second"),
+    52→    dow: { SUN: 0, MON: 1, TUE: 2, WED: 3, THU: 4, FRI: 5, SAT: 6 }[wd] ?? 0,
+    53→  };
+    54→}
+    55→
+    56→export function tehranDateKey(ms = Date.now()): string {
+    57→  const f = tehranFields(ms);
+    58→  return `${f.y}${String(f.mon).padStart(2, "0")}${String(f.dom).padStart(2, "0")}`;
+    59→}
+    60→
+    61→// ─── 6-field cron matcher ──────────────────────────────────────────────────
+    62→
+    63→type Field = { wildcard: boolean; any: Set<number>; step?: number };
+    64→
+    65→function parseField(raw: string, min: number, max: number): Field {
+    66→  const any = new Set<number>();
+    67→  let wildcard = false;
+    68→  let step: number | undefined;
+    69→  for (const chunk of raw.split(",")) {
+    70→    if (chunk === "*") {
+    71→      wildcard = true;
+    72→      for (let i = min; i <= max; i++) any.add(i);
+    73→    } else if (chunk.startsWith("*/")) {
+    74→      wildcard = true;
+    75→      step = Number(chunk.slice(2));
+    76→      for (let i = min; i <= max; i += step) any.add(i);
+    77→    } else if (chunk.includes("-")) {
+    78→      const [a, b] = chunk.split("-").map(Number);
+    79→      for (let i = a; i <= b; i++) any.add(i);
+    80→    } else {
+    81→      any.add(Number(chunk));
+    82→    }
+    83→  }
+    84→  return { wildcard, any, step };
+    85→}
+    86→
+    87→interface Cron {
+    88→  sec: Field; min: Field; hour: Field; dom: Field; mon: Field; dow: Field;
+    89→}
+    90→
+    91→function parseCron(expr: string): Cron {
+    92→  const [sec, min, hour, dom, mon, dow] = expr.trim().split(/\s+/);
+    93→  return {
+    94→    sec: parseField(sec, 0, 59),
+    95→    min: parseField(min, 0, 59),
+    96→    hour: parseField(hour, 0, 23),
+    97→    dom: parseField(dom, 1, 31),
+    98→    mon: parseField(mon, 1, 12),
+    99→    dow: parseField(dow, 0, 6),
+   100→  };
+   101→}
+   102→
+   103→function cronMatches(c: Cron, f: ReturnType<typeof tehranFields>): boolean {
+   104→  return (
+   105→    c.sec.any.has(f.s) &&
+   106→    c.min.any.has(f.min) &&
+   107→    c.hour.any.has(f.h) &&
+   108→    c.mon.any.has(f.mon) &&
+   109→    (c.dom.wildcard || c.dow.wildcard
+   110→      ? c.dom.any.has(f.dom) || c.dow.any.has(f.dow)
+   111→      : c.dom.any.has(f.dom) && c.dow.any.has(f.dow))
+   112→  );
+   113→}
+   114→
+   115→/** next run strictly after `after` (ms epoch) for a Tehran-anchored cron */
+   116→export function nextCronRun(expr: string, after = Date.now()): number {
+   117→  const c = parseCron(expr);
+   118→  // iterate the next 2 days at second resolution starting from `after + 1s`
+   119→  let t = after + 1000;
+   120→  const limit = after + 2 * 86_400_000;
+   121→  while (t <= limit) {
+   122→    if (cronMatches(c, tehranFields(t))) return t;
+   123→    // jump smartly: skip to next minute boundary when seconds won't match soon
+   124→    const f = tehranFields(t);
+   125→    if (!c.hour.any.has(f.h) || !c.min.any.has(f.min)) {
+   126→      t += (59 - f.s) * 1000 + 1000; // finish current minute
+   127→      if (!c.hour.any.has(f.h)) t += (59 - f.min) * 60_000; // finish current hour
+   128→    } else {
+   129→      t += 1000;
+   130→    }
+   131→  }
+   132→  return after + 60_000;
+   133→}
+   134→
+   135→// ─── runtime state ─────────────────────────────────────────────────────────
+   136→
+   137→const nextRunAt = new Map<JobId, number>();
+   138→let liveOverride: boolean | null = null;
+   139→
+   140→function isLive(): boolean {
+   141→  if (liveOverride !== null) return liveOverride;
+   142→  return CONFIG.live;
+   143→}
+   144→
+   145→/** resolved VIP chat id: env first, then auto-discovered channel */
+   146→function vipChatId(): string {
+   147→  return CONFIG.vipChatId || store.kvGet("vipChatId") || "";
+   148→}
+   149→
+   150→export function setLive(on: boolean): void {
+   151→  liveOverride = on;
+   152→  store.kvSet("live", on ? "1" : "0");
+   153→}
+   154→
+   155→function restoreLive(): void {
+   156→  const v = store.kvGet("live");
+   157→  if (v !== null) liveOverride = v === "1";
+   158→}
+   159→
+   160→const OUTBOX = path.join(process.cwd(), "outbox");
+   161→
+   162→function saveOutbox(jobId: JobId, png: Buffer): void {
+   163→  try {
+   164→    mkdirSync(OUTBOX, { recursive: true });
+   165→    writeFileSync(path.join(OUTBOX, `last_${jobId}.png`), png);
+   166→  } catch {
+   167→    /* outbox is best-effort */
+   168→  }
+   169→}
+   170→
+   171→// ─── posting pipeline ──────────────────────────────────────────────────────
+   172→
+   173→interface PostOutcome {
+   174→  status: "SENT" | "DRY-RUN" | "SKIPPED" | "ERROR";
+   175→  error?: string;
+   176→  messageId?: number;
+   177→}
+   178→
+   179→async function deliver(
+   180→  jobId: JobId,
+   181→  target: string,
+   182→  kind: PosterKind,
+   183→  caption: string,
+   184→  png: Buffer
+   185→): Promise<PostOutcome> {
+   186→  saveOutbox(jobId, png);
+   187→  if (!isLive()) {
+   188→    store.logPost({
+   189→      at: new Date().toISOString(),
+   190→      jobId,
+   191→      target,
+   192→      posterKind: kind,
+   193→      mode: "DRY-RUN",
+   194→      caption,
+   195→      status: "DRY-RUN",
+   196→    });
+   197→    console.log(`[job:${jobId}] DRY-RUN ${kind} → ${target} (${Math.round(png.length / 1024)}KB)`);
+   198→    return { status: "DRY-RUN" };
+   199→  }
+   200→  const chatId = target === "vip" ? vipChatId() : CONFIG.publicChatId;
+   201→  if (!chatId) {
+   202→    store.logPost({
+   203→      at: new Date().toISOString(),
+   204→      jobId,
+   205→      target,
+   206→      posterKind: kind,
+   207→      mode: "LIVE",
+   208→      caption,
+   209→      status: "SKIPPED",
+   210→      error: "chat id not configured",
+   211→    });
+   212→    return { status: "SKIPPED", error: "chat id not configured" };
+   213→  }
+   214→  const res = await telegram.sendPhoto(chatId, png, caption);
+   215→  store.logPost({
+   216→    at: new Date().toISOString(),
+   217→    jobId,
+   218→    target,
+   219→    posterKind: kind,
+   220→    mode: "LIVE",
+   221→    messageId: res.messageId,
+   222→    caption,
+   223→    status: res.ok ? "SENT" : "ERROR",
+   224→    error: res.description,
+   225→  });
+   226→  console.log(
+   227→    `[job:${jobId}] ${res.ok ? "SENT" : "ERROR"} ${kind} → ${target}${res.messageId ? ` #${res.messageId}` : ""}${res.description ? ` (${res.description})` : ""}`
+   228→  );
+   229→  return { status: res.ok ? "SENT" : "ERROR", error: res.description, messageId: res.messageId };
+   230→}
+   231→
+   232→async function render(req: PosterRequest): Promise<Buffer> {
+   233→  const out = renderPoster(req);
+   234→  if (!out.ok) throw new Error(`render failed: ${out.error}`);
+   235→  return Buffer.from(out.pngBase64, "base64");
+   236→}
+   237→
+   238→function stageLabel(): string {
+   239→  const f = tehranFields();
+   240→  return `ST ${String(f.mon).padStart(2, "0")}-${String(f.dom).padStart(2, "0")}`;
+   241→}
+   242→
+   243→function kickoffLabel(card: CardMatch): string {
+   244→  if (!card.startTime) return "START TIME TBC";
+   245→  const ms = new Date(card.startTime).getTime();
+   246→  if (Number.isNaN(ms)) return "START TIME TBC";
+   247→  const f = tehranFields(ms);
+   248→  return `START ${String(f.h).padStart(2, "0")}:${String(f.min).padStart(2, "0")} TEHRAN`;
+   249→}
+   250→
+   251→const SURFACE_EN: Record<string, string> = {
+   252→  HARD: "HARD COURT",
+   253→  CLAY: "CLAY COURT",
+   254→  GRASS: "GRASS COURT",
+   255→};
+   256→
+   257→// ─── poster request builders ───────────────────────────────────────────────
+   258→
+   259→function flashcardRequest(card: CardMatch, kind: PosterKind = "FLASHCARD"): PosterRequest {
+   260→  const slips = [
+   261→    card.slipA && {
+   262→      key: card.slipA.key,
+   263→      label: "TYPE A",
+   264→      marketEn: card.slipA.marketEn,
+   265→      detail: card.slipA.detail,
+   266→      odds: card.slipA.odds,
+   267→      prob: card.slipA.prob,
+   268→    },
+   269→    card.slipB && {
+   270→      key: card.slipB.key,
+   271→      label: kind === "FREECARD" ? "TYPE B" : "TYPE B",
+   272→      marketEn: kind === "FREECARD" ? "FULL MARKET HIDDEN" : card.slipB.marketEn,
+   273→      detail: kind === "FREECARD" ? "UNLOCK THE SECOND WING INSIDE THE VIP ARENA. FULL DUTCHING PLAN POSTED DAILY." : card.slipB.detail,
+   274→      odds: kind === "FREECARD" ? 0 : card.slipB.odds,
+   275→      prob: card.slipB.prob,
+   276→      locked: kind === "FREECARD",
+   277→    },
+   278→  ].filter(Boolean) as PosterRequest["slips"];
+   279→  return {
+   280→    kind,
+   281→    title: kind === "FREECARD" ? "FREE CARD" : "MATCH OF THE DAY",
+   282→    subtitle: card.tournament,
+   283→    theme: card.surface,
+   284→    players: {
+   285→      a: card.playerA,
+   286→      b: card.playerB,
+   287→      shortA: card.shortA,
+   288→      shortB: card.shortB,
+   289→      rankA: card.rankA,
+   290→      rankB: card.rankB,
+   291→    },
+   292→    tournament: card.tournament,
+   293→    round: card.round,
+   294→    surfaceLabel: `${SURFACE_EN[card.surface] ?? "COURT"} - ${card.favorite === "A" ? "FAV A" : "FAV B"}`,
+   295→    slips,
+   296→    hash: card.hash,
+   297→    timeLabel: kickoffLabel(card),
+   298→    stage: stageLabel(),
+   299→    footerNote: kind === "FREECARD" ? "FULL CARD IN VIP" : "VIP ONLY - NOT FOR RESHARE - 18+",
+   300→  };
+   301→}
+   302→
+   303→function briefingRequest(
+   304→  cards: CardMatch[],
+   305→  vetoed: CardMatch[],
+   306→  quota: { poolSize: number; approved: number; adaptive: number }
+   307→): PosterRequest {
+   308→  const hhmm = (card: CardMatch): string => {
+   309→    if (!card.startTime) return "--:--";
+   310→    const ms = new Date(card.startTime).getTime();
+   311→    if (Number.isNaN(ms)) return "--:--";
+   312→    const f = tehranFields(ms);
+   313→    return `${String(f.h).padStart(2, "0")}:${String(f.min).padStart(2, "0")}`;
+   314→  };
+   315→  const rows: PosterRequest["rows"] = cards.slice(0, 8).map((c) => ({
+   316→    label: `${hhmm(c)} ${(c.shortA ?? c.playerA).slice(0, 16)} x ${(c.shortB ?? c.playerB).slice(0, 16)}`,
+   317→    value: `${c.surface} - ${(c.slipA?.key ?? "TBD").slice(0, 9)} - ${(c.slipA?.odds ?? 0).toFixed(2)}`,
+   318→    status: "INFO",
+   319→  }));
+   320→  const vetoRows: PosterRequest["rows"] = vetoed.slice(0, 5).map((v) => ({
+   321→    label: `${(v.shortA ?? v.playerA).slice(0, 16)} x ${(v.shortB ?? v.playerB).slice(0, 16)}`,
+   322→    value:
+   323→      v.vetoCode === "TOP100"
+   324→        ? "OUTSIDE TOP-100 DOMAIN"
+   325→        : v.vetoCode === "P02_RISK"
+   326→          ? "NO ELIGIBLE ARCHETYPE"
+   327→          : "MODEL VETO",
+   328→    status: "VETO",
+   329→  }));
+   330→  return {
+   331→    kind: "BRIEFING",
+   332→    title: "TODAY'S BATTLE ARENA",
+   333→    subtitle: `${tehranDateKey()} - ${cards.length} QUALIFIED PICKS`,
+   334→    theme: "HARD",
+   335→    rows: [...rows, ...vetoRows],
+   336→    bullets: [
+   337→      "MAX 2 UNITS PER PICK - NEVER CHASE A LOSS",
+   338→      "FLAT STAKES ONLY - NO PARLAY TODAY",
+   339→      "LINE LOCKED AT T-30M - NO LATE MOVES",
+   340→      "SKIP ANY MATCH IF ODDS DROP BELOW 1.60",
+   341→    ],
+   342→    stats: [
+   343→      { label: "APPROVED", value: String(quota.approved), accent: true },
+   344→      { label: "VETOED", value: String(vetoed.length) },
+   345→      { label: "QUOTA", value: "12 MAX" },
+   346→      { label: "BANK RISK", value: "2.0U" },
+   347→    ],
+   348→    stage: stageLabel(),
+   349→    footerNote: "FULL CARD IN VIP - 18+ - FLAT STAKES",
+   350→  } as PosterRequest;
+   351→}
+   352→
+   353→function aggregateRequest(
+   354→  title: string,
+   355→  kind: PosterKind,
+   356→  stats: { coreWinRate: number; profit: number; picks: number; settled: number; streak: number },
+   357→  rows: { matchLabel: string; status: string; profit: number; result?: string }[]
+   358→): PosterRequest {
+   359→  return {
+   360→    kind,
+   361→    title,
+   362→    subtitle: `${tehranDateKey()} - OFFICIAL LEDGER`,
+   363→    theme: "RESULTS",
+   364→    stats: [
+   365→      { label: "WIN RATE - CORE", value: `${Math.round(stats.coreWinRate * 100)}%`, accent: true },
+   366→      { label: "NET UNITS", value: `${stats.profit >= 0 ? "+" : ""}${Math.round(stats.profit)}U` },
+   367→      { label: "PICKS", value: String(stats.picks) },
+   368→      { label: "SETTLED", value: String(stats.settled) },
+   369→      { label: "STREAK", value: `${stats.streak >= 0 ? "W" : "L"}${Math.abs(stats.streak)}` },
+   370→    ],
+   371→    rows: rows.slice(0, 9).map((r) => ({
+   372→      label: r.matchLabel.slice(0, 30),
+   373→      value: r.result ? `FT ${r.result} - ${r.profit >= 0 ? "+" : ""}${Math.round(r.profit)}U` : "PENDING",
+   374→      status: r.status === "WON" ? ("WIN" as const) : r.status === "LOST" ? ("LOSS" as const) : ("PENDING" as const),
+   375→    })),
+   376→    stage: stageLabel(),
+   377→    footerNote: "SHA-256 LOCKED RECORDS - 18+",
+   378→  } as PosterRequest;
+   379→}
+   380→
+   381→function newsRequest(
+   382→  item: TennisNewsItem,
+   383→  live: LiveTennisMatch[],
+   384→  fitness: FitnessItem[]
+   385→): PosterRequest {
+   386→  const liveRows: PosterLiveRow[] = live.slice(0, 4).map((m) => ({
+   387→    label: `${m.shortA ?? m.playerA} v ${m.shortB ?? m.playerB} - ${m.tournament}`.slice(0, 42),
+   388→    value:
+   389→      m.state === "in"
+   390→        ? `${m.scoreLine || "LIVE"} - ${m.detail}`.slice(0, 34)
+   391→        : m.state === "pre"
+   392→          ? `SCHEDULED - ${m.detail}`.slice(0, 34)
+   393→          : `${m.scoreLine || "FT"} - ${m.detail}`.slice(0, 34),
+   394→    state: m.state === "in" ? ("LIVE" as const) : m.state === "pre" ? ("UPCOMING" as const) : ("FINAL" as const),
+   395→  }));
+   396→  const fitRows: PosterFitnessRow[] = fitness.slice(0, 3).map((f) => ({
+   397→    label: f.headline.toUpperCase(),
+   398→    tag: f.tag,
+   399→  }));
+   400→  return {
+   401→    kind: "NEWS",
+   402→    title: "TENNIS NEWSWIRE",
+   403→    theme: "LIVE",
+   404→    news: {
+   405→      headline: item.headline.toUpperCase(),
+   406→      description: item.description.toUpperCase(),
+   407→      source: "ESPN",
+   408→      published: item.published
+   409→        ? new Date(item.published).toLocaleDateString("en-GB", { timeZone: TZ })
+   410→        : undefined,
+   411→      tag: item.tour,
+   412→      live: liveRows,
+   413→      fitness: fitRows,
+   414→    },
+   415→    stage: stageLabel(),
+   416→    footerNote: "MORE AT ESPN.COM/TENNIS",
+   417→  } as PosterRequest;
+   418→}
+   419→
+   420→function academyRequest(index: number): PosterRequest {
+   421→  const l = ACADEMY[(index - 1) % ACADEMY.length];
+   422→  return {
+   423→    kind: "ACADEMY",
+   424→    title: "BET ACADEMY",
+   425→    theme: "ACADEMY",
+   426→    lesson: {
+   427→      index: l.index,
+   428→      term: l.term,
+   429→      phonetic: l.phonetic,
+   430→      category: l.category,
+   431→      definition: l.definition,
+   432→      example: l.example,
+   433→    },
+   434→    stage: stageLabel(),
+   435→    footerNote: "NEW LESSON DAILY - 14 LESSON SERIES",
+   436→  } as PosterRequest;
+   437→}
+   438→
+   439→function bannerRequest(stats: {
+   440→  coreWinRate: number;
+   441→  profit: number;
+   442→  picks: number;
+   443→}): PosterRequest {
+   444→  return {
+   445→    kind: "BANNER",
+   446→    title: "VIP ARCADE ARENA",
+   447→    subtitle: "INSERT COIN - JOIN THE WINNING SIDE",
+   448→    theme: "MARKETING",
+   449→    stats: [
+   450→      { label: "WIN RATE - CORE", value: `${Math.round(stats.coreWinRate * 100)}%`, accent: true },
+   451→      { label: "NET UNITS", value: `${stats.profit >= 0 ? "+" : ""}${Math.round(stats.profit)}U` },
+   452→      { label: "PICKS ON RECORD", value: String(stats.picks) },
+   453→    ],
+   454→    stage: stageLabel(),
+   455→    footerNote: "JOIN @aineobet - RESPONSIBLE GAMBLING - 18+",
+   456→  } as PosterRequest;
+   457→}
+   458→
+   459→// ─── job handlers ──────────────────────────────────────────────────────────
+   460→
+   461→type Handler = () => Promise<PostOutcome>;
+   462→
+   463→async function ensureWarm(): Promise<void> {
+   464→  const last = store.kvGet("lastFeedWarmMs");
+   465→  const stale = !last || Date.now() - Number(last) > 10 * 60_000;
+   466→  if (stale) {
+   467→    const ok = await dataHub.warm();
+   468→    if (ok) store.kvSet("lastFeedWarmMs", String(Date.now()));
+   469→  }
+   470→}
+   471→
+   472→function vetoedRowsOf(cards: CardMatch[]): CardMatch[] {
+   473→  return cards.filter((c) => c.vetoed);
+   474→}
+   475→
+   476→const handlers: Record<JobId, Handler> = {
+   477→  async vip_briefing() {
+   478→    await ensureWarm();
+   479→    const approved = dataHub.approvedPool().slice(0, 8);
+   480→    const vetoed = vetoedRowsOf(dataHub.cards());
+   481→    if (approved.length === 0 && vetoed.length === 0) return { status: "SKIPPED", error: "no cards today" };
+   482→    const quota = { ...dataHub.quota(), adaptive: dataHub.cards().filter((c) => c.adaptive).length };
+   483→    // fitness radar feeds the morning discipline block too
+   484→    const radar = await fetchTennisRadar().catch(() => null);
+   485→    const png = await render(briefingRequest(approved, vetoed, quota));
+   486→    const caption = cap.captionBriefing(approved, vetoed, quota, radar?.fitness ?? []);
+   487→    return deliver("vip_briefing", "vip", "BRIEFING", caption, png);
+   488→  },
+   489→
+   490→  async flashcards() {
+   491→    await ensureWarm();
+   492→    const dateKey = tehranDateKey();
+   493→    if (store.kvGet("flashDateKey") !== dateKey) store.resetQueueForDay(dateKey);
+   494→    const pool = dataHub.approvedPool();
+   495→    if (pool.length === 0) return { status: "SKIPPED", error: "flash pool empty" };
+   496→    const cursor = Number(store.kvGet("flashCursor") ?? "0") % pool.length;
+   497→    const card = pool[cursor];
+   498→    store.kvSet("flashCursor", String(cursor + 1));
+   499→    const png = await render(flashcardRequest(card));
+   500→    const caption = cap.captionFlashcard(card, !!card.adaptive);
+   501→    return deliver("flashcards", "vip", "FLASHCARD", caption, png);
+   502→  },
+   503→
+   504→  async vip_aggregate() {
+   505→    await ensureWarm();
+   506→    const stats = dataHub.stats();
+   507→    if (!stats) return { status: "SKIPPED", error: "no stats" };
+   508→    const rows = dataHub.settledToday();
+   509→    const png = await render(
+   510→      aggregateRequest("DAILY LEDGER - VIP", "AGGREGATE", stats, rows)
+   511→    );
+   512→    const caption = cap.captionAggregate(stats, rows, false);
+   513→    return deliver("vip_aggregate", "vip", "AGGREGATE", caption, png);
+   514→  },
+   515→
+   516→  async weekly_report() {
+   517→    await ensureWarm();
+   518→    const stats = dataHub.stats();
+   519→    if (!stats) return { status: "SKIPPED", error: "no stats" };
+   520→    const rows = dataHub.settledRows(7);
+   521→    const png = await render(aggregateRequest("WEEKLY REPORT - 7 DAY LEDGER", "WEEKLY", stats, rows));
+   522→    const caption = cap.captionWeekly(stats, rows);
+   523→    const out1 = await deliver("weekly_report", "public", "WEEKLY", caption, png);
+   524→    if (vipChatId()) {
+   525→      const out2 = await deliver("weekly_report", "vip", "WEEKLY", caption, png);
+   526→      return out1.status === "SENT" || out2.status === "SENT" ? out1 : out2;
+   527→    }
+   528→    return out1;
+   529→  },
+   530→
+   531→  async tennis_news_am() {
+   532→    return postNews("tennis_news_am");
+   533→  },
+   534→  async tennis_news_pm() {
+   535→    return postNews("tennis_news_pm");
+   536→  },
+   537→
+   538→  async academy_am() {
+   539→    return postAcademy("academy_am");
+   540→  },
+   541→  async academy_pm() {
+   542→    return postAcademy("academy_pm");
+   543→  },
+   544→
+   545→  async free_card() {
+   546→    await ensureWarm();
+   547→    const card = dataHub.freeCardCandidate() ?? dataHub.dbFallbackCards().find((c) => c.slipA);
+   548→    if (!card) return { status: "SKIPPED", error: "no free card candidate" };
+   549→    const png = await render(flashcardRequest(card, "FREECARD"));
+   550→    const caption = cap.captionFreeCard(card);
+   551→    return deliver("free_card", "public", "FREECARD", caption, png);
+   552→  },
+   553→
+   554→  async marketing_banner() {
+   555→    await ensureWarm();
+   556→    const stats = dataHub.stats();
+   557→    if (!stats) return { status: "SKIPPED", error: "no stats" };
+   558→    const png = await render(bannerRequest(stats));
+   559→    const caption = cap.captionBanner(stats);
+   560→    return deliver("marketing_banner", "public", "BANNER", caption, png);
+   561→  },
+   562→
+   563→  async ft_results() {
+   564→    await ensureWarm();
+   565→    const stats = dataHub.stats();
+   566→    if (!stats) return { status: "SKIPPED", error: "no stats" };
+   567→    const rows = dataHub.settledToday();
+   568→    const f = dataHub.getFeed();
+   569→    const won = f ? f.ledger.rows.filter((r) => r.status === "WON").length : 0;
+   570→    const lost = f ? f.ledger.rows.filter((r) => r.status === "LOST").length : 0;
+   571→    const png = await render(aggregateRequest("FULL TIME RESULTS", "FTRESULTS", stats, rows));
+   572→    const caption = cap.captionFtResults(rows, { coreWinRate: stats.coreWinRate, won, lost });
+   573→    return deliver("ft_results", "public", "FTRESULTS", caption, png);
+   574→  },
+   575→
+   576→  async public_aggregate() {
+   577→    await ensureWarm();
+   578→    const stats = dataHub.stats();
+   579→    if (!stats) return { status: "SKIPPED", error: "no stats" };
+   580→    const rows = dataHub.settledToday();
+   581→    const png = await render(
+   582→      aggregateRequest("NIGHTLY LEDGER", "AGGREGATE", stats, rows)
+   583→    );
+   584→    const caption = cap.captionAggregate(stats, rows, true);
+   585→    return deliver("public_aggregate", "public", "AGGREGATE", caption, png);
+   586→  },
+   587→};
+   588→
+   589→async function postNews(jobId: JobId): Promise<PostOutcome> {
+   590→  const radar = await fetchTennisRadar();
+   591→  const fresh = radar.news.find((i) => !store.hasNews(i.id)) ?? radar.news[0];
+   592→  if (!fresh) return { status: "SKIPPED", error: "no tennis news available" };
+   593→  if (!store.hasNews(fresh.id)) store.markNews(fresh.id);
+   594→  const tr = await cap.translateNewsToPersian(fresh.headline, fresh.description);
+   595→  const png = await render(newsRequest(fresh, radar.live, radar.fitness));
+   596→  const caption = cap.captionNews(fresh, tr, radar.live, radar.fitness);
+   597→  return deliver(jobId, "public", "NEWS", caption, png);
+   598→}
+   599→
+   600→async function postAcademy(jobId: JobId): Promise<PostOutcome> {
+   601→  const next = Number(store.kvGet("academyNext") ?? "1");
+   602→  const index = ((next - 1) % ACADEMY.length) + 1;
+   603→  store.kvSet("academyNext", String(index + 1));
+   604→  const png = await render(academyRequest(index));
+   605→  const caption = cap.captionAcademy(index);
+   606→  return deliver(jobId, "public", "ACADEMY", caption, png);
+   607→}
+   608→
+   609→// ─── scheduler core ────────────────────────────────────────────────────────
+   610→
+   611→let running = new Set<JobId>();
+   612→
+   613→async function runJob(jobId: JobId, reason: "cron" | "manual" = "cron"): Promise<PostOutcome> {
+   614→  if (running.has(jobId)) return { status: "SKIPPED", error: "already running" };
+   615→  running.add(jobId);
+   616→  try {
+   617→    const out = await handlers[jobId]();
+   618→    store.recordRun(jobId, out.status, { error: out.error, messageId: out.messageId });
+   619→    return out;
+   620→  } catch (e) {
+   621→    const error = e instanceof Error ? e.message : String(e);
+   622→    console.error(`[job:${jobId}] ${reason} error:`, error);
+   623→    store.recordRun(jobId, "ERROR", { error });
+   624→    return { status: "ERROR", error };
+   625→  } finally {
+   626→    running.delete(jobId);
+   627→  }
+   628→}
+   629→
+   630→function scheduleAll(): void {
+   631→  for (const job of JOB_SPECS) {
+   632→    if (job.cron) {
+   633→      nextRunAt.set(job.id, nextCronRun(job.cron));
+   634→    } else if (job.everySeconds) {
+   635→      nextRunAt.set(job.id, Date.now() + (job.everySeconds * 1000));
+   636→    }
+   637→  }
+   638→}
+   639→
+   640→function tick(): void {
+   641→  const now = Date.now();
+   642→  for (const job of JOB_SPECS) {
+   643→    const next = nextRunAt.get(job.id);
+   644→    if (next === undefined || now < next) continue;
+   645→    if (job.cron) {
+   646→      nextRunAt.set(job.id, nextCronRun(job.cron, now));
+   647→    } else if (job.everySeconds) {
+   648→      nextRunAt.set(job.id, now + job.everySeconds * 1000);
+   649→    }
+   650→    void runJob(job.id);
+   651→  }
+   652→}
+   653→
+   654→export function startScheduler(): void {
+   655→  registerFonts();
+   656→  restoreLive();
+   657→  scheduleAll();
+   658→  // warm immediately so the first flashcard is never cold
+   659→  void dataHub.warm().then((ok) => {
+   660→    if (ok) store.kvSet("lastFeedWarmMs", String(Date.now()));
+   661→  });
+   662→  setInterval(tick, 1000);
+   663→  // engine keep-warm loop — the core must never go cold
+   664→  setInterval(() => {
+   665→    void ensureWarm();
+   666→  }, 5 * 60_000);
+   667→  // tennis radar keep-warm (news/live/fitness cache stays hot)
+   668→  setInterval(() => {
+   669→    void fetchTennisRadar().catch(() => null);
+   670→  }, 4 * 60_000);
+   671→  // VIP channel auto-discovery — the moment the bot becomes admin of (or
+   672→  // receives any update from) the VIP channel, its numeric id is captured.
+   673→  setInterval(() => {
+   674→    void discoverVipLoop();
+   675→  }, 30_000);
+   676→  console.log(
+   677→    `[scheduler] started - ${JOB_SPECS.length} jobs - live=${isLive()} - tz=${TZ}`
+   678→  );
+   679→  for (const job of JOB_SPECS) {
+   680→    const next = nextRunAt.get(job.id);
+   681→    console.log(`[scheduler] ${job.id.padEnd(18)} next=${next ? new Date(next).toISOString() : "-"}`);
+   682→  }
+   683→  void discoverVipLoop();
+   684→}
+   685→
+   686→/** capture the VIP channel id from any chat the bot can see */
+   687→async function discoverVipLoop(): Promise<void> {
+   688→  try {
+   689→    const chats = await telegram.discoverChats();
+   690→    for (const ch of chats) {
+   691→      const isPublic = !!ch.username && CONFIG.publicChatId.includes(ch.username);
+   692→      const isChannelish = ch.type === "channel" || ch.type === "supergroup";
+   693→      if (isChannelish && ch.id) {
+   694→        store.kvSet(`chatSeen:${ch.id}`, JSON.stringify(ch));
+   695→      }
+   696→      if (isChannelish && !isPublic && ch.id) {
+   697→        const idStr = String(ch.id);
+   698→        if (vipChatId() !== idStr) {
+   699→          store.kvSet("vipChatId", idStr);
+   700→          store.kvSet("vipChatTitle", ch.title ?? "");
+   701→          console.log(`[discover] VIP chat captured: ${idStr} (${ch.title ?? ch.type})`);
+   702→        }
+   703→      }
+   704→    }
+   705→  } catch {
+   706→    /* discovery is best-effort */
+   707→  }
+   708→}
+   709→
+   710→export async function runManually(jobId: JobId): Promise<PostOutcome> {
+   711→  return runJob(jobId, "manual");
+   712→}
+   713→
+   714→/** single scheduler pass — exposed for the /tick HTTP endpoint */
+   715→export function tickOnce(): void {
+   716→  tick();
+   717→}
+   718→
+   719→export function status(): AgentStatus {
+   720→  const jobs = JOB_SPECS.map((j) => {
+   721→    const st = store.getJobState(j.id);
+   722→    return {
+   723→      ...(j as JobSpec),
+   724→      lastRun: st?.lastRun ?? undefined,
+   725→      lastStatus: (st?.lastStatus as JobRunState["lastStatus"]) ?? undefined,
+   726→      lastError: st?.lastError ?? undefined,
+   727→      lastMessageId: st?.lastMessageId ?? undefined,
+   728→      nextRun: nextRunAt.has(j.id)
+   729→        ? new Date(nextRunAt.get(j.id)!).toISOString()
+   730→        : undefined,
+   731→      runs: st?.runs ?? 0,
+   732→    } as JobSpec & JobRunState;
+   733→  });
+   734→  const f = dataHub.getFeed();
+   735→  const radar = peekRadar();
+   736→  return {
+   737→    ok: true,
+   738→    bot: { username: "Aineobet_bot", live: isLive() },
+   739→    chats: { public: CONFIG.publicChatId, vip: vipChatId() || undefined, vipTitle: store.kvGet("vipChatTitle") || undefined },
+   740→    uptimeSeconds: Math.round((Date.now() - BOOT_AT) / 1000),
+   741→    jobs,
+   742→    recentPosts: store.recentPosts(20),
+   743→    flashQueue: {
+   744→      cursor: Number(store.kvGet("flashCursor") ?? "0"),
+   745→      total: dataHub.approvedPool().length,
+   746→      dateKey: tehranDateKey(),
+   747→    },
+   748→    academy: {
+   749→      nextLesson: Number(store.kvGet("academyNext") ?? "1"),
+   750→      total: ACADEMY.length,
+   751→    },
+   752→    dataFeed: {
+   753→      lastWarmOk: dataHub.lastOk,
+   754→      lastWarmAt: dataHub.lastAt,
+   755→      matches: f?.matches.length ?? 0,
+   756→      approved: dataHub.approvedPool().length,
+   757→    },
+   758→    radar: {
+   759→      news: radar?.news.length ?? 0,
+   760→      live: radar?.live.length ?? 0,
+   761→      liveNow: radar?.live.filter((m) => m.state === "in").length ?? 0,
+   762→      fitness: radar?.fitness.length ?? 0,
+   763→    },
+   764→  };
+   765→}
+   766→
+   767→// tree-shaking honesty imports
+   768→void LEG_DETAIL_EN;
+   769→void CONFIG.live;
+   770→

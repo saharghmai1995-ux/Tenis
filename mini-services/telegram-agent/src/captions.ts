@@ -14,7 +14,10 @@ import type { SettledRow } from "./data";
 import type { TennisNewsItem, LiveTennisMatch, FitnessItem } from "./espn";
 
 const fa = (n: number): string => n.toLocaleString("fa-IR");
-const faOdds = (n: number): string => n.toFixed(2).replace(/[0-9]/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[+d]);
+const faOdds = (n: number): string =>
+  n.toFixed(2).replace(/[0-9]/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[+d]).replace(".", "٫");
+const faStake = (n: number | undefined): string =>
+  (n ?? 1).toLocaleString("fa-IR", { maximumFractionDigits: 1 });
 
 // ─── LLM Persian translation ───────────────────────────────────────────────
 
@@ -84,7 +87,7 @@ export async function translateNewsToPersian(
   } catch (e) {
     console.error("[caption] translation fallback:", e instanceof Error ? e.message : e);
     return {
-      titleFa: "خبر مهم تنیس از ESPN",
+      titleFa: "خبر مهم تنیس از ای‌اس‌پی‌ان",
       bodyFa:
         "ترجمه خودکار این خبر در این لحظه در دسترس نبود؛ پوستر انگلیسی خبر را در همین پست می‌بینید. ترجمه کامل فارسی در پست بعدی همان خبر ارائه می‌شود.",
       ok: false,
@@ -94,7 +97,10 @@ export async function translateNewsToPersian(
 
 // ─── Persian caption builders (one per job family) ─────────────────────────
 
-const BRAND = "\u200f🅽🅴🅾🅱🅴🆃 | کانال رسمی NeoBet";
+// BRAND FIX (director report): the old 🅽🅴🅾🅱🅴🆃 negative-squared "sticker"
+// glyphs rendered incompletely on several devices. Plain text + red circle
+// emojis render 100% reliably on every Telegram client.
+const BRAND = "🔴 NEOBET | کانال رسمی نئوبت";
 const FOOT = "\n\n————————————————\n⚡️ کانال عمومی: @aineobet\n👑 کارت‌های کامل VIP: @aineobet_vip\n⚠️ +۱۸ | مسئولیت مالی با شماست.";
 
 function slipFa(card: CardMatch, wing: "A" | "B"): string {
@@ -110,7 +116,13 @@ function slipFa(card: CardMatch, wing: "A" | "B"): string {
   };
   const text = legFa[slip.key] ?? slip.marketEn;
   const prob = slip.prob !== undefined ? ` | احتمال مدل: ٪${Math.round(slip.prob * 100)}` : "";
-  return `🔹 ${wing === "A" ? "تیپ A" : "تیپ B"} — ${text} | ضریب: ${faOdds(slip.odds)}${prob}`;
+  const edge =
+    slip.edge !== undefined && slip.edge > 0.02
+      ? ` | ارزش: ٪+${(slip.edge * 100).toFixed(1)}`
+      : "";
+  // director rule: stake amount per tip must always be visible
+  const stake = ` | استیک: ${faStake(slip.stake)} واحد`;
+  return `🔹 ${wing === "A" ? "تیپ A" : "تیپ B"} — ${text} | ضریب: ${faOdds(slip.odds)}${prob}${edge}${stake}`;
 }
 
 function cardHeaderFa(card: CardMatch): string {
@@ -128,7 +140,11 @@ function cardHeaderFa(card: CardMatch): string {
   );
 }
 
-export function captionFlashcard(card: CardMatch, adaptive: boolean): string {
+export function captionFlashcard(
+  card: CardMatch,
+  adaptive: boolean,
+  angle?: { labelFa: string; insightFa: string }
+): string {
   const parts = [
     BRAND,
     "🎯 فلش‌کارت اختصاصی VIP",
@@ -138,11 +154,12 @@ export function captionFlashcard(card: CardMatch, adaptive: boolean): string {
     slipFa(card, "B"),
     "",
     `📐 پوشش دوپایی: ٪${Math.round((card.coverage ?? 0) * 100)} — یعنی در ${(card.coverage ?? 0) >= 0.9 ? "بیش از ۹۰" : "بخش عمده‌ای"} از مسیرهای ممکن بازی، حداقل یکی از دو تیپ برنده می‌شود.`,
+    angle ? `🧠 نگاه این دور (${angle.labelFa}): ${angle.insightFa}` : "",
     adaptive
       ? "🛠 این کارت با «گرانت تطبیقی» سوپروایزر صادر شده است؛ ریسک هم‌زمان بالاتر از حالت طبیعی است و صادقانه اعلام می‌شود."
       : "✅ این کارت به‌صورت طبیعی از دروازه‌های الگو گذاشته است.",
     `🔐 قفل SHA-256 پیش از بازی: ${card.hash ?? "—"}`,
-    "🧭 انضباط اجرا: فقط یک واحد ثابت روی هر تیپ؛ بدون چیس، بدون افزایش استیک، بدون ورود خارج از تایمینگ.",
+    "🧭 انضباط اجرا: استیک اعلام‌شده روی هر تیپ الزامی است (نردبان ۰٫۵ تا ۲ واحد)؛ بدون چیس، بدون افزایش استیک، بدون ورود خارج از تایمینگ.",
   ];
   return parts.filter(Boolean).join("\n") + FOOT;
 }
@@ -158,7 +175,7 @@ export function captionFreeCard(card: CardMatch): string {
     "",
     "🔒 تیپ B همین بازی فقط در کانال VIP منتشر می‌شود؛ همان ساختار دوپایی که تیپ A را پوشش می‌دهد.",
     "👉 برای دریافت کامل هر ۹ پست روزانه و همه فلش‌کارت‌ها به کانال VIP بپیوندید.",
-    "🧭 همین قوانین اجرا: یک واحد ثابت، بدون چیس، تایمینگ اعلام‌شده.",
+    "🧭 همین قوانین اجرا: استیک اعلام‌شده روی تیپ، بدون چیس، تایمینگ اعلام‌شده.",
   ];
   return parts.filter(Boolean).join("\n") + FOOT;
 }
@@ -178,8 +195,14 @@ export function captionBriefing(
   ];
   top.forEach((c, i) => {
     lines.push(`${i + 1}. ${c.playerA} × ${c.playerB} — ${c.tournament}`);
-    if (c.slipA) lines.push(`   🔹 تیپ A: ضریب ${faOdds(c.slipA.odds)} | احتمال ٪${Math.round((c.slipA.prob ?? 0) * 100)}`);
-    if (c.slipB) lines.push(`   🔹 تیپ B: ضریب ${faOdds(c.slipB.odds)} | احتمال ٪${Math.round((c.slipB.prob ?? 0) * 100)}`);
+    if (c.slipA)
+      lines.push(
+        `   🔹 تیپ A: ضریب ${faOdds(c.slipA.odds)} | احتمال ٪${Math.round((c.slipA.prob ?? 0) * 100)} | استیک ${faStake(c.slipA.stake)} واحد`
+      );
+    if (c.slipB)
+      lines.push(
+        `   🔹 تیپ B: ضریب ${faOdds(c.slipB.odds)} | احتمال ٪${Math.round((c.slipB.prob ?? 0) * 100)} | استیک ${faStake(c.slipB.stake)} واحد`
+      );
     lines.push(`   🔐 قفل: ${c.hash ?? "—"}`);
   });
   lines.push("");
@@ -198,7 +221,7 @@ export function captionBriefing(
   }
   lines.push("");
   lines.push("🧭 انضباط اجرا (غیرقابل مذاکره):");
-  lines.push("۱. حداکثر یک واحد روی هر تیپ — استیک ثابت طول روز");
+  lines.push("۱. استیک اعلام‌شده روی هر تیپ الزامی است — نردبان ۰٫۵ تا ۲ واحد، بدون چیس");
   lines.push("۲. بدون پارلی خودسرانه بین کارت‌ها");
   lines.push("۳. ورود فقط در تایمینگ اعلام‌شده (T-۳۰ دقیقه)");
   lines.push("۴. باخت پشت‌سرهم = نه به چیس؛ بانک مقدس است");

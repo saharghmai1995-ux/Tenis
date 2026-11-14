@@ -62,7 +62,14 @@ interface AgentStatusPayload {
   uptimeSeconds: number;
   jobs: AgentJob[];
   recentPosts: AgentPost[];
-  flashQueue: { cursor: number; total: number; dateKey: string };
+  flashQueue: {
+    cursor: number;
+    total: number;
+    dateKey: string;
+    postsToday?: number;
+    cooldownActive?: boolean;
+    cooldownMinutes?: number;
+  };
   academy: { nextLesson: number; total: number };
   dataFeed: { lastWarmOk: boolean; lastWarmAt?: string; matches: number; approved: number };
 }
@@ -233,8 +240,11 @@ export function SupervisorMonitor() {
             },
             {
               icon: <Clock className="size-3.5 text-cyan-300" />,
-              label: "صف فلش‌کارت",
-              value: `${st.flashQueue.cursor}/${st.flashQueue.total}`,
+              label: "فلش‌کارت امروز",
+              value:
+                st.flashQueue.postsToday !== undefined
+                  ? `${st.flashQueue.postsToday} پست${st.flashQueue.cooldownActive ? " · استراحت ضدتکرار" : ""}`
+                  : `${st.flashQueue.cursor}/${st.flashQueue.total}`,
             },
             {
               icon: <Radio className="size-3.5 text-fuchsia-300" />,

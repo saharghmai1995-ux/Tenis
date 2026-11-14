@@ -490,6 +490,7 @@ function drawPlayerPlate(
   rank: number | undefined,
   flag: string | undefined,
   accent: string,
+  fav = false,
 ): void {
   P.panel(x, y, w, h, PANEL);
   drawPixelBorder(P.ctx, x, y, w, h, accent);
@@ -505,6 +506,13 @@ function drawPlayerPlate(
   P.text(short, x + w / 2, y + 112, shortFont, CREAM, "center");
   if (full && full !== name) {
     P.text(P.fit(full, w - 60, fSans(20)), x + w / 2, y + 152, fSans(20, "normal"), GREY, "center");
+  }
+  if (fav) {
+    const favFont = fMono(16);
+    P.ctx.font = favFont;
+    const tw = P.ctx.measureText("FAV").width;
+    P.chip("FAV", x + 18, y + h - 52, { font: favFont, fg: INK, bg: GOLD, h: 32, padX: 10 });
+    drawSprite(P.ctx, SPRITES.STAR, x + 28 + tw + 14, y + h - 47, 2, { "#": GOLD });
   }
 }
 
@@ -550,6 +558,36 @@ function drawSlipBox(P: Painter, x: number, y: number, w: number, h: number, sli
   const detailY = Math.max(marketLines + 26, y + 140);
   P.wrapped(slip.detail, x + 24, detailY, w - 48, fMono(17, "normal"), GREY, 25, 4);
 
+  // stake + edge chips (director rule: stake per tip must be visible)
+  if (slip.stake !== undefined || slip.edge !== undefined) {
+    const chipY = y + 258;
+    if (slip.stake !== undefined) {
+      const stakeText = `STAKE ${slip.stake === Math.floor(slip.stake) ? slip.stake : slip.stake.toFixed(1)}U`;
+      P.chip(stakeText, x + 24, chipY, {
+        font: fMono(20),
+        fg: INK,
+        bg: GOLD,
+        h: 44,
+        padX: 14,
+      });
+    }
+    if (slip.edge !== undefined) {
+      const pct = slip.edge * 100;
+      const sign = pct >= 0 ? "+" : "−";
+      const edgeText = `EDGE ${sign}${Math.abs(pct).toFixed(1)}%`;
+      const pos = pct >= 0;
+      const col = pos ? GREEN : RED;
+      P.chipRight(edgeText, x + w - 24, chipY, {
+        font: fMono(20),
+        fg: col,
+        border: col,
+        bg: pos ? "rgba(66,226,130,0.10)" : "rgba(255,93,93,0.10)",
+        h: 44,
+        padX: 14,
+      });
+    }
+  }
+
   // odds
   P.text("ODDS", x + w / 2, y + h - 222, fMono(17), GREY, "center");
   P.text(slip.odds.toFixed(2), x + w / 2 + 4, y + h - 140, fMono(84), GOLD, "center");
@@ -574,17 +612,19 @@ function drawFlashcard(P: Painter, req: PosterRequest): void {
   const { w } = P;
   const free = req.kind === "FREECARD";
   const pl = req.players;
+  const intel = req.intel;
 
-  // tournament + round
+  // tour + tournament + round
   if (req.tournament || req.round) {
-    const line = `${req.tournament ?? ""}${req.round ? ` - ${req.round}` : ""}`.trim();
-    P.text(line, w / 2, 110, fMono(22), CYAN, "center");
+    const tourPart = intel?.tour ? `${intel.tour.toUpperCase()} - ` : "";
+    const line = `${tourPart}${req.tournament ?? ""}${req.round ? ` - ${req.round}` : ""}`.trim();
+    P.text(P.fit(line, w - 80, fMono(22)), w / 2, 110, fMono(22), CYAN, "center");
   }
 
-  // player plates
+  // player plates (favorite gets the star)
   if (pl) {
-    drawPlayerPlate(P, 24, 130, 470, 190, pl.shortA ?? pl.a, pl.a, pl.rankA, pl.flagA, GOLD);
-    drawPlayerPlate(P, 586, 130, 470, 190, pl.shortB ?? pl.b, pl.b, pl.rankB, pl.flagB, CYAN);
+    drawPlayerPlate(P, 24, 130, 470, 190, pl.shortA ?? pl.a, pl.a, pl.rankA, pl.flagA, GOLD, intel?.favSide === "A");
+    drawPlayerPlate(P, 586, 130, 470, 190, pl.shortB ?? pl.b, pl.b, pl.rankB, pl.flagB, CYAN, intel?.favSide === "B");
 
     // center VS with ball above
     drawSprite(P.ctx, SPRITES.BALL, 516, 142, 4);
@@ -632,24 +672,82 @@ function drawFlashcard(P: Painter, req: PosterRequest): void {
   if (slips[0]) drawSlipBox(P, 24, slipY, bw, boxH, slips[0], GOLD, free);
   if (slips[1]) drawSlipBox(P, w - 24 - bw, slipY, bw, boxH, slips[1], CYAN, free);
 
-  // time label chip + deco sprite row
+  // ── bottom block: intel strip + time + rotating insight panel ──────────
   const infoY = slipY + boxH + 26;
-  if (req.timeLabel) {
-    P.chipCentered(req.timeLabel, w / 2, infoY, {
-      font: fMono(20),
-      fg: CREAM,
-      border: GREY,
-      bg: "rgba(154,167,180,0.10)",
-      h: 42,
-      padX: 18,
+  const hasIntel = !!intel && (intel.favProb !== undefined || intel.coverage !== undefined || intel.archLabel);
+
+  if (hasIntel) {
+    // intel chips row (model / coverage / archetype / timing)
+    const chips: Array<{ t: string; fg: string; border: string; bg: string }> = [];
+    if (intel?.favProb !== undefined) {
+      chips.push({ t: `MODEL ${Math.round(intel.favProb * 100)}%`, fg: GOLD, border: GOLD, bg: "rgba(255,209,102,0.10)" });
+    }
+    if (intel?.coverage !== undefined) {
+      chips.push({ t: `COVER ${Math.round(intel.coverage * 100)}%`, fg: OPTIC, border: OPTIC, bg: "rgba(223,255,79,0.08)" });
+    }
+    if (intel?.archLabel) {
+      chips.push({ t: P.fit(`ARCH ${intel.archLabel}`, 230, fMono(16)), fg: CYAN, border: CYAN, bg: "rgba(77,214,255,0.08)" });
+    }
+    if (intel?.timing) {
+      chips.push({ t: P.fit(intel.timing.toUpperCase(), 230, fMono(16)), fg: GREY, border: "#3d4654", bg: "rgba(61,70,84,0.25)" });
+    }
+    const chipH = 38;
+    const gap = 14;
+    const widths = chips.map((c) => {
+      P.ctx.font = fMono(16);
+      return Math.ceil(P.ctx.measureText(c.t).width) + 26;
     });
+    const totalW = widths.reduce((a, b) => a + b, 0) + gap * (chips.length - 1);
+    let cx = w / 2 - totalW / 2;
+    chips.forEach((c, i) => {
+      P.chip(c.t, Math.round(cx), infoY, { font: fMono(16), fg: c.fg, border: c.border, bg: c.bg, h: chipH, padX: 13 });
+      cx += widths[i] + gap;
+    });
+
+    // time chip
+    if (req.timeLabel) {
+      P.chipCentered(req.timeLabel, w / 2, infoY + 54, {
+        font: fMono(20),
+        fg: CREAM,
+        border: GREY,
+        bg: "rgba(154,167,180,0.10)",
+        h: 42,
+        padX: 18,
+      });
+    }
+
+    // rotating insight panel (content changes every pass — anti-repeat)
+    if (intel?.insightEn) {
+      const py = infoY + 116;
+      const ph = 168;
+      P.panel(24, py, w - 48, ph, PANEL);
+      drawPixelBorder(P.ctx, 24, py, w - 48, ph, GOLD);
+      const angleTitle = intel.angleLabel
+        ? `${intel.angleLabel.toUpperCase()} - SUPERVISOR ROTATION`
+        : "SUPERVISOR INSIGHT";
+      drawSectionLabel(P, 62, py + 44, angleTitle, GOLD);
+      drawSprite(P.ctx, SPRITES.STAR, w - 110, py + 26, 3, { "#": GOLD });
+      P.wrapped(intel.insightEn, 62, py + 92, w - 190, fMono(19, "normal"), CREAM, 27, 3);
+    }
+  } else {
+    // legacy bottom block
+    if (req.timeLabel) {
+      P.chipCentered(req.timeLabel, w / 2, infoY, {
+        font: fMono(20),
+        fg: CREAM,
+        border: GREY,
+        bg: "rgba(154,167,180,0.10)",
+        h: 42,
+        padX: 18,
+      });
+    }
+    const decoY = infoY + 74;
+    P.ctx.globalAlpha = 0.92;
+    drawSprite(P.ctx, SPRITES.RACKET, 110, decoY, 7);
+    drawSprite(P.ctx, SPRITES.BALL, 486, decoY + 26, 7);
+    drawSprite(P.ctx, SPRITES.JOYSTICK, 860, decoY, 7);
+    P.ctx.globalAlpha = 1;
   }
-  const decoY = infoY + 74;
-  P.ctx.globalAlpha = 0.92;
-  drawSprite(P.ctx, SPRITES.RACKET, 110, decoY, 7);
-  drawSprite(P.ctx, SPRITES.BALL, 486, decoY + 26, 7);
-  drawSprite(P.ctx, SPRITES.JOYSTICK, 860, decoY, 7);
-  P.ctx.globalAlpha = 1;
 }
 
 // ─── BRIEFING (1080x1920) ───────────────────────────────────────────────────
@@ -1252,6 +1350,8 @@ export function samplePoster(kind: PosterKind): PosterRequest {
             detail: "ALCARAZ TO WIN THE MATCH BY EXACTLY 2 SETS TO 0. VALID FOR FULL MATCH ONLY. VOID IF RETIRED.",
             odds: 1.97,
             prob: 0.51,
+            stake: 1,
+            edge: 0.005,
           },
           {
             key: "TS-O25",
@@ -1260,8 +1360,23 @@ export function samplePoster(kind: PosterKind): PosterRequest {
             detail: "MATCH TOTAL GAMES TO FINISH OVER 22.5. TIE-BREAKS IN EITHER SET PUSH THIS PICK GREEN FAST.",
             odds: 2.68,
             prob: 0.38,
+            stake: 1,
+            edge: 0.018,
           },
         ],
+        intel: {
+          tour: "ATP",
+          city: "NEW YORK",
+          timing: "T-30M PRE-WARMUP",
+          favName: "CARLOS ALCARAZ",
+          favProb: 0.62,
+          coverage: 0.92,
+          archLabel: "DUAL-ENGINE",
+          favSide: "B",
+          angleLabel: "FULL CARD",
+          insightEn:
+            "DUAL-WING STRUCTURE ONLINE - TYPE A + TYPE B TOGETHER COVER 92% OF ALL POSSIBLE SCORE ROUTES.",
+        },
         timeLabel: "T-30M PRE-WARMUP",
         hash: "A1B2C3D4E5",
         stage: "ST 01-07",
@@ -1294,6 +1409,8 @@ export function samplePoster(kind: PosterKind): PosterRequest {
             detail: "SABALENKA TO WIN THE MATCH IN STRAIGHT OR THREE SETS. VALID FOR FULL MATCH ONLY.",
             odds: 1.85,
             prob: 0.55,
+            stake: 1,
+            edge: 0.017,
           },
           {
             key: "TS-U35",
@@ -1305,6 +1422,19 @@ export function samplePoster(kind: PosterKind): PosterRequest {
             locked: true,
           },
         ],
+        intel: {
+          tour: "WTA",
+          city: "PARIS",
+          timing: "T-45M PRE-WARMUP",
+          favName: "ARYNA SABALENKA",
+          favProb: 0.58,
+          coverage: 0.88,
+          archLabel: "DUAL-ENGINE",
+          favSide: "A",
+          angleLabel: "FREE CARD",
+          insightEn:
+            "TYPE A IS THE FREE GIFT TODAY - FULL MARKET DETAIL ON THE POSTER, TYPE B STAYS LOCKED IN THE VIP ARENA.",
+        },
         timeLabel: "T-45M PRE-WARMUP",
         hash: "F4E8D2C6B0",
         stage: "ST 02-07",
@@ -1504,7 +1634,7 @@ export function renderPoster(req: PosterRequest): RenderResult {
     const ctx = canvas.getContext("2d");
     ctx.imageSmoothingEnabled = false;
 
-    const seed = hashString(`${latinize(req.title)}|${kind}`);
+    const seed = hashString(`${latinize(req.title)}|${kind}|${req.seedSalt ?? 0}`);
     const rng = makeRng(seed ^ 0xf00ba11);
 
     const P = new Painter(ctx, w, h, rng);

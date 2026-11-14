@@ -38,6 +38,10 @@ export interface PosterSlipBox {
   detail: string;
   odds: number;
   prob?: number;
+  /** recommended stake in units for this tip (staking ladder) */
+  stake?: number;
+  /** model expected value edge (prob*odds-1), e.g. 0.099 → +9.9% */
+  edge?: number;
   /** locked (free-card teaser) — draws padlock + static noise */
   locked?: boolean;
 }
@@ -105,6 +109,30 @@ export interface PosterRequest {
   hash?: string;
   /** e.g. "T-30M PRE-WARMUP" */
   timeLabel?: string;
+  /** match intel strip (model / archetype / timing data) */
+  intel?: {
+    /** tour label e.g. ATP / WTA */
+    tour?: string;
+    city?: string;
+    /** supervisor timing label e.g. T-30M PRE-WARMUP */
+    timing?: string;
+    /** favorite full name (Latin) */
+    favName?: string;
+    /** favorite model win probability 0..1 */
+    favProb?: number;
+    /** dual-wing coverage 0..1 */
+    coverage?: number;
+    /** archetype English label */
+    archLabel?: string;
+    /** favorite side A or B (draws star on the plate) */
+    favSide?: "A" | "B";
+    /** rotating spotlight angle shown on the card, e.g. VALUE SPOTLIGHT */
+    angleLabel?: string;
+    /** rotating English insight sentence (differs every pass) */
+    insightEn?: string;
+  };
+  /** extra seed salt — rotates the pixel background between passes */
+  seedSalt?: number;
   /** extra footer line (Latin only) */
   footerNote?: string;
   /** arcade stage number printed on HUD */
@@ -182,7 +210,17 @@ export interface AgentStatus {
   uptimeSeconds: number;
   jobs: (JobSpec & JobRunState)[];
   recentPosts: PostLogRow[];
-  flashQueue: { cursor: number; total: number; dateKey: string };
+  flashQueue: {
+    cursor: number;
+    total: number;
+    dateKey: string;
+    /** posts already sent today (all matches) */
+    postsToday?: number;
+    /** true when every match is inside the anti-repeat cooldown */
+    cooldownActive?: boolean;
+    /** anti-repeat window in minutes */
+    cooldownMinutes?: number;
+  };
   academy: { nextLesson: number; total: number };
   dataFeed: { lastWarmOk: boolean; lastWarmAt?: string; matches: number; approved: number };
   radar: { news: number; live: number; liveNow: number; fitness: number };

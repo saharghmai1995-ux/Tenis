@@ -7,7 +7,7 @@
 import { CONFIG, JOB_SPECS } from "./config";
 import { store } from "./store";
 import { telegram, meCached, refreshMe } from "./telegram";
-import { dataHub, LEG_DETAIL_EN } from "./data";
+import { dataHub, LEG_DETAIL_EN, stakeLabelEn } from "./data";
 import type { CardMatch } from "./data";
 import { fetchTennisRadar, peekRadar, type TennisNewsItem, type LiveTennisMatch, type FitnessItem } from "./espn";
 import type { PosterLiveRow, PosterFitnessRow } from "./types";
@@ -254,9 +254,134 @@ const SURFACE_EN: Record<string, string> = {
   GRASS: "GRASS COURT",
 };
 
+/** supervisor timing codes → compact English poster labels (Persian labels
+    would be mangled by the Latin sanitizer, so we never print them raw). */
+const TIMING_EN: Record<string, string> = {
+  DONE: "SETTLED",
+  WAIT: "WINDOW PENDING",
+  OPEN: "ENTRY WINDOW OPEN",
+  T30: "T-30M ENTRY WINDOW",
+  LIVE: "IN-PLAY WINDOW",
+  POST: "SETTLED",
+};
+
+function timingEn(code?: string, label?: string): string {
+  if (code && TIMING_EN[code.toUpperCase()]) return TIMING_EN[code.toUpperCase()];
+  if (label) {
+    const m = label.match(/(\d{1,4})/);
+    if (m) return `WINDOW PENDING (${m[1]}M)`;
+  }
+  return "TIMING LOCKED";
+}
+
+// ─── flashcard anti-repeat engine (director fix: no more duplicate cards) ──
+// Every match rests at least FLASH_MIN_REPEAT_MS between posts, carries a
+// daily post cap, and rotates through 4 spotlight angles so consecutive
+// cards of the same match are never identical. When everything is resting
+// the job SKIPS instead of re-posting a duplicate.
+
+export const FLASH_MIN_REPEAT_MS = 20 * 60_000; // 20 min per-match cooldown
+export const FLASH_MAX_PER_DAY = 12; // max posts per match per Tehran day
+const FLASH_ANGLES = ["FULL CARD", "VALUE SPOTLIGHT", "MARKET DEPTH", "MODEL X-RAY"] as const;
+
+export interface FlashAngle {
+  label: string;
+  labelFa: string;
+  insightEn: string;
+  insightFa: string;
+}
+
+const ANGLE_LABEL_FA: Record<(typeof FLASH_ANGLES)[number], string> = {
+  "FULL CARD": "کارت کامل",
+  "VALUE SPOTLIGHT": "کانون ارزش",
+  "MARKET DEPTH": "عمق بازار",
+  "MODEL X-RAY": "اشعه ایکس مدل",
+};
+
+export function angleFor(card: CardMatch, rotation: number): FlashAngle {
+  const angle = FLASH_ANGLES[rotation % FLASH_ANGLES.length];
+  const cov = Math.round((card.coverage ?? 0) * 100);
+  const favName = (card.favorite === "A" ? card.playerA : card.playerB).toUpperCase();
+  switch (angle) {
+    case "VALUE SPOTLIGHT": {
+      const slips = [card.slipA, card.slipB].filter((s): s is NonNullable<typeof s> => !!s);
+      const best = [...slips].sort((a, b) => (b.edge ?? -9) - (a.edge ?? -9))[0];
+      if (best && best.edge > 0.02) {
+        const wingEn = best === card.slipA ? "TYPE A" : "TYPE B";
+        const wingFa = best === card.slipA ? "تیپ A" : "تیپ B";
+        const edge = (best.edge * 100).toFixed(1);
+        return {
+          label: angle,
+          labelFa: ANGLE_LABEL_FA[angle],
+          insightEn: `${wingEn} CARRIES +${edge}% MODEL EDGE AT ODDS ${best.odds.toFixed(2)} - PRICE ABOVE FAIR VALUE.`,
+          insightFa: `${wingFa} دارای ٪${edge} ارزش مدل با ضریب ${best.odds.toFixed(2)} است؛ قیمت بالاتر از ارزش منصفانه بازار.`,
+        };
+      }
+      return {
+        label: angle,
+        labelFa: ANGLE_LABEL_FA[angle],
+        insightEn: "NO OVERPRICED WINDOW RIGHT NOW - BOTH WINGS TRADE NEAR FAIR VALUE. DISCIPLINE STAKES ONLY.",
+        insightFa: "در این لحظه شانه خالی کردن بازار دیده نمی‌شود؛ هر دو تیپ نزدیک ارزش منصفانه‌اند و فقط استیک انضباطی توصیه می‌شود.",
+      };
+    }
+    case "MARKET DEPTH": {
+      const timing = timingEn(card.timingCode, card.timingLabel);
+      return {
+        label: angle,
+        labelFa: ANGLE_LABEL_FA[angle],
+        insightEn: `ARCHETYPE ${card.archLabelEn?.toUpperCase() ?? "SUPERVISED PATTERN"} DETECTED - OFFICIAL ENTRY WINDOW ${timing}. NO LATE MOVES.`,
+        insightFa: "الگوی بازی از دروازه‌های سوپروایزر عبور کرده است؛ پنجره رسمی ورود همان تایمینگ اعلام‌شده است و ورود خارج از پنجره ممنوع.",
+      };
+    }
+    case "MODEL X-RAY": {
+      const p = Math.round((card.favWinProb ?? 0.5) * 100);
+      return {
+        label: angle,
+        labelFa: ANGLE_LABEL_FA[angle],
+        insightEn: `MODEL X-RAY: ${favName} WINS ${p}% OF SIMULATED PATHS - MARKET AND SURFACE RATING FUSED AT 65/35.`,
+        insightFa: `بر اساس شبیه‌سازی مدل، ${favName} در ٪${p} از مسیرهای ممکن برنده است؛ ترکیب ۶۵/۳۵ بازار و ریتینگ سطح زمین.`,
+      };
+    }
+    default:
+      return {
+        label: "FULL CARD",
+        labelFa: ANGLE_LABEL_FA["FULL CARD"],
+        insightEn: `DUAL-WING STRUCTURE ONLINE - TYPE A + TYPE B TOGETHER COVER ${cov}% OF ALL POSSIBLE SCORE ROUTES.`,
+        insightFa: `ساختار دوپایی فعال است: ترکیب تیپ A و تیپ B حدود ٪${cov} از همه مسیرهای نتیجه بازی را پوشش می‌دهد.`,
+      };
+  }
+}
+
+interface FlashHistEntry {
+  c: number;
+  at: number;
+}
+
+function loadFlashHist(dateKey: string): Record<string, FlashHistEntry> {
+  const raw = store.kvGet("flashHist");
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as { dateKey: string; entries: Record<string, FlashHistEntry> };
+      if (parsed.dateKey === dateKey) return parsed.entries ?? {};
+    } catch {
+      /* corrupted entry → fresh day */
+    }
+  }
+  return {};
+}
+
+function saveFlashHist(dateKey: string, entries: Record<string, FlashHistEntry>): void {
+  store.kvSet("flashHist", JSON.stringify({ dateKey, entries }));
+}
+
 // ─── poster request builders ───────────────────────────────────────────────
 
-function flashcardRequest(card: CardMatch, kind: PosterKind = "FLASHCARD"): PosterRequest {
+function flashcardRequest(
+  card: CardMatch,
+  kind: PosterKind = "FLASHCARD",
+  angle?: FlashAngle,
+  salt?: number
+): PosterRequest {
   const slips = [
     card.slipA && {
       key: card.slipA.key,
@@ -265,17 +390,25 @@ function flashcardRequest(card: CardMatch, kind: PosterKind = "FLASHCARD"): Post
       detail: card.slipA.detail,
       odds: card.slipA.odds,
       prob: card.slipA.prob,
+      stake: card.slipA.stake,
+      edge: card.slipA.edge,
     },
     card.slipB && {
       key: card.slipB.key,
-      label: kind === "FREECARD" ? "TYPE B" : "TYPE B",
+      label: "TYPE B",
       marketEn: kind === "FREECARD" ? "FULL MARKET HIDDEN" : card.slipB.marketEn,
-      detail: kind === "FREECARD" ? "UNLOCK THE SECOND WING INSIDE THE VIP ARENA. FULL DUTCHING PLAN POSTED DAILY." : card.slipB.detail,
+      detail:
+        kind === "FREECARD"
+          ? "UNLOCK THE SECOND WING INSIDE THE VIP ARENA. FULL DUTCHING PLAN POSTED DAILY."
+          : card.slipB.detail,
       odds: kind === "FREECARD" ? 0 : card.slipB.odds,
       prob: card.slipB.prob,
+      stake: kind === "FREECARD" ? undefined : card.slipB.stake,
+      edge: kind === "FREECARD" ? undefined : card.slipB.edge,
       locked: kind === "FREECARD",
     },
   ].filter(Boolean) as PosterRequest["slips"];
+  const favName = (card.favorite === "A" ? card.playerA : card.playerB).toUpperCase();
   return {
     kind,
     title: kind === "FREECARD" ? "FREE CARD" : "MATCH OF THE DAY",
@@ -291,8 +424,21 @@ function flashcardRequest(card: CardMatch, kind: PosterKind = "FLASHCARD"): Post
     },
     tournament: card.tournament,
     round: card.round,
-    surfaceLabel: `${SURFACE_EN[card.surface] ?? "COURT"} - ${card.favorite === "A" ? "FAV A" : "FAV B"}`,
+    surfaceLabel: `${SURFACE_EN[card.surface] ?? "COURT"} - FAV ${card.favorite} - BEST OF 3`,
     slips,
+    intel: {
+      tour: card.tour,
+      city: card.city,
+      timing: timingEn(card.timingCode, card.timingLabel),
+      favName,
+      favProb: card.favWinProb,
+      coverage: card.coverage,
+      archLabel: card.archLabelEn,
+      favSide: card.favorite,
+      angleLabel: angle?.label,
+      insightEn: angle?.insightEn,
+    },
+    seedSalt: salt,
     hash: card.hash,
     timeLabel: kickoffLabel(card),
     stage: stageLabel(),
@@ -314,7 +460,7 @@ function briefingRequest(
   };
   const rows: PosterRequest["rows"] = cards.slice(0, 8).map((c) => ({
     label: `${hhmm(c)} ${(c.shortA ?? c.playerA).slice(0, 16)} x ${(c.shortB ?? c.playerB).slice(0, 16)}`,
-    value: `${c.surface} - ${(c.slipA?.key ?? "TBD").slice(0, 9)} - ${(c.slipA?.odds ?? 0).toFixed(2)}`,
+    value: `${(c.slipA?.key ?? "TBD").slice(0, 9)} ${(c.slipA?.odds ?? 0).toFixed(2)} ${stakeLabelEn(c.slipA?.stake ?? 1)}`,
     status: "INFO",
   }));
   const vetoRows: PosterRequest["rows"] = vetoed.slice(0, 5).map((v) => ({
@@ -490,14 +636,40 @@ const handlers: Record<JobId, Handler> = {
   async flashcards() {
     await ensureWarm();
     const dateKey = tehranDateKey();
-    if (store.kvGet("flashDateKey") !== dateKey) store.resetQueueForDay(dateKey);
+    store.kvSet("flashDateKey", dateKey);
     const pool = dataHub.approvedPool();
     if (pool.length === 0) return { status: "SKIPPED", error: "flash pool empty" };
-    const cursor = Number(store.kvGet("flashCursor") ?? "0") % pool.length;
-    const card = pool[cursor];
-    store.kvSet("flashCursor", String(cursor + 1));
-    const png = await render(flashcardRequest(card));
-    const caption = cap.captionFlashcard(card, !!card.adaptive);
+    const hist = loadFlashHist(dateKey);
+    const now = Date.now();
+    const eligible = pool.filter((c) => {
+      const h = hist[c.eventKey];
+      if (!h) return true;
+      return now - h.at >= FLASH_MIN_REPEAT_MS && h.c < FLASH_MAX_PER_DAY;
+    });
+    if (eligible.length === 0) {
+      return {
+        status: "SKIPPED",
+        error: `anti-repeat cooldown active - ${pool.length} match(es) resting`,
+      };
+    }
+    // fewest posts today first (even rotation) → longest rest → best coverage
+    eligible.sort((a, b) => {
+      const ca = hist[a.eventKey]?.c ?? 0;
+      const cb = hist[b.eventKey]?.c ?? 0;
+      if (ca !== cb) return ca - cb;
+      const ta = hist[a.eventKey]?.at ?? 0;
+      const tb = hist[b.eventKey]?.at ?? 0;
+      if (ta !== tb) return ta - tb;
+      return (b.coverage ?? 0) - (a.coverage ?? 0);
+    });
+    const card = eligible[0];
+    const rotation = hist[card.eventKey]?.c ?? 0;
+    hist[card.eventKey] = { c: rotation + 1, at: now };
+    saveFlashHist(dateKey, hist);
+    store.kvSet("flashCursor", String(Object.values(hist).reduce((s, e) => s + e.c, 0)));
+    const angle = angleFor(card, rotation);
+    const png = await render(flashcardRequest(card, "FLASHCARD", angle, rotation + 1));
+    const caption = cap.captionFlashcard(card, !!card.adaptive, angle);
     return deliver("flashcards", "vip", "FLASHCARD", caption, png);
   },
 
@@ -544,8 +716,13 @@ const handlers: Record<JobId, Handler> = {
 
   async free_card() {
     await ensureWarm();
-    const card = dataHub.freeCardCandidate() ?? dataHub.dbFallbackCards().find((c) => c.slipA);
-    if (!card) return { status: "SKIPPED", error: "no free card candidate" };
+    const pool = dataHub.approvedPool();
+    const base = pool.length ? pool : dataHub.dbFallbackCards().filter((c) => c.slipA);
+    if (base.length === 0) return { status: "SKIPPED", error: "no free card candidate" };
+    // rotate among the top-3 coverage candidates day by day (no daily repeat)
+    const cands = [...base].sort((a, b) => (b.coverage ?? 0) - (a.coverage ?? 0)).slice(0, 3);
+    const dateKey = tehranDateKey();
+    const card = cands[Number(dateKey.slice(-3)) % cands.length];
     const png = await render(flashcardRequest(card, "FREECARD"));
     const caption = cap.captionFreeCard(card);
     return deliver("free_card", "public", "FREECARD", caption, png);
@@ -734,6 +911,16 @@ export function status(): AgentStatus {
   });
   const f = dataHub.getFeed();
   const radar = peekRadar();
+  const flashDateKey = tehranDateKey();
+  const flashEntries = loadFlashHist(flashDateKey);
+  const flashPool = dataHub.approvedPool();
+  const postsToday = Object.values(flashEntries).reduce((s, e) => s + e.c, 0);
+  const cooldownActive =
+    flashPool.length > 0 &&
+    flashPool.every((c) => {
+      const h = flashEntries[c.eventKey];
+      return !!h && (Date.now() - h.at < FLASH_MIN_REPEAT_MS || h.c >= FLASH_MAX_PER_DAY);
+    });
   return {
     ok: true,
     bot: { username: meCached()?.username ?? "Neotenisbot", live: isLive() },
@@ -742,9 +929,12 @@ export function status(): AgentStatus {
     jobs,
     recentPosts: store.recentPosts(20),
     flashQueue: {
-      cursor: Number(store.kvGet("flashCursor") ?? "0"),
-      total: dataHub.approvedPool().length,
-      dateKey: tehranDateKey(),
+      cursor: postsToday,
+      total: flashPool.length,
+      dateKey: flashDateKey,
+      postsToday,
+      cooldownActive,
+      cooldownMinutes: Math.round(FLASH_MIN_REPEAT_MS / 60_000),
     },
     academy: {
       nextLesson: Number(store.kvGet("academyNext") ?? "1"),

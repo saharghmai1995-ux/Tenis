@@ -16,6 +16,10 @@ export interface CardSlip {
   detail: string;
   odds: number;
   prob?: number;
+  /** recommended stake in units (staking ladder) */
+  stake: number;
+  /** model EV edge = prob*odds-1 (negative when no value) */
+  edge: number;
 }
 
 export interface CardMatch {
@@ -26,6 +30,8 @@ export interface CardMatch {
   shortB?: string;
   rankA?: number;
   rankB?: number;
+  tour?: string;
+  city?: string;
   tournament: string;
   round: string;
   surface: "HARD" | "CLAY" | "GRASS";
@@ -37,12 +43,28 @@ export interface CardMatch {
   archLabelEn?: string;
   coverage?: number;
   adaptive?: boolean;
+  timingCode?: string;
+  timingLabel?: string;
   slipA?: CardSlip;
   slipB?: CardSlip;
   hash?: string;
   vetoed?: boolean;
   vetoCode?: string;
   vetoReasonFa?: string;
+}
+
+// ─── staking ladder (director rule: stake per tip, honest risk) ────────────
+// adaptive grant → 0.5U · prob ≥ 72% → 2U · prob ≥ 62% → 1.5U · else 1U
+export function stakeFor(prob: number | undefined, adaptive?: boolean): number {
+  if (adaptive) return 0.5;
+  const p = prob ?? 0.5;
+  if (p >= 0.72) return 2;
+  if (p >= 0.62) return 1.5;
+  return 1;
+}
+
+export function stakeLabelEn(stake: number): string {
+  return stake === Math.floor(stake) ? `${stake}U` : `${stake.toFixed(1)}U`;
 }
 
 // complete English descriptions per atomic leg — posters are 100% English
@@ -71,6 +93,8 @@ export function matchToCard(m: AnalyzedMatch): CardMatch {
     (m.favorite === "A" ? m.playerA.name : m.playerB.name).toUpperCase();
   const mkSlip = (s?: AnalyzedMatch["slips"]["A"]): CardSlip | undefined => {
     if (!s) return undefined;
+    const stake = stakeFor(s.prob, m.archetype?.adaptive);
+    const edge = s.odds * (s.prob ?? 0) - 1;
     return {
       key: s.leg,
       marketEn: s.marketEn || s.textEn,
@@ -80,6 +104,8 @@ export function matchToCard(m: AnalyzedMatch): CardMatch {
           .replace("PLAYER 1", m.playerA.name.toUpperCase()) ?? s.textEn.toUpperCase(),
       odds: s.odds,
       prob: s.prob,
+      stake,
+      edge,
     };
   };
   return {
@@ -90,6 +116,8 @@ export function matchToCard(m: AnalyzedMatch): CardMatch {
     shortB: m.playerB.shortName?.toUpperCase(),
     rankA: m.playerA.rank,
     rankB: m.playerB.rank,
+    tour: m.tour,
+    city: m.city,
     tournament: m.tournament,
     round: m.round,
     surface: m.surface,
@@ -101,6 +129,8 @@ export function matchToCard(m: AnalyzedMatch): CardMatch {
     archLabelEn: m.archetype?.labelEn,
     coverage: m.archetype?.coverage,
     adaptive: m.archetype?.adaptive,
+    timingCode: m.timing?.code,
+    timingLabel: m.timing?.label,
     slipA: mkSlip(m.slips.A),
     slipB: mkSlip(m.slips.B),
     hash: m.hashPre?.slice(0, 10).toUpperCase(),
@@ -313,25 +343,36 @@ class DataHub {
       state: (r.status as CardMatch["state"]) ?? "pre",
       startTime: r.startTime as string | undefined,
       favorite: fav,
+      timingLabel: "SUPERVISOR SYNC PENDING",
       vetoed: !!r.vetoed,
       vetoReasonFa: (r.vetoReason as string) ?? undefined,
       slipA: r.slipAOdds
-        ? {
-            key: "PENDING-SYNC",
-            marketEn: "OFFICIAL MARKET - SYNC PENDING",
-            detail: LEG_DETAIL_EN["TG-O225"],
-            odds: Number(r.slipAOdds),
-            prob: (r.slipAProb as number) ?? undefined,
-          }
+        ? (() => {
+            const prob = (r.slipAProb as number) ?? undefined;
+            return {
+              key: "PENDING-SYNC",
+              marketEn: "OFFICIAL MARKET - SYNC PENDING",
+              detail: LEG_DETAIL_EN["TG-O225"],
+              odds: Number(r.slipAOdds),
+              prob,
+              stake: stakeFor(prob),
+              edge: Number(r.slipAOdds) * (prob ?? 0) - 1,
+            };
+          })()
         : undefined,
       slipB: r.slipBOdds
-        ? {
-            key: "PENDING-SYNC",
-            marketEn: "OFFICIAL MARKET - SYNC PENDING",
-            detail: LEG_DETAIL_EN["GH-F45"].replace("FAVORITE", favName),
-            odds: Number(r.slipBOdds),
-            prob: (r.slipBProb as number) ?? undefined,
-          }
+        ? (() => {
+            const prob = (r.slipBProb as number) ?? undefined;
+            return {
+              key: "PENDING-SYNC",
+              marketEn: "OFFICIAL MARKET - SYNC PENDING",
+              detail: LEG_DETAIL_EN["GH-F45"].replace("FAVORITE", favName),
+              odds: Number(r.slipBOdds),
+              prob,
+              stake: stakeFor(prob),
+              edge: Number(r.slipBOdds) * (prob ?? 0) - 1,
+            };
+          })()
         : undefined,
       hash: (r.hashPre as string)?.slice(0, 10).toUpperCase(),
     };
