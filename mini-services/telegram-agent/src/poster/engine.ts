@@ -491,11 +491,16 @@ function drawPlayerPlate(
   flag: string | undefined,
   accent: string,
   fav = false,
+  seed?: number,
 ): void {
   P.panel(x, y, w, h, PANEL);
   drawPixelBorder(P.ctx, x, y, w, h, accent);
   if (rank !== undefined) {
     P.chip(`#${rank}`, x + 18, y + 16, { font: fMono(20), fg: GOLD, border: GOLD, bg: "rgba(255,209,102,0.10)", h: 34, padX: 10 });
+  }
+  if (seed !== undefined) {
+    const seedX = x + 18 + (rank !== undefined ? 76 : 0);
+    P.chip(`S${seed}`, seedX, y + 16, { font: fMono(20), fg: CYAN, border: CYAN, bg: "rgba(77,214,255,0.10)", h: 34, padX: 10 });
   }
   if (flag) {
     P.chipRight(flag, x + w - 18, y + 16, { font: fMono(18), fg: GREY, border: "#3d4654", bg: "rgba(61,70,84,0.3)", h: 34, padX: 10 });
@@ -624,8 +629,8 @@ function drawFlashcard(P: Painter, req: PosterRequest): void {
 
   // player plates (favorite gets the star)
   if (pl) {
-    drawPlayerPlate(P, 24, 130, 470, 190, pl.shortA ?? pl.a, pl.a, pl.rankA, pl.flagA, GOLD, intel?.favSide === "A");
-    drawPlayerPlate(P, 586, 130, 470, 190, pl.shortB ?? pl.b, pl.b, pl.rankB, pl.flagB, CYAN, intel?.favSide === "B");
+    drawPlayerPlate(P, 24, 130, 470, 190, pl.shortA ?? pl.a, pl.a, pl.rankA, pl.flagA, GOLD, intel?.favSide === "A", pl.seedA);
+    drawPlayerPlate(P, 586, 130, 470, 190, pl.shortB ?? pl.b, pl.b, pl.rankB, pl.flagB, CYAN, intel?.favSide === "B", pl.seedB);
 
     // center VS with ball above
     drawSprite(P.ctx, SPRITES.BALL, 516, 142, 4);

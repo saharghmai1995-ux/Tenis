@@ -30,6 +30,12 @@ export interface CardMatch {
   shortB?: string;
   rankA?: number;
   rankB?: number;
+  /** 2-3 letter country code extracted from the ESPN flag URL (poster-safe Latin) */
+  flagA?: string;
+  flagB?: string;
+  /** tournament seed, drawn as S{n} chip next to the rank chip */
+  seedA?: number;
+  seedB?: number;
   tour?: string;
   city?: string;
   tournament: string;
@@ -88,6 +94,12 @@ function shortName(full: string): string {
   return (parts[parts.length - 1] || full).toUpperCase();
 }
 
+/** ESPN flag URL → 2-3 letter country code (e.g. .../countries/40x28/ir.png → IR) */
+function countryCodeOf(flagUrl?: string): string | undefined {
+  const m = flagUrl?.match(/\/([a-z]{2,3})\.png/i);
+  return m ? m[1].toUpperCase() : undefined;
+}
+
 export function matchToCard(m: AnalyzedMatch): CardMatch {
   const favName =
     (m.favorite === "A" ? m.playerA.name : m.playerB.name).toUpperCase();
@@ -116,6 +128,10 @@ export function matchToCard(m: AnalyzedMatch): CardMatch {
     shortB: m.playerB.shortName?.toUpperCase(),
     rankA: m.playerA.rank,
     rankB: m.playerB.rank,
+    flagA: countryCodeOf(m.playerA.flagUrl),
+    flagB: countryCodeOf(m.playerB.flagUrl),
+    seedA: m.playerA.seed,
+    seedB: m.playerB.seed,
     tour: m.tour,
     city: m.city,
     tournament: m.tournament,
