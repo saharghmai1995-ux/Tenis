@@ -74,6 +74,8 @@ export interface PosterRequest {
     shortB?: string;
     rankA?: number;
     rankB?: number;
+    seedA?: number; // tournament seed (drawn as S{n} chip when present)
+    seedB?: number;
     flagA?: string; // 2-letter ISO code (Latin only)
     flagB?: string;
   };
@@ -130,6 +132,15 @@ export interface PosterRequest {
     angleLabel?: string;
     /** rotating English insight sentence (differs every pass) */
     insightEn?: string;
+    // ── enrichment (director fix: fuller English cards + stake per tip) ──
+    /** model score prediction, e.g. "PREDICTION: FAV 2-0" */
+    prediction?: string;
+    /** ranking gap line, e.g. "RANK #3 v #6" */
+    rankGap?: string;
+    /** total position risk across both tips, e.g. "TOTAL RISK 1.0U" */
+    totalStake?: string;
+    /** per-tip stake breakdown, e.g. "TIP A 0.5U + TIP B 0.5U" */
+    stakeDetail?: string;
   };
   /** extra seed salt — rotates the pixel background between passes */
   seedSalt?: number;

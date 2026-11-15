@@ -614,10 +614,11 @@ function drawFlashcard(P: Painter, req: PosterRequest): void {
   const pl = req.players;
   const intel = req.intel;
 
-  // tour + tournament + round
+  // tour + tournament + round + city (enrichment: venue always visible)
   if (req.tournament || req.round) {
     const tourPart = intel?.tour ? `${intel.tour.toUpperCase()} - ` : "";
-    const line = `${tourPart}${req.tournament ?? ""}${req.round ? ` - ${req.round}` : ""}`.trim();
+    const cityPart = intel?.city ? ` - ${intel.city.toUpperCase()}` : "";
+    const line = `${tourPart}${req.tournament ?? ""}${req.round ? ` - ${req.round}` : ""}${cityPart}`.trim();
     P.text(P.fit(line, w - 80, fMono(22)), w / 2, 110, fMono(22), CYAN, "center");
   }
 
@@ -644,25 +645,51 @@ function drawFlashcard(P: Painter, req: PosterRequest): void {
     });
   }
 
-  // section header with side deco lines
+  // enrichment row: model prediction + ranking gap (fuller English cards)
+  const enrich: Array<{ t: string; fg: string; border: string; bg: string }> = [];
+  if (intel?.prediction) {
+    enrich.push({ t: intel.prediction.toUpperCase(), fg: GOLD, border: GOLD, bg: "rgba(255,209,102,0.10)" });
+  }
+  if (intel?.rankGap) {
+    enrich.push({ t: intel.rankGap.toUpperCase(), fg: MAGENTA, border: MAGENTA, bg: "rgba(255,77,214,0.08)" });
+  }
+  let slipY = 452;
+  if (enrich.length > 0) {
+    const eH = 32;
+    const eGap = 14;
+    const eW = enrich.map((c) => {
+      P.ctx.font = fMono(15);
+      return Math.ceil(P.ctx.measureText(c.t).width) + 24;
+    });
+    const eTotal = eW.reduce((a, b) => a + b, 0) + eGap * (enrich.length - 1);
+    let ex = w / 2 - eTotal / 2;
+    enrich.forEach((c, i) => {
+      P.chip(c.t, Math.round(ex), 388, { font: fMono(15), fg: c.fg, border: c.border, bg: c.bg, h: eH, padX: 12 });
+      ex += eW[i] + eGap;
+    });
+    slipY = 470; // push slips down so the enrichment row never overlaps
+  }
+
+  // section header with side deco lines (baseline = slipY header anchor)
   const header = free ? "OFFICIAL MARKET SLIPS - 1 OF 2 FREE" : "OFFICIAL MARKET SLIPS";
   const hFont = fMono(26);
   const hW = P.measure(header, hFont);
-  P.text(header, w / 2, 428, hFont, GOLD, "center");
+  P.text(header, w / 2, slipY, hFont, GOLD, "center");
   P.ctx.fillStyle = "rgba(255,209,102,0.5)";
-  P.ctx.fillRect(w / 2 - hW / 2 - 110, 420, 86, 3);
-  P.ctx.fillRect(w / 2 + hW / 2 + 24, 420, 86, 3);
+  P.ctx.fillRect(w / 2 - hW / 2 - 110, slipY - 8, 86, 3);
+  P.ctx.fillRect(w / 2 + hW / 2 + 24, slipY - 8, 86, 3);
 
-  let slipY = 452;
   if (free) {
-    // FREE TO PLAY green banner strip
-    const by = 448;
+    // FREE TO PLAY green banner strip (below the header, above the slips)
+    const by = slipY + 20;
     const bw = 460;
     P.ctx.fillStyle = "rgba(66,226,130,0.14)";
     P.ctx.fillRect(w / 2 - bw / 2, by, bw, 46);
     drawPixelBorder(P.ctx, w / 2 - bw / 2, by, bw, 46, GREEN);
     P.text("FREE TO PLAY - TODAY'S GIFT", w / 2, by + 31, fMono(22), GREEN, "center");
-    slipY = 516;
+    slipY += 88;
+  } else {
+    slipY += 24;
   }
 
   // slip boxes
@@ -719,7 +746,7 @@ function drawFlashcard(P: Painter, req: PosterRequest): void {
     // rotating insight panel (content changes every pass — anti-repeat)
     if (intel?.insightEn) {
       const py = infoY + 116;
-      const ph = 168;
+      const ph = intel.totalStake ? 208 : 168;
       P.panel(24, py, w - 48, ph, PANEL);
       drawPixelBorder(P.ctx, 24, py, w - 48, ph, GOLD);
       const angleTitle = intel.angleLabel
@@ -728,6 +755,18 @@ function drawFlashcard(P: Painter, req: PosterRequest): void {
       drawSectionLabel(P, 62, py + 44, angleTitle, GOLD);
       drawSprite(P.ctx, SPRITES.STAR, w - 110, py + 26, 3, { "#": GOLD });
       P.wrapped(intel.insightEn, 62, py + 92, w - 190, fMono(19, "normal"), CREAM, 27, 3);
+      // enrichment: total position risk + per-tip stake breakdown line
+      if (intel.totalStake) {
+        P.ctx.fillStyle = "rgba(255,209,102,0.14)";
+        P.ctx.fillRect(44, py + ph - 64, w - 88, 44);
+        const stakeLine = `${intel.totalStake}${intel.stakeDetail ? `  |  ${intel.stakeDetail}` : ""}`;
+        P.ctx.font = fMono(19);
+        const sW = P.ctx.measureText(stakeLine).width;
+        P.text(stakeLine, w / 2, py + ph - 35, fMono(19), GOLD, "center");
+        P.ctx.fillStyle = GOLD;
+        P.ctx.fillRect(w / 2 - sW / 2 - 20, py + ph - 64, 3, 44);
+        P.ctx.fillRect(w / 2 + sW / 2 + 17, py + ph - 64, 3, 44);
+      }
     }
   } else {
     // legacy bottom block
@@ -1376,6 +1415,10 @@ export function samplePoster(kind: PosterKind): PosterRequest {
           angleLabel: "FULL CARD",
           insightEn:
             "DUAL-WING STRUCTURE ONLINE - TYPE A + TYPE B TOGETHER COVER 92% OF ALL POSSIBLE SCORE ROUTES.",
+          prediction: "PREDICTION: CARLOS ALCARAZ 2-0",
+          rankGap: "RANK GAP #7 v #2",
+          totalStake: "TOTAL RISK 2U",
+          stakeDetail: "TIP A 1U + TIP B 1U",
         },
         timeLabel: "T-30M PRE-WARMUP",
         hash: "A1B2C3D4E5",

@@ -20,6 +20,8 @@ import {
   runManually,
   setLive,
   tehranFields,
+  resetFlashHistory,
+  vipChatId,
 } from "./src/scheduler";
 import type { PosterRequest, PosterKind } from "./src/types";
 import { readFileSync, existsSync } from "node:fs";
@@ -121,6 +123,27 @@ async function handle(req: Request): Promise<Response> {
 
     if (p === "/now") {
       return json({ tehran: tehranFields(), iso: new Date().toISOString() });
+    }
+
+    // ops: clear today's one-post flash history (revive burned/failed cards)
+    if (p === "/admin/reset-flash" && req.method === "POST") {
+      return json({ ok: true, ...resetFlashHistory() });
+    }
+
+    // ops: end-to-end channel proof — send a test card to BOTH channels now
+    if (p === "/admin/channel-test" && req.method === "POST") {
+      const results: Record<string, { ok: boolean; messageId?: number; description?: string }> = {};
+      const out = renderPoster(samplePoster("FLASHCARD"));
+      if (!out.ok) return json({ ok: false, error: `poster render failed: ${out.error}` }, 500);
+      const png = Buffer.from(out.pngBase64, "base64");
+      const capText =
+        "🔴 NEOBET | کانال رسمی نئوبت\n🧪 پست آزمایشی تست خط ارسال — سیستم احیا شد و هر دو کانال عمومی و VIP در حالت زنده فعالیت می‌کنند.\n\n————————————————\n⚡️ کانال عمومی: @aineobet\n👑 کارت‌های کامل VIP: @aineobet_vip\n⚠️ +۱۸ | مسئولیت مالی با شماست.";
+      results.public = await telegram.sendPhoto(CONFIG.publicChatId, png, capText);
+      const vip = vipChatId();
+      results.vip = vip
+        ? await telegram.sendPhoto(vip, png, capText)
+        : { ok: false, description: "vip chat id not configured" };
+      return json({ ok: results.public.ok || results.vip.ok, ...results });
     }
 
     return json({ ok: false, error: "not found" }, 404);

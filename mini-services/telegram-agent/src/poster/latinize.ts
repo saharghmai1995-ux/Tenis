@@ -75,6 +75,8 @@ const CHAR_MAP: Record<string, string> = {
   '·': '-',
   '—': '-',
   '–': '-',
+  '−': '-', // U+2212 MINUS SIGN — napi-canvas fallback drops it, breaks EDGE chips
+  '…': '...',
   '\u200C': ' ', // ZWNJ → space
   '«': '"',
   '»': '"',
@@ -89,6 +91,11 @@ const CHAR_MAP: Record<string, string> = {
   '→': '>',
   '←': '<',
   '٪': '%',
+  '½': '1/2',
+  '¼': '1/4',
+  '¾': '3/4',
+  '°': 'deg',
+  '∞': 'INF',
 };
 
 const isCombiningMark = (cp: number): boolean =>

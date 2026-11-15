@@ -102,12 +102,13 @@ function BankAuditBox({ audit }: { audit?: BankAudit }) {
         جمع جبری تک‌تک سطرهای تسویه‌شده کارنامه — هر کاربر می‌تواند صحت ۱۰۰٪ رشد بانک را در ۳
         ثانیه با چشم خود جمع بزند و تایید کند.
       </p>
-      <div className="mt-3 grid grid-cols-2 gap-1.5 sm:grid-cols-4 lg:grid-cols-8" dir="ltr">
+      <div className="mt-3 grid grid-cols-2 gap-1.5 sm:grid-cols-4 lg:grid-cols-9" dir="ltr">
         <AuditPart label="موجودی اولیه" value={audit.bankStart.toFixed(2)} tone="start" />
         <AuditPart label="سود بردهای زوج‌تیپ" value={fmt(audit.dualWonProfit)} tone="win" />
         <AuditPart label="زیان بازنده‌های زوج‌تیپ" value={fmt(audit.dualLostStake)} tone="loss" />
         <AuditPart label="سایر خطوط میکس" value={fmt(audit.comboProfit + audit.accumulatorProfit)} tone="line" />
-        <AuditPart label="بانکر + کمبو کاپولا" value={fmt(audit.bankerProfit + audit.comboProfit)} tone="line" />
+        <AuditPart label="بانکر" value={fmt(audit.bankerProfit)} tone="line" />
+        <AuditPart label="کمبو کاپولا + پوشش" value={fmt(audit.regComboProfit)} tone="line" />
         <AuditPart label="خوشه دقیق" value={fmt(audit.clusterProfit)} tone="line" />
         <AuditPart label="اسنایپر +EV" value={fmt(audit.sniperProfit)} tone="line" />
         <AuditPart label="موجودی دقیق فعلی" value={audit.bank.toFixed(2)} tone="result" />
@@ -116,7 +117,8 @@ function BankAuditBox({ audit }: { audit?: BankAudit }) {
         {audit.bankStart.toFixed(2)} {sgn(audit.dualWonProfit)} {Math.abs(audit.dualWonProfit).toFixed(2)}{" "}
         {sgn(audit.dualLostStake)} {Math.abs(audit.dualLostStake).toFixed(2)} {sgn(audit.comboProfit)}{" "}
         {Math.abs(audit.comboProfit).toFixed(2)} {sgn(audit.bankerProfit)} {Math.abs(audit.bankerProfit).toFixed(2)}{" "}
-        {sgn(audit.clusterProfit)} {Math.abs(audit.clusterProfit).toFixed(2)} {sgn(audit.sniperProfit)}{" "}
+        {sgn(audit.regComboProfit)} {Math.abs(audit.regComboProfit).toFixed(2)} {sgn(audit.clusterProfit)}{" "}
+        {Math.abs(audit.clusterProfit).toFixed(2)} {sgn(audit.sniperProfit)}{" "}
         {Math.abs(audit.sniperProfit).toFixed(2)} {sgn(audit.accumulatorProfit)}{" "}
         {Math.abs(audit.accumulatorProfit).toFixed(2)} = <span className="text-amber-300">{audit.bank.toFixed(2)} units</span>
       </p>

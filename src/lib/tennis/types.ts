@@ -594,6 +594,8 @@ export interface BankAudit {
   comboProfit: number;
   clusterProfit: number;
   bankerProfit: number;
+  /** v5.6 — copula-combo+cover line, explicit audit equation term */
+  regComboProfit: number;
   sniperProfit: number;
   accumulatorProfit: number;
   otherProfit: number;

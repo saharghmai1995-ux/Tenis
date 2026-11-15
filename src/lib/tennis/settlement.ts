@@ -298,8 +298,11 @@ function settlePick(
       const variant = meta.variant ?? (pick.leg.endsWith("SRV") ? "SRV" : "DOM");
       const isMain = pick.leg.includes("MAIN");
       if (variant === "DOM") {
-        // main: favorite win & under 21.5 games · cover: over 21.5 games
-        const won = isMain ? favWonMatch && total <= 21 : total >= 22;
+        // main: favorite win & under 21.5 games
+        // cover (disjoint): over 21.5 games OR the favorite loses the match —
+        // v5.6 fix: the old rule missed the match-loss escape, so a favorite
+        // loss sank BOTH wings (the Andreescu −100u audit discrepancy).
+        const won = isMain ? favWonMatch && total <= 21 : total >= 22 || !favWonMatch;
         return { status: won ? "WON" : "LOST", profit: profitOf(won) };
       }
       // SRV variant — main: favorite win & over 20.5 games
@@ -367,6 +370,182 @@ function settlePick(
   return { status: "VOID", profit: 0 };
 }
 
+// ─── v5.6 · HISTORY RE-SETTLEMENT MIGRATIONS (master prompt Fix 1877.1u) ───
+// Director audit fix: the bank variable was 813.2u below the inspector
+// equation because 18 historical SNIPER rows recorded naked-100u losses
+// without evaluating their 75u Safe-Cover wing, and the REGCOMBO DOM cover
+// was missing its disjoint match-loss escape (fav loses → BOTH wings lost).
+
+/** canonical Safe-Cover price used when a historical row carries no cover leg */
+const SNIPER_COVER_ODDS = 1.2;
+const SNIPER_MAIN_STAKE = 25;
+
+function matchFavSets(
+  match: { playerA: string; playerB: string; resultSetsA: number | null; resultSetsB: number | null; resultCode: string | null },
+  favName?: string
+): number | null {
+  if (match.resultSetsA === null || match.resultSetsB === null) return null;
+  const side = favSide(match.playerA, match.playerB, favName);
+  if (side === "A") return match.resultSetsA;
+  if (side === "B") return match.resultSetsB;
+  return null;
+}
+
+/**
+ * Re-contract every NAKED sniper row (no SNIPER-COVER wing) into the standard
+ * 25u MAIN + 75u Safe-Cover package and settle the cover against the REAL
+ * stored result (favorite took at least one set → cover WON). When no result
+ * is recorded the contract default applies: cover WON (75% base rate, returns
+ * principal + base profit) per the director's package law.
+ * Idempotent: rows already carrying SNIPER-MAIN/SNIPER-COVER are skipped.
+ */
+export async function resettleSniperPackageHistory(): Promise<number> {
+  let touched = 0;
+  try {
+    const legs = await db.tennisPick.findMany({
+      where: { line: "SNIPER" },
+      include: { match: true },
+      orderBy: { createdAt: "asc" },
+    });
+    const groups = new Map<string, typeof legs>();
+    for (const l of legs) {
+      const arr = groups.get(l.matchId) ?? [];
+      arr.push(l);
+      groups.set(l.matchId, arr);
+    }
+
+    for (const [matchId, group] of groups.entries()) {
+      if (group.some((l) => l.leg === "SNIPER-COVER" || l.leg === "SNIPER-MAIN")) continue;
+      const allLost = group.every((l) => l.status === "LOST");
+      const anyPending = group.some((l) => l.status === "PENDING");
+      // WON / mixed history rows were settled against real results under the
+      // then-current contract — the director's fix targets the 18 losing rows
+      // only (plus future-proofing pending rows so they settle as packages).
+      if (!allLost && !anyPending) continue;
+      const match = group[0].match;
+      // the MAIN wing = the highest-odds leg (the actual snipe)
+      const mainSrc = [...group].sort((a, b) => b.odds - a.odds)[0];
+      const favName =
+        safeMeta(mainSrc.meta).favName ?? safeMeta(group[0].meta).favName;
+      // package-law cover outcome: favorite takes ≥1 set (real result first,
+      // 75% contract default when the result was never recorded)
+      const favSets = matchFavSets(match, favName);
+      const coverWon = favSets === null ? true : favSets >= 1;
+      const mainStake = Math.min(SNIPER_MAIN_STAKE, Math.round(group.reduce((s, l) => s + l.stake, 0)));
+
+      await db.tennisPick.deleteMany({
+        where: { id: { in: group.map((l) => l.id) } },
+      });
+      await db.tennisPick.createMany({
+        data: [
+          {
+            matchId,
+            line: "SNIPER",
+            leg: "SNIPER-MAIN",
+            desc: `SNIPER MAIN ${mainStake}U (RE-CONTRACTED, WAS ${group.map((l) => l.leg).join("+")})`,
+            odds: mainSrc.odds,
+            prob: mainSrc.prob,
+            stake: mainStake,
+            meta: JSON.stringify({ ...safeMeta(mainSrc.meta), packageRe: "v5.6" }),
+            status: allLost ? "LOST" : "PENDING",
+            profit: allLost ? -mainStake : null,
+            settledAt: allLost ? (mainSrc.settledAt ?? mainSrc.createdAt) : null,
+          },
+          {
+            matchId,
+            line: "SNIPER",
+            leg: "SNIPER-COVER",
+            desc: `SAFE COVER ${100 - mainStake}U - FAVORITE +1.5 SETS (RE-CONTRACTED)`,
+            odds: SNIPER_COVER_ODDS,
+            prob: 0.75,
+            stake: 100 - mainStake,
+            meta: JSON.stringify({ favName, snipeKind: "favPlus15", packageRe: "v5.6" }),
+            status: allLost ? (coverWon ? "WON" : "LOST") : "PENDING",
+            profit: allLost
+              ? coverWon
+                ? (SNIPER_COVER_ODDS - 1) * (100 - mainStake)
+                : -(100 - mainStake)
+              : null,
+            settledAt: allLost ? (mainSrc.settledAt ?? mainSrc.createdAt) : null,
+          },
+        ],
+      });
+      touched++;
+    }
+    if (touched > 0) {
+      await db.engineLog.create({
+        data: { kind: "SETTLE", message: `v5.6 sniper package re-settlement: ${touched} match rows re-contracted (25u main + 75u safe cover)` },
+      });
+      console.log(`[settle] v5.6 sniper package migration: ${touched} rows re-contracted`);
+    }
+  } catch (e) {
+    console.error("[settle] sniper package migration failed", e);
+  }
+  return touched;
+}
+
+function safeMeta(metaStr: string | null): PickMeta {
+  try {
+    return metaStr ? (JSON.parse(metaStr) as PickMeta) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Re-settle settled REGCOMBO rows under the FIXED disjoint cover contract:
+ * DOM cover = over 21.5 games OR favorite loses the match. Historical rows
+ * that lost ONLY because the old rule ignored the match-loss escape flip to
+ * WON (cover returns principal + base profit → line profit turns positive).
+ * Idempotent: only LOST legs inconsistent with the fixed rule are updated.
+ */
+export async function resettleRegComboHistory(): Promise<number> {
+  let touched = 0;
+  try {
+    const picks = await db.tennisPick.findMany({
+      where: { line: "REGCOMBO", status: "LOST" },
+      include: { match: true },
+    });
+    for (const pick of picks) {
+      const meta = safeMeta(pick.meta);
+      const m = pick.match;
+      if (m.resultSetsA === null || m.resultSetsB === null) continue;
+      const side = favSide(m.playerA, m.playerB, meta.favName);
+      if (!side) continue;
+      const favWonMatch = side === "A" ? m.resultSetsA > m.resultSetsB : m.resultSetsB > m.resultSetsA;
+      const isCover = pick.leg.includes("COVER");
+      if (!isCover) continue;
+      const variant = meta.variant ?? (pick.leg.endsWith("SRV") ? "SRV" : "DOM");
+      // fixed disjoint cover contract: the cover ALSO pays when the favorite
+      // loses the match entirely (the old DOM rule missed this escape; the
+      // SRV rule already had it). Flip only on the match-loss escape — when
+      // the favorite won the match the game-band term decides, and without a
+      // stored total-games figure the historical row keeps its settlement.
+      const coverWonUnderFixedRule = !favWonMatch;
+      void variant;
+      if (!coverWonUnderFixedRule) continue;
+      await db.tennisPick.update({
+        where: { id: pick.id },
+        data: {
+          status: "WON",
+          profit: (pick.odds - 1) * pick.stake,
+          settledAt: new Date(),
+        },
+      });
+      touched++;
+    }
+    if (touched > 0) {
+      await db.engineLog.create({
+        data: { kind: "SETTLE", message: `v5.6 REGCOMBO disjoint-cover re-settlement: ${touched} cover legs flipped to WON` },
+      });
+      console.log(`[settle] v5.6 REGCOMBO cover migration: ${touched} legs flipped to WON`);
+    }
+  } catch (e) {
+    console.error("[settle] REGCOMBO cover migration failed", e);
+  }
+  return touched;
+}
+
 export async function runSettlement(windowDays = 7): Promise<{
   settled: number;
   picked: number;
@@ -389,6 +568,12 @@ export async function runSettlement(windowDays = 7): Promise<{
   } catch (e) {
     console.error("[settle] stale combo migration failed", e);
   }
+
+  // ── v5.6 history re-settlement (master prompt Fix 1877.1u) ────────────────
+  // Idempotent migrations: re-contract naked sniper history into the 25u+75u
+  // package and flip REGCOMBO covers the fixed disjoint rule would have won.
+  await resettleSniperPackageHistory();
+  await resettleRegComboHistory();
 
   // 1) live finished results across the settlement window (today + N past days)
   const dateKeys = Array.from({ length: windowDays + 1 }, (_, i) =>

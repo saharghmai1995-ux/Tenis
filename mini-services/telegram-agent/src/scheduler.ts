@@ -143,7 +143,7 @@ function isLive(): boolean {
 }
 
 /** resolved VIP chat id: env first, then auto-discovered channel */
-function vipChatId(): string {
+export function vipChatId(): string {
   return CONFIG.vipChatId || store.kvGet("vipChatId") || "";
 }
 
@@ -324,6 +324,15 @@ function saveFlashHist(dateKey: string, entries: Record<string, FlashHistEntry>)
   store.kvSet("flashHist", JSON.stringify({ dateKey, entries }));
 }
 
+/** ops endpoint: clear today's one-post history so failed/burned cards re-send */
+export function resetFlashHistory(): { cleared: boolean; dateKey: string } {
+  const dateKey = tehranDateKey();
+  store.kvSet("flashHist", JSON.stringify({ dateKey, entries: {} }));
+  store.kvSet("flashCursor", "0");
+  console.log(`[scheduler] flash history reset for ${dateKey} — all pool matches re-eligible`);
+  return { cleared: true, dateKey };
+}
+
 // ─── poster request builders ───────────────────────────────────────────────
 
 function flashcardRequest(
@@ -359,6 +368,29 @@ function flashcardRequest(
     },
   ].filter(Boolean) as PosterRequest["slips"];
   const favName = (card.favorite === "A" ? card.playerA : card.playerB).toUpperCase();
+  // ── enrichment (director fix: fuller English cards) ──────────────────────
+  // score prediction derived from the primary (Type A) market key
+  const PRED_EN: Record<string, string> = {
+    "SB-F20": `PREDICTION: ${favName} 2-0`,
+    "SB-P1-20": `PREDICTION: ${card.playerA.toUpperCase()} 2-0`,
+    "SB-P1-21": `PREDICTION: ${card.playerA.toUpperCase()} 2-1`,
+    "TS-O25": "PREDICTION: DECIDING 3RD SET",
+    "TG-O225": "PREDICTION: 23+ TOTAL GAMES",
+    "GH-F45": `PREDICTION: ${favName} BY 5+ GAMES`,
+  };
+  const prediction = PRED_EN[card.slipA?.key ?? ""];
+  const rankPart = (r?: number): string => (r !== undefined ? `#${r}` : "N/A");
+  const rankGap =
+    card.rankA !== undefined || card.rankB !== undefined
+      ? `RANK GAP ${rankPart(card.rankA)} v ${rankPart(card.rankB)}`
+      : undefined;
+  const stakeSum = (card.slipA?.stake ?? 0) + (card.slipB?.stake ?? 0);
+  const uOf = (n: number): string => (n === Math.floor(n) ? `${n}U` : `${n.toFixed(1)}U`);
+  const totalStake = stakeSum > 0 ? `TOTAL RISK ${uOf(stakeSum)}` : undefined;
+  const stakeDetail =
+    stakeSum > 0
+      ? `TIP A ${uOf(card.slipA?.stake ?? 0)} + TIP B ${uOf(card.slipB?.stake ?? 0)}`
+      : undefined;
   return {
     kind,
     title: kind === "FREECARD" ? "FREE CARD" : "MATCH OF THE DAY",
@@ -387,6 +419,10 @@ function flashcardRequest(
       favSide: card.favorite,
       angleLabel: angle?.label,
       insightEn: angle?.insightEn,
+      prediction,
+      rankGap,
+      totalStake,
+      stakeDetail,
     },
     seedSalt: salt,
     hash: card.hash,
@@ -607,13 +643,24 @@ const handlers: Record<JobId, Handler> = {
       return (b.coverage ?? 0) - (a.coverage ?? 0);
     });
     const card = eligible[0];
-    hist[card.eventKey] = { c: 1, at: Date.now() };
-    saveFlashHist(dateKey, hist);
-    store.kvSet("flashCursor", String(Object.values(hist).reduce((s, e) => s + e.c, 0)));
+    // DELIVERY-FIRST POLICY (revival fix): the one-post mark is written only
+    // AFTER a confirmed SENT (or in dry-run mode). A failed Telegram delivery
+    // (network / auth / 404) does NOT burn the card — the next 90s tick
+    // retries the same match until the card is actually on the channel.
     const angle = angleFor(card, 0);
     const png = await render(flashcardRequest(card, "FLASHCARD", angle, 1));
     const caption = cap.captionFlashcard(card, !!card.adaptive, angle);
-    return deliver("flashcards", "vip", "FLASHCARD", caption, png);
+    const outcome = await deliver("flashcards", "vip", "FLASHCARD", caption, png);
+    if (outcome.status === "SENT" || outcome.status === "DRY-RUN") {
+      hist[card.eventKey] = { c: 1, at: Date.now() };
+      saveFlashHist(dateKey, hist);
+      store.kvSet("flashCursor", String(Object.values(hist).reduce((s, e) => s + e.c, 0)));
+    } else {
+      console.warn(
+        `[job:flashcards] delivery ${outcome.status} for ${card.eventKey} — card NOT marked, retry next tick (${outcome.error ?? "unknown"})`
+      );
+    }
+    return outcome;
   },
 
   async vip_aggregate() {

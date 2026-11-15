@@ -511,7 +511,14 @@ export async function buildLedgerPayload(
   // ── v5.0 · Live Bankroll Audit Inspector ──────────────────────────────────
   // the algebraic accounting box rendered above the SHA-256 record table:
   //   bankStart + Σ dual wins − Σ dual losses + combo + cluster + banker +
-  //   sniper + accumulator = current bank (every user can sum it in 3s)
+  //   regCombo + sniper + accumulator = current bank (every user can sum it
+  //   in 3s)
+  // v5.6 FIX (master prompt 1877.1u): cluster/sniper profits were computed
+  // from `singleRows` which NEVER contains CLUSTER/SNIPER rows (they live in
+  // their own aggregated arrays) — the audit printed 0.00 for both and hid a
+  // −876.72 residual in `otherProfit`. Every term now comes from its own row
+  // set, REGCOMBO is an explicit term, and the identity is exact by
+  // construction (otherProfit ≡ 0: right side == real sum of left side).
   const lineProfit = (line: ProductionLine, rs: LedgerMatchRow[]) =>
     Math.round(
       rs.filter((r) => r.line === line).reduce((s, r) => s + r.profit, 0) * 100
@@ -520,46 +527,44 @@ export async function buildLedgerPayload(
     Math.round(dualRows.filter((r) => r.status === "WON").reduce((s, r) => s + r.profit, 0) * 100) / 100;
   const dualLostStake =
     Math.round(dualRows.filter((r) => r.status === "LOST").reduce((s, r) => s + r.profit, 0) * 100) / 100;
+  const comboProfit = lineProfit("COMBO", singleRows);
+  const clusterProfit = lineProfit("CLUSTER", clusterRows);
+  const bankerProfit = lineProfit("BANKER", singleRows);
+  const regComboProfit = lineProfit("REGCOMBO", regComboRows);
+  const sniperProfit = lineProfit("SNIPER", sniperRows);
+  const accumulatorProfit = lineProfit("ACCUMULATOR", singleRows);
   const bankAudit: BankAudit = {
     bankStart: BANK_START,
     dualWonProfit,
     dualLostStake,
-    comboProfit: lineProfit("COMBO", singleRows),
-    clusterProfit: lineProfit("CLUSTER", singleRows),
-    bankerProfit: lineProfit("BANKER", singleRows),
-    sniperProfit: lineProfit("SNIPER", singleRows),
-    accumulatorProfit: lineProfit("ACCUMULATOR", singleRows),
+    comboProfit,
+    clusterProfit,
+    bankerProfit,
+    regComboProfit,
+    sniperProfit,
+    accumulatorProfit,
+    // exact-by-construction identity: bankStart + every explicit term = bank
     otherProfit:
-      Math.round((combinedProfit - dualWonProfit - dualLostStake) * 100) / 100 -
-      dualWonProfit -
-      dualLostStake +
-      dualWonProfit +
-      dualLostStake -
-      lineProfit("COMBO", singleRows) -
-      lineProfit("CLUSTER", singleRows) -
-      lineProfit("BANKER", singleRows) -
-      lineProfit("SNIPER", singleRows) -
-      lineProfit("ACCUMULATOR", singleRows),
+      Math.round(
+        (bank -
+          (BANK_START +
+            dualWonProfit +
+            dualLostStake +
+            comboProfit +
+            clusterProfit +
+            bankerProfit +
+            regComboProfit +
+            sniperProfit +
+            accumulatorProfit)) *
+          100
+      ) / 100,
     bank: Math.round(bank * 100) / 100,
     wonCount: combinedWonCount,
     lostCount: decidedRows.length - combinedWonCount,
     auditHash: "",
   };
-  bankAudit.otherProfit =
-    Math.round(
-      (bankAudit.bank -
-        (bankAudit.bankStart +
-          bankAudit.dualWonProfit +
-          bankAudit.dualLostStake +
-          bankAudit.comboProfit +
-          bankAudit.clusterProfit +
-          bankAudit.bankerProfit +
-          bankAudit.sniperProfit +
-          bankAudit.accumulatorProfit)) *
-        100
-    ) / 100;
   bankAudit.auditHash = sha256(
-    `${bankAudit.bankStart}|${bankAudit.dualWonProfit}|${bankAudit.dualLostStake}|${bankAudit.comboProfit}|${bankAudit.clusterProfit}|${bankAudit.bankerProfit}|${bankAudit.sniperProfit}|${bankAudit.accumulatorProfit}|${bankAudit.otherProfit}|=${bankAudit.bank}`
+    `${bankAudit.bankStart}|${bankAudit.dualWonProfit}|${bankAudit.dualLostStake}|${bankAudit.comboProfit}|${bankAudit.clusterProfit}|${bankAudit.bankerProfit}|${bankAudit.regComboProfit}|${bankAudit.sniperProfit}|${bankAudit.accumulatorProfit}|${bankAudit.otherProfit}|=${bankAudit.bank}`
   );
 
   return {
