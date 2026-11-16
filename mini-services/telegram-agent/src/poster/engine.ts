@@ -525,13 +525,13 @@ function drawSlipBox(P: Painter, x: number, y: number, w: number, h: number, sli
   P.panel(x, y, w, h, PANEL);
   drawPixelBorder(P.ctx, x, y, w, h, slip.locked ? GREY : accent);
 
-  // key chip + wing label
-  P.chip(`KEY: ${slip.key}`, x + 20, y + 18, { font: fMono(17), fg: GOLD, border: GOLD, bg: "rgba(255,209,102,0.08)", h: 32 });
+  // key chip + wing label — LEGIBILITY FIX (director: slip font too small)
+  P.chip(`KEY: ${slip.key}`, x + 20, y + 18, { font: fMono(19), fg: GOLD, border: GOLD, bg: "rgba(255,209,102,0.08)", h: 36 });
   P.chipRight(slip.label, x + w - 20, y + 18, {
-    font: fMono(17),
+    font: fMono(19),
     fg: INK,
     bg: slip.locked ? GREY : accent,
-    h: 32,
+    h: 36,
   });
 
   if (slip.locked) {
@@ -553,27 +553,27 @@ function drawSlipBox(P: Painter, x: number, y: number, w: number, h: number, sli
     P.text("ODDS HIDDEN", x + w / 2, y + 352, fMono(22), GREY, "center");
     P.text("UNLOCK IN VIP ARENA", x + w / 2, y + 392, fMono(19), GOLD, "center");
     // market name stays visible (teaser) — centered INSIDE the box
-    P.wrapped(slip.marketEn, x + w / 2, y + 84, w - 48, fSans(26), CREAM, 34, 1, "center");
+    P.wrapped(slip.marketEn, x + w / 2, y + 88, w - 48, fSans(28), CREAM, 36, 1, "center");
     return;
   }
 
   // market name
-  const marketLines = P.wrapped(slip.marketEn, x + 24, y + 84, w - 48, fSans(26), CREAM, 34, 2);
-  // detail
-  const detailY = Math.max(marketLines + 26, y + 140);
-  P.wrapped(slip.detail, x + 24, detailY, w - 48, fMono(17, "normal"), GREY, 25, 4);
+  const marketLines = P.wrapped(slip.marketEn, x + 24, y + 88, w - 48, fSans(28), CREAM, 36, 2);
+  // detail — bumped 17→20px (director legibility fix), 4 wrap lines stay in band
+  const detailY = Math.max(marketLines + 28, y + 146);
+  P.wrapped(slip.detail, x + 24, detailY, w - 48, fMono(20, "normal"), GREY, 27, 4);
 
   // stake + edge chips (director rule: stake per tip must be visible)
   if (slip.stake !== undefined || slip.edge !== undefined) {
-    const chipY = y + 258;
+    const chipY = y + 262;
     if (slip.stake !== undefined) {
       const stakeText = `STAKE ${slip.stake === Math.floor(slip.stake) ? slip.stake : slip.stake.toFixed(1)}U`;
       P.chip(stakeText, x + 24, chipY, {
-        font: fMono(20),
+        font: fMono(23),
         fg: INK,
         bg: GOLD,
-        h: 44,
-        padX: 14,
+        h: 50,
+        padX: 16,
       });
     }
     if (slip.edge !== undefined) {
@@ -583,24 +583,24 @@ function drawSlipBox(P: Painter, x: number, y: number, w: number, h: number, sli
       const pos = pct >= 0;
       const col = pos ? GREEN : RED;
       P.chipRight(edgeText, x + w - 24, chipY, {
-        font: fMono(20),
+        font: fMono(23),
         fg: col,
         border: col,
         bg: pos ? "rgba(66,226,130,0.10)" : "rgba(255,93,93,0.10)",
-        h: 44,
-        padX: 14,
+        h: 50,
+        padX: 16,
       });
     }
   }
 
   // odds
-  P.text("ODDS", x + w / 2, y + h - 222, fMono(17), GREY, "center");
-  P.text(slip.odds.toFixed(2), x + w / 2 + 4, y + h - 140, fMono(84), GOLD, "center");
+  P.text("ODDS", x + w / 2, y + h - 222, fMono(18), GREY, "center");
+  P.text(slip.odds.toFixed(2), x + w / 2 + 4, y + h - 138, fMono(88), GOLD, "center");
 
   // probability bar
   if (!forFree || slip.prob !== undefined) {
     const prob = slip.prob ?? 0.5;
-    P.text(`PROB ${Math.round(prob * 100)}%`, x + w - 24, y + h - 76, fMono(16), GREY, "right");
+    P.text(`PROB ${Math.round(prob * 100)}%`, x + w - 24, y + h - 76, fMono(18), GREY, "right");
     segmentedBar(P.ctx, x + 24, y + h - 66, w - 48, 18, prob, accent);
   }
 }
@@ -1394,7 +1394,7 @@ export function samplePoster(kind: PosterKind): PosterRequest {
             detail: "ALCARAZ TO WIN THE MATCH BY EXACTLY 2 SETS TO 0. VALID FOR FULL MATCH ONLY. VOID IF RETIRED.",
             odds: 1.97,
             prob: 0.51,
-            stake: 1,
+            stake: 57.6,
             edge: 0.005,
           },
           {
@@ -1404,7 +1404,7 @@ export function samplePoster(kind: PosterKind): PosterRequest {
             detail: "MATCH TOTAL GAMES TO FINISH OVER 22.5. TIE-BREAKS IN EITHER SET PUSH THIS PICK GREEN FAST.",
             odds: 2.68,
             prob: 0.38,
-            stake: 1,
+            stake: 42.4,
             edge: 0.018,
           },
         ],
@@ -1422,8 +1422,8 @@ export function samplePoster(kind: PosterKind): PosterRequest {
             "DUAL-WING STRUCTURE ONLINE - TYPE A + TYPE B TOGETHER COVER 92% OF ALL POSSIBLE SCORE ROUTES.",
           prediction: "PREDICTION: CARLOS ALCARAZ 2-0",
           rankGap: "RANK GAP #7 v #2",
-          totalStake: "TOTAL RISK 2U",
-          stakeDetail: "TIP A 1U + TIP B 1U",
+          totalStake: "TOTAL RISK 100U",
+          stakeDetail: "TIP A 57.6U + TIP B 42.4U",
         },
         timeLabel: "T-30M PRE-WARMUP",
         hash: "A1B2C3D4E5",
@@ -1457,7 +1457,7 @@ export function samplePoster(kind: PosterKind): PosterRequest {
             detail: "SABALENKA TO WIN THE MATCH IN STRAIGHT OR THREE SETS. VALID FOR FULL MATCH ONLY.",
             odds: 1.85,
             prob: 0.55,
-            stake: 1,
+            stake: 64.8,
             edge: 0.017,
           },
           {

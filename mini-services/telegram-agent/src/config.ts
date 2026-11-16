@@ -19,9 +19,18 @@ function str(name: string, fallback = ""): string {
   return v === undefined || v === "" ? fallback : v;
 }
 
+/**
+ * Director-provided tokens historically arrive as "12345: ABC..." (space
+ * after the colon) or wrapped in quotes/ZWNJ. Any stray whitespace makes the
+ * Bot API URL invalid → HTTP 404 "Not Found" on EVERY send. Normalize hard.
+ */
+function normalizeToken(raw: string): string {
+  return raw.replace(/[\s"'​‌﻿]+/g, "");
+}
+
 export function loadConfig(): AgentConfig {
   return {
-    token: str("TELEGRAM_BOT_TOKEN"),
+    token: normalizeToken(str("TELEGRAM_BOT_TOKEN")),
     publicChatId: str("TELEGRAM_PUBLIC_CHAT_ID", "@aineobet"),
     vipChatId: str("TELEGRAM_VIP_CHAT_ID"),
     live: str("TELEGRAM_LIVE", "false").toLowerCase() === "true",

@@ -74,6 +74,10 @@ export const telegram = {
     png: Buffer,
     caption: string
   ): Promise<{ ok: boolean; messageId?: number; description?: string }> {
+    // token guard: an empty token silently builds "/bot/sendPhoto" → opaque
+    // HTTP 404 "Not Found". Fail loudly instead so the scheduler log shows
+    // the REAL cause (delivery-first retry logic relies on honest errors).
+    if (!CONFIG.token) return { ok: false, description: "no token configured - check agent .env" };
     const cap = caption.length > 1024 ? `${caption.slice(0, 1000)}\n…` : caption;
     if (!chatId) return { ok: false, description: "target chat id missing" };
     try {
@@ -101,6 +105,7 @@ export const telegram = {
     chatId: string,
     text: string
   ): Promise<{ ok: boolean; messageId?: number; description?: string }> {
+    if (!CONFIG.token) return { ok: false, description: "no token configured - check agent .env" };
     if (!chatId) return { ok: false, description: "target chat id missing" };
     const res = await call<SentMessage>("sendMessage", {
       chat_id: chatId,

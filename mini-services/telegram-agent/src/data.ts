@@ -59,14 +59,23 @@ export interface CardMatch {
   vetoReasonFa?: string;
 }
 
-// ─── staking ladder (director rule: stake per tip, honest risk) ────────────
-// adaptive grant → 0.5U · prob ≥ 72% → 2U · prob ≥ 62% → 1.5U · else 1U
-export function stakeFor(prob: number | undefined, adaptive?: boolean): number {
-  if (adaptive) return 0.5;
-  const p = prob ?? 0.5;
-  if (p >= 0.72) return 2;
-  if (p >= 0.62) return 1.5;
-  return 1;
+// ─── 100-UNIT STAKE LAW (director rule, v5.5) ──────────────────────────────
+// Every match rides ONE standard 100-unit budget. The per-tip stake is the
+// equal-profit dutching split of that budget by the two official market
+// prices — the EXACT same formula as the signal production lines
+// (src/lib/tennis/supervisor.ts → dutchStakes). Card, caption and production
+// line therefore always show identical amounts, and stakeA + stakeB = 100.
+export const STANDARD_MATCH_STAKE = 100;
+
+export function dutchStakesOf(
+  oddsA: number | undefined,
+  oddsB: number | undefined
+): { stakeA: number; stakeB: number } {
+  const invA = 1 / Math.max(oddsA ?? 2, 1.01);
+  const invB = 1 / Math.max(oddsB ?? 2, 1.01);
+  const stakeA = Math.round(((STANDARD_MATCH_STAKE * invA) / (invA + invB)) * 10) / 10;
+  const stakeB = Math.round((STANDARD_MATCH_STAKE - stakeA) * 10) / 10;
+  return { stakeA, stakeB };
 }
 
 export function stakeLabelEn(stake: number): string {
@@ -103,9 +112,15 @@ function countryCodeOf(flagUrl?: string): string | undefined {
 export function matchToCard(m: AnalyzedMatch): CardMatch {
   const favName =
     (m.favorite === "A" ? m.playerA.name : m.playerB.name).toUpperCase();
-  const mkSlip = (s?: AnalyzedMatch["slips"]["A"]): CardSlip | undefined => {
+  // 100-unit stake law: dutch the standard budget across BOTH wings with the
+  // production-line formula so card/caption amounts match the signal lines.
+  const dutched = dutchStakesOf(m.slips.A?.odds, m.slips.B?.odds);
+  const mkSlip = (
+    s?: AnalyzedMatch["slips"]["A"],
+    wing: "A" | "B" = "A"
+  ): CardSlip | undefined => {
     if (!s) return undefined;
-    const stake = stakeFor(s.prob, m.archetype?.adaptive);
+    const stake = wing === "A" ? dutched.stakeA : dutched.stakeB;
     const edge = s.odds * (s.prob ?? 0) - 1;
     return {
       key: s.leg,
@@ -147,8 +162,8 @@ export function matchToCard(m: AnalyzedMatch): CardMatch {
     adaptive: m.archetype?.adaptive,
     timingCode: m.timing?.code,
     timingLabel: m.timing?.label,
-    slipA: mkSlip(m.slips.A),
-    slipB: mkSlip(m.slips.B),
+    slipA: mkSlip(m.slips.A, "A"),
+    slipB: mkSlip(m.slips.B, "B"),
     hash: m.hashPre?.slice(0, 10).toUpperCase(),
     vetoed: m.veto.vetoed,
     vetoCode: m.veto.code,
@@ -362,16 +377,18 @@ class DataHub {
       timingLabel: "SUPERVISOR SYNC PENDING",
       vetoed: !!r.vetoed,
       vetoReasonFa: (r.vetoReason as string) ?? undefined,
+      // 100-unit stake law — same dutching split as the live production lines
       slipA: r.slipAOdds
         ? (() => {
             const prob = (r.slipAProb as number) ?? undefined;
+            const dutched = dutchStakesOf(Number(r.slipAOdds), r.slipBOdds ? Number(r.slipBOdds) : undefined);
             return {
               key: "PENDING-SYNC",
               marketEn: "OFFICIAL MARKET - SYNC PENDING",
               detail: LEG_DETAIL_EN["TG-O225"],
               odds: Number(r.slipAOdds),
               prob,
-              stake: stakeFor(prob),
+              stake: dutched.stakeA,
               edge: Number(r.slipAOdds) * (prob ?? 0) - 1,
             };
           })()
@@ -379,13 +396,14 @@ class DataHub {
       slipB: r.slipBOdds
         ? (() => {
             const prob = (r.slipBProb as number) ?? undefined;
+            const dutched = dutchStakesOf(r.slipAOdds ? Number(r.slipAOdds) : undefined, Number(r.slipBOdds));
             return {
               key: "PENDING-SYNC",
               marketEn: "OFFICIAL MARKET - SYNC PENDING",
               detail: LEG_DETAIL_EN["GH-F45"].replace("FAVORITE", favName),
               odds: Number(r.slipBOdds),
               prob,
-              stake: stakeFor(prob),
+              stake: dutched.stakeB,
               edge: Number(r.slipBOdds) * (prob ?? 0) - 1,
             };
           })()

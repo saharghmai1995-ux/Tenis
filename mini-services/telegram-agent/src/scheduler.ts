@@ -470,8 +470,8 @@ function briefingRequest(
     theme: "HARD",
     rows: [...rows, ...vetoRows],
     bullets: [
-      "MAX 2 UNITS PER PICK - NEVER CHASE A LOSS",
-      "FLAT STAKES ONLY - NO PARLAY TODAY",
+      "STANDARD 100U MATCH BUDGET - NEVER CHASE A LOSS",
+      "EQUAL-PROFIT DUTCHING - BOTH WINGS = 100U TOTAL",
       "LINE LOCKED AT T-30M - NO LATE MOVES",
       "SKIP ANY MATCH IF ODDS DROP BELOW 1.60",
     ],
@@ -479,10 +479,10 @@ function briefingRequest(
       { label: "APPROVED", value: String(quota.approved), accent: true },
       { label: "VETOED", value: String(vetoed.length) },
       { label: "QUOTA", value: "12 MAX" },
-      { label: "BANK RISK", value: "2.0U" },
+      { label: "BANK RISK", value: "100U" },
     ],
     stage: stageLabel(),
-    footerNote: "FULL CARD IN VIP - 18+ - FLAT STAKES",
+    footerNote: "FULL CARD IN VIP - 18+ - 100U STANDARD STAKE",
   } as PosterRequest;
 }
 
