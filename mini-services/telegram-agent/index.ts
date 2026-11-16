@@ -37,6 +37,7 @@ const KINDS: PosterKind[] = [
   "ACADEMY",
   "BANNER",
   "FTRESULTS",
+  "DAILYPROGRAM",
 ];
 
 const OUTBOX = path.join(process.cwd(), "outbox");

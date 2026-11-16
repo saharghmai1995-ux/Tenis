@@ -5,6 +5,7 @@ import { AlertTriangle, RefreshCw, Radar } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useFeed } from "@/components/tennis/use-feed";
 import { HeaderBar } from "@/components/tennis/header-bar";
+import { DailyProgram } from "@/components/tennis/daily-program";
 import { CommandCenter } from "@/components/tennis/command-center";
 import { HawkEyeCourt } from "@/components/tennis/hawk-eye-court";
 import { ProductionLines } from "@/components/tennis/production-lines";
@@ -92,6 +93,11 @@ export default function Home() {
       />
 
       <main className="mx-auto w-full max-w-7xl flex-1 space-y-6 px-4 py-6">
+        {/* v3.1 · Professional daily broadcast program (agent-driven, browser-free) */}
+        <section aria-label="برنامه روزانه پخش">
+          <DailyProgram />
+        </section>
+
         {loading && <FeedSkeleton />}
         {!loading && error && <FeedError error={error} onRetry={() => void reload(true)} />}
 

@@ -9,6 +9,7 @@ import ZAI from "z-ai-web-dev-sdk";
 import { esc } from "./telegram";
 import { ACADEMY } from "./academy";
 import { LEG_DETAIL_EN } from "./data";
+import { PROGRAM, targetFa, type ProgramRow } from "./program";
 import type { CardMatch } from "./data";
 import type { SettledRow } from "./data";
 import type { TennisNewsItem, LiveTennisMatch, FitnessItem } from "./espn";
@@ -418,6 +419,43 @@ export function captionBanner(stats: { coreWinRate: number; profit: number; pick
     "🔒 همه رکوردها با قفل SHA-256 قبل از بازی ثبت می‌شوند؛ هیچ عددی بعداً ادیت نمی‌شود.",
     FOOT,
   ].join("\n");
+}
+
+/** fa-clock helper for the program caption */
+const faClock = (s: string): string =>
+  s.replace(/[0-9]/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[+d]).replace(":", ":");
+
+/**
+ * Professional daily program caption — the day's full broadcast contract,
+ * generated from PROGRAM (single source of truth shared with the poster and
+ * the dashboard panel).
+ */
+export function captionDailyProgram(dateFa: string, weekdayFa: string): string {
+  const lines: string[] = [
+    BRAND,
+    `📋 برنامه حرفه‌ای روزانه پخش — ${weekdayFa} ${dateFa}`,
+    "",
+    "قرارداد پخش امروز، دقیقه‌به‌دقیقه و به وقت تهران:",
+    "",
+  ];
+  for (const p of PROGRAM) {
+    const clock = p.time === ":15" ? "هر ساعت دقیقه ۱۵" : p.time === "90s" ? "تمام روز هر ۹۰ ثانیه" : faClock(p.time);
+    lines.push(`⏰ ${clock} — ${p.fa} → ${targetFa(p.target)}`);
+  }
+  lines.push("");
+  lines.push("🧭 قوانین ثابت برنامه:");
+  lines.push("• فلش‌کارت هر بازی فقط یک‌بار در روز ارسال می‌شود؛ تکرار ممنوع.");
+  lines.push("• استیک استاندارد ۱۰۰ واحدی برای هر بازی؛ مبلغ دقیق هر تیپ روی کارت و کپشن اعلام می‌شود.");
+  lines.push("• پوستر هر پست انگلیسی و کپشن آن کامل فارسی است.");
+  lines.push("• همه اعداد پیش از بازی با قفل SHA-256 ثبت و بعد از بازی فقط تسویه می‌شوند.");
+  lines.push("");
+  lines.push("این برنامه هر روز ساعت ۰۸:۳۰ در هر دو کانال منتشر می‌شود.");
+  return lines.join("\n") + FOOT;
+}
+
+/** poster rows for the DAILYPROGRAM timetable (English, sanitizer-safe) */
+export function dailyProgramPosterRows(): ProgramRow[] {
+  return PROGRAM;
 }
 
 /** Persian caption for a flashcard when the card lacks full data (fallback). */

@@ -1363,6 +1363,86 @@ function drawBanner(P: Painter, req: PosterRequest): void {
   P.ctx.globalAlpha = 1;
 }
 
+// ─── DAILYPROGRAM — professional daily broadcast timetable ─────────────────
+
+const CHANNEL_COLOR: Record<string, string> = {
+  PUBLIC: GREEN,
+  VIP: GOLD,
+  BOTH: CYAN,
+};
+
+function drawChannelChip(P: Painter, cx: number, cy: number, channel: string): number {
+  const color = CHANNEL_COLOR[channel] ?? GREY;
+  const font = fMono(18);
+  P.ctx.font = font;
+  const tw = P.ctx.measureText(channel).width;
+  const w = Math.ceil(tw) + 24;
+  const h = 40;
+  const x = Math.round(cx - w / 2);
+  const y = Math.round(cy - h / 2);
+  P.ctx.fillStyle = `${color}22`;
+  P.ctx.fillRect(x, y, w, h);
+  P.ctx.fillStyle = color;
+  P.ctx.fillRect(x, y, w, 2);
+  P.ctx.fillRect(x, y + h - 2, w, 2);
+  P.ctx.fillRect(x, y, 2, h);
+  P.ctx.fillRect(x + w - 2, y, 2, h);
+  P.ctx.fillStyle = color;
+  P.ctx.textAlign = "center";
+  P.ctx.textBaseline = "middle";
+  P.ctx.fillText(latinize(channel), cx, cy + 1);
+  P.ctx.textBaseline = "alphabetic";
+  return w;
+}
+
+function drawDailyProgram(P: Painter, req: PosterRequest): void {
+  const { w } = P;
+  if (req.subtitle) P.text(req.subtitle, w / 2, 108, fMono(21), CYAN, "center");
+
+  const rows = (req.rows ?? []).slice(0, 13);
+
+  // ── timetable ──────────────────────────────────────────────────────────
+  const ty = 152;
+  const headH = 54;
+  const rowH = 74;
+  const tx = 24;
+  const tw = w - 48;
+  P.ctx.fillStyle = "rgba(77,214,255,0.10)";
+  P.ctx.fillRect(tx, ty, tw, headH);
+  P.text("TIME", tx + 16, ty + 35, fMono(19), CYAN);
+  P.text("PROGRAM", tx + 148, ty + 35, fMono(19), CYAN);
+  P.text("CHANNEL", tx + tw - 16, ty + 35, fMono(19), CYAN, "right");
+
+  rows.forEach((r, i) => {
+    const ry = ty + headH + i * rowH;
+    if (i % 2 === 1) {
+      P.ctx.fillStyle = "rgba(255,255,255,0.045)";
+      P.ctx.fillRect(tx, ry, tw, rowH);
+    }
+    // time column — the time token is the part before the first "·"
+    const sep = r.label.indexOf("·");
+    const time = sep > 0 ? r.label.slice(0, sep).trim() : "";
+    const name = sep > 0 ? r.label.slice(sep + 1).trim() : r.label;
+    P.text(P.fit(time, 110, fMono(22)), tx + 16, ry + 46, fMono(22), GOLD);
+    P.text(P.fit(name, 620, fSans(22)), tx + 148, ry + 46, fSans(22), CREAM);
+    drawChannelChip(P, tx + tw - 96, ry + rowH / 2, r.value);
+    if (i < rows.length - 1) {
+      P.ctx.fillStyle = "rgba(255,255,255,0.06)";
+      P.ctx.fillRect(tx + 16, ry + rowH - 1, tw - 32, 2);
+    }
+  });
+  drawPixelBorder(P.ctx, tx, ty, tw, headH + rows.length * rowH, CYAN);
+
+  // ── discipline strip ───────────────────────────────────────────────────
+  const sumY = ty + headH + rows.length * rowH + 54;
+  P.text("ALL TIMES TEHRAN (UTC+03:30) - POSTERS EN / CAPTIONS FA", w / 2, sumY, fMono(20), GREY, "center");
+  P.text("ONE CARD PER MATCH PER DAY - STANDARD STAKE 100U", w / 2, sumY + 44, fMono(22), GOLD, "center");
+  P.ctx.globalAlpha = 0.9;
+  drawSprite(P.ctx, SPRITES.BELL, 150, sumY + 26, 5);
+  drawSprite(P.ctx, SPRITES.BALL, 880, sumY + 22, 5);
+  P.ctx.globalAlpha = 1;
+}
+
 // ─── sample data (realistic mocks per kind) ─────────────────────────────────
 
 export function samplePoster(kind: PosterKind): PosterRequest {
@@ -1667,6 +1747,30 @@ export function samplePoster(kind: PosterKind): PosterRequest {
         hash: "E5F1A8C3D7",
         footerNote: "TOMORROW CARD DROPS 10:00 TEHRAN",
       };
+    case "DAILYPROGRAM":
+      return {
+        kind,
+        title: "DAILY BROADCAST PROGRAM",
+        subtitle: "SATURDAY - ALL TIMES TEHRAN",
+        theme: "RESULTS",
+        stage: "ST 01-01",
+        rows: [
+          { label: "08:30 · DAILY BROADCAST PROGRAM", value: "BOTH" },
+          { label: "09:30 · TENNIS LIVE NEWS + FITNESS", value: "PUBLIC" },
+          { label: "10:00 · VIP MORNING BRIEFING", value: "VIP" },
+          { label: "10:30 · FREE CARD OF THE DAY", value: "PUBLIC" },
+          { label: "11:30 · BET ACADEMY LESSON", value: "PUBLIC" },
+          { label: ":15 · MARKETING BANNER - HOURLY", value: "PUBLIC" },
+          { label: "90S · VIP FLASH CARDS - ALL DAY", value: "VIP" },
+          { label: "16:30 · TENNIS LIVE NEWS + FITNESS", value: "PUBLIC" },
+          { label: "18:30 · BET ACADEMY LESSON", value: "PUBLIC" },
+          { label: "20:00 · FT RESULTS + WIN RATE", value: "PUBLIC" },
+          { label: "21:00 · VIP DAILY AGGREGATE", value: "VIP" },
+          { label: "22:00 · WEEKLY REPORT - FRIDAYS ONLY", value: "BOTH" },
+          { label: "23:00 · NIGHTLY PUBLIC LEDGER", value: "PUBLIC" },
+        ],
+        footerNote: "ONE CARD PER MATCH PER DAY - STAKE 100U",
+      };
   }
 }
 
@@ -1716,6 +1820,9 @@ export function renderPoster(req: PosterRequest): RenderResult {
         break;
       case "FTRESULTS":
         drawFtResults(P, req);
+        break;
+      case "DAILYPROGRAM":
+        drawDailyProgram(P, req);
         break;
     }
 

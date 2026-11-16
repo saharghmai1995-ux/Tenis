@@ -10,7 +10,8 @@ export type PosterKind =
   | "NEWS" // LIVE tennis newswire poster (English) — news + live board + fitness
   | "ACADEMY" // BET terminology academy lesson (English educational poster)
   | "BANNER" // hourly marketing banner
-  | "FTRESULTS"; // full-time settled results + win rate
+  | "FTRESULTS" // full-time settled results + win rate
+  | "DAILYPROGRAM"; // professional daily broadcast timetable (both channels)
 
 export type ThemeSurface = "HARD" | "CLAY" | "GRASS" | "LIVE" | "ACADEMY" | "MARKETING" | "RESULTS";
 
@@ -175,9 +176,25 @@ export type JobId =
   | "free_card"
   | "marketing_banner"
   | "ft_results"
-  | "public_aggregate";
+  | "public_aggregate"
+  | "daily_program";
 
 export type ChannelTarget = "public" | "vip" | "both";
+
+/** one row of the daily broadcast program (status payload) */
+export interface ProgramEntry {
+  time: string;
+  fa: string;
+  en: string;
+  target: ChannelTarget;
+  targetEn: string;
+  jobId: string;
+  lastStatus?: string;
+  lastRun?: string;
+  nextRun?: string;
+  /** true when today's slot time has passed (Tehran) */
+  elapsed?: boolean;
+}
 
 export interface JobSpec {
   id: JobId;
@@ -220,6 +237,10 @@ export interface AgentStatus {
   chats: { public?: string; vip?: string; vipTitle?: string };
   uptimeSeconds: number;
   jobs: (JobSpec & JobRunState)[];
+  /** the professional daily program, joined with live job state */
+  program: ProgramEntry[];
+  /** Tehran local time HH:MM at status build */
+  tehranTime?: string;
   recentPosts: PostLogRow[];
   flashQueue: {
     cursor: number;

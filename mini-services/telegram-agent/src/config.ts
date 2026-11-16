@@ -45,6 +45,7 @@ export function loadConfig(): AgentConfig {
 export const CONFIG = loadConfig();
 
 // Tehran-anchored schedule table (Times are Asia/Tehran local):
+//   Program : broadcast timetable 08:30 (both channels — the day's contract)
 //   VIP     : briefing 10:00 · flashcards every 90s · aggregate 21:00
 //   Weekly  : Friday 22:00 (both channels)
 //   Public  : LIVE TENNIS news 09:30 & 16:30 (news + live board + fitness) ·
@@ -52,6 +53,7 @@ export const CONFIG = loadConfig();
 //             FT results 20:00 · nightly aggregate 23:00
 // FOOTBALL NEWS: CANCELLED per director — replaced by live tennis + fitness.
 export const JOB_SPECS: JobSpec[] = [
+  { id: "daily_program", label: "Daily Broadcast Program (08:30, both)", labelFa: "برنامه روزانه پخش (۰۸:۳۰، هر دو کانال)", cron: "0 30 8 * * *", target: "both", enabled: true },
   { id: "vip_briefing", label: "VIP Morning Briefing", labelFa: "بریفینگ صبح کانال VIP", cron: "0 0 10 * * *", target: "vip", enabled: true },
   { id: "flashcards", label: "VIP Flash Cards (every 90s)", labelFa: "فلش‌کارت‌های VIP (هر ۹۰ ثانیه)", everySeconds: 90, target: "vip", enabled: true },
   { id: "vip_aggregate", label: "VIP Daily Aggregate", labelFa: "برآیند روزانه VIP", cron: "0 0 21 * * *", target: "vip", enabled: true },

@@ -13,9 +13,10 @@ import { fetchTennisRadar, peekRadar, type TennisNewsItem, type LiveTennisMatch,
 import type { PosterLiveRow, PosterFitnessRow } from "./types";
 import { ACADEMY } from "./academy";
 import * as cap from "./captions";
+import { PROGRAM, targetEn } from "./program";
 import { renderPoster } from "./poster/engine";
 import { registerFonts } from "./poster/engine";
-import type { JobId, JobRunState, JobSpec, PosterRequest, AgentStatus, PosterKind } from "./types";
+import type { JobId, JobRunState, JobSpec, PosterRequest, AgentStatus, PosterKind, ProgramEntry } from "./types";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
@@ -610,6 +611,36 @@ function vetoedRowsOf(cards: CardMatch[]): CardMatch[] {
 }
 
 const handlers: Record<JobId, Handler> = {
+  async daily_program() {
+    // The day's broadcast contract — rendered from PROGRAM (single source of
+    // truth) and delivered to BOTH channels. No data dependency, never skips.
+    const dow = tehranDow();
+    const f = tehranFields();
+    const dateFa = `${f.dom.toLocaleString("fa-IR")} ${new Intl.DateTimeFormat("fa-IR", { month: "long", timeZone: TZ }).format(new Date())}`;
+    const rows = PROGRAM.map((p) => ({
+      label: `${p.time} · ${p.en}`,
+      value: targetEn(p.target),
+      status: "INFO" as const,
+    }));
+    const req: PosterRequest = {
+      kind: "DAILYPROGRAM",
+      title: "DAILY BROADCAST PROGRAM",
+      subtitle: `${WEEKDAYS_EN[dow]} - ALL TIMES TEHRAN`,
+      theme: "RESULTS",
+      stage: stageLabel(),
+      rows,
+      footerNote: "ONE CARD PER MATCH PER DAY - STAKE 100U",
+    };
+    const png = await render(req);
+    const caption = cap.captionDailyProgram(dateFa, WEEKDAYS_FA[dow]);
+    const out1 = await deliver("daily_program", "public", "DAILYPROGRAM", caption, png);
+    if (vipChatId()) {
+      const out2 = await deliver("daily_program", "vip", "DAILYPROGRAM", caption, png);
+      return out1.status === "SENT" || out2.status === "SENT" ? out1 : out2;
+    }
+    return out1;
+  },
+
   async vip_briefing() {
     await ensureWarm();
     const approved = dataHub.approvedPool().slice(0, 8);
@@ -757,6 +788,15 @@ const handlers: Record<JobId, Handler> = {
   },
 };
 
+const WEEKDAYS_FA = ["یکشنبه", "دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه", "شنبه"];
+const WEEKDAYS_EN = ["SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"];
+
+/** Tehran weekday index (0=Sunday) for the program subtitle/caption. */
+function tehranDow(ms = Date.now()): number {
+  const dow = new Intl.DateTimeFormat("en-US", { timeZone: TZ, weekday: "short" }).format(new Date(ms));
+  return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(dow);
+}
+
 async function postNews(jobId: JobId): Promise<PostOutcome> {
   const radar = await fetchTennisRadar();
   const fresh = radar.news.find((i) => !store.hasNews(i.id)) ?? radar.news[0];
@@ -903,6 +943,27 @@ export function status(): AgentStatus {
       runs: st?.runs ?? 0,
     } as JobSpec & JobRunState;
   });
+  // program table joined with live job state (dashboard Daily Program panel)
+  const jobsById = new Map(jobs.map((j) => [j.id, j]));
+  const nowF = tehranFields();
+  const nowMin = nowF.h * 60 + nowF.min;
+  const program: ProgramEntry[] = PROGRAM.map((p) => {
+    const j = jobsById.get(p.jobId);
+    const elapsed =
+      p.min >= 0 && p.min <= 22 * 60 ? nowMin >= p.min : p.time === ":15" ? nowF.min >= 15 : true;
+    return {
+      time: p.time,
+      fa: p.fa,
+      en: p.en,
+      target: p.target,
+      targetEn: targetEn(p.target),
+      jobId: p.jobId,
+      lastStatus: j?.lastStatus,
+      lastRun: j?.lastRun,
+      nextRun: j?.nextRun,
+      elapsed,
+    };
+  });
   const f = dataHub.getFeed();
   const radar = peekRadar();
   const flashDateKey = tehranDateKey();
@@ -918,6 +979,8 @@ export function status(): AgentStatus {
     chats: { public: CONFIG.publicChatId, vip: vipChatId() || undefined, vipTitle: store.kvGet("vipChatTitle") || undefined },
     uptimeSeconds: Math.round((Date.now() - BOOT_AT) / 1000),
     jobs,
+    program,
+    tehranTime: `${String(nowF.h).padStart(2, "0")}:${String(nowF.min).padStart(2, "0")}`,
     recentPosts: store.recentPosts(20),
     flashQueue: {
       cursor: postsToday,
