@@ -370,6 +370,133 @@ export async function normalizeStakeUnits(): Promise<void> {
   }
 }
 
+// ─── v10 · PURGE THE RETIRED LOSS-MAKING LINES (master-prompt v10 §1) ──────
+// The v7.0 single-option lines (🎯 DEEP SINGLE / تک‌گزینه عمیق، 🏦 BANKER with
+// its negative-Sharpe 1.29x singles، 🔗 MIX-2 + ACCA uncovered parlays) sank
+// the bank −1,029.92u in two days. This idempotent migration DELETES every
+// ledger row of those lines AND enforces the IRON RULE on the remaining
+// packages: every tennis match keeps EXACTLY ONE 100-unit overlap package —
+// the duplicated parallel bets (e.g. the Shevchenko × Ruud double −100u) are
+// removed, DUAL (the champion) wins when a match carries several package
+// lines, and same-pair duplicates inside a 36h window are collapsed.
+export async function purgeNonOverlapHistory(): Promise<number> {
+  let removed = 0;
+  try {
+    // 1) delete every row of the retired loss-making lines
+    const gone = await db.tennisPick.deleteMany({
+      where: { line: { in: ["SINGLE", "BANKER", "COMBO", "ACCUMULATOR"] } },
+    });
+    removed += gone.count;
+
+    // 2) iron-rule dedupe on the surviving package lines
+    const legs = await db.tennisPick.findMany({
+      where: { line: { in: ["DUAL", "REGCOMBO", "CLUSTER", "SNIPER"] } },
+      include: { match: { select: { playerA: true, playerB: true } } },
+      orderBy: { createdAt: "asc" },
+    });
+
+    interface Pkg {
+      ids: string[];
+      line: string;
+      matchId: string;
+      pairKey: string;
+      createdAt: number;
+    }
+    const pkgs = new Map<string, Pkg>();
+    for (const l of legs) {
+      const key = `${l.line}|${l.matchId}`;
+      const p = pkgs.get(key) ?? {
+        ids: [],
+        line: l.line,
+        matchId: l.matchId,
+        pairKey: [l.match.playerA, l.match.playerB]
+          .map((s) => s.toLowerCase().trim())
+          .sort()
+          .join("__"),
+        createdAt: l.createdAt.getTime(),
+      };
+      p.ids.push(l.id);
+      pkgs.set(key, p);
+    }
+
+    const lineRank: Record<string, number> = { DUAL: 0, REGCOMBO: 1, CLUSTER: 2, SNIPER: 3 };
+    const better = (a: Pkg, b: Pkg): Pkg => {
+      const ra = lineRank[a.line] ?? 9;
+      const rb = lineRank[b.line] ?? 9;
+      if (ra !== rb) return ra < rb ? a : b;
+      return a.createdAt <= b.createdAt ? a : b;
+    };
+
+    const doomed = new Set<string>();
+
+    // 2a) one package line per match — DUAL beats REGCOMBO beats CLUSTER/SNIPER
+    const byMatch = new Map<string, Pkg[]>();
+    for (const p of pkgs.values()) {
+      const arr = byMatch.get(p.matchId) ?? [];
+      arr.push(p);
+      byMatch.set(p.matchId, arr);
+    }
+    for (const list of byMatch.values()) {
+      if (list.length < 2) continue;
+      let winner = list[0];
+      for (const p of list.slice(1)) winner = better(winner, p);
+      for (const p of list) if (p !== winner) p.ids.forEach((id) => doomed.add(id));
+    }
+
+    // 2b) the Shevchenko × Ruud law — no two parallel packages on the SAME
+    // player pair within 36h (a genuine rematch sits far apart in time)
+    const byPair = new Map<string, Pkg[]>();
+    for (const p of pkgs.values()) {
+      if (p.ids.some((id) => doomed.has(id))) continue;
+      const arr = byPair.get(p.pairKey) ?? [];
+      arr.push(p);
+      byPair.set(p.pairKey, arr);
+    }
+    for (const list of byPair.values()) {
+      if (list.length < 2) continue;
+      const sorted = [...list].sort((a, b) => a.createdAt - b.createdAt);
+      const kept: Pkg[] = [];
+      for (const p of sorted) {
+        const clash = kept.find(
+          (k) => Math.abs(k.createdAt - p.createdAt) <= 36 * 3600 * 1000
+        );
+        if (!clash) {
+          kept.push(p);
+        } else {
+          const winner = better(clash, p);
+          const loser = winner === clash ? p : clash;
+          loser.ids.forEach((id) => doomed.add(id));
+          if (winner === p) {
+            kept[kept.indexOf(clash)] = p;
+          }
+        }
+      }
+    }
+
+    if (doomed.size > 0) {
+      const del = await db.tennisPick.deleteMany({
+        where: { id: { in: [...doomed] } },
+      });
+      removed += del.count;
+    }
+
+    if (removed > 0) {
+      await db.engineLog
+        .create({
+          data: {
+            kind: "SETTLE",
+            message: `v10 peak-architecture purge: ${removed} retired loss-making rows removed (SINGLE/BANKER/COMBO/ACCUMULATOR + double-bet duplicates)`,
+          },
+        })
+        .catch(() => undefined);
+      console.log(`[ledger] v10 purge: ${removed} rows removed`);
+    }
+  } catch (e) {
+    console.error("[ledger] v10 purge failed", e);
+  }
+  return removed;
+}
+
 export async function buildLedgerPayload(
   quota?: QuotaTelemetry
 ): Promise<LedgerPayload> {

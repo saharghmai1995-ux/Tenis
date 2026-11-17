@@ -79,6 +79,13 @@ export interface PosterRequest {
     seedB?: number;
     flagA?: string; // 2-letter ISO code (Latin only)
     flagB?: string;
+    // ── v10 · per-player DEDICATED telemetry (anti-fixed-numbers law) ──
+    holdA?: number; // service game-hold % of player A (model)
+    holdB?: number;
+    bpsA?: number; // break-point saved % of player A
+    bpsB?: number;
+    markovPA?: number; // this match's own Markov serve points
+    markovPB?: number;
   };
   tournament?: string;
   round?: string;
@@ -142,6 +149,11 @@ export interface PosterRequest {
     totalStake?: string;
     /** per-tip stake breakdown, e.g. "TIP A 0.5U + TIP B 0.5U" */
     stakeDetail?: string;
+    // ── v10 · positive-overlap gate telemetry (golden filter verdict) ──
+    /** the gated overlap pattern, e.g. "P1 · SET MASTERY OVERLAP" */
+    patternLabel?: string;
+    /** guaranteed net return of every package win, e.g. "+18.4%" */
+    overlapNet?: string;
   };
   /** extra seed salt — rotates the pixel background between passes */
   seedSalt?: number;

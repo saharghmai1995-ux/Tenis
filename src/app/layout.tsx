@@ -17,7 +17,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "نئوتنیس مارکوف کوانت v7.0 | NeoTennis Live-Odds 3-Line Edition",
+  title: "نئوتنیس مارکوف کوانت v10.0 | Peak Dual-Hedge & Positive Overlap Gate",
   description:
     "ترمینال کمّی مهندسی تنیس حرفه‌ای ATP/WTA — رادار سه‌بعدی چشم شاهین، زنجیره مارکوف ۴ لایه، مهندسی معکوس ضرایب، سوپروایزر ۳ الگویی با سهمیه تایید ۶۵٪ و کارنامه SHA-256 در سطح مسابقه",
   keywords: [

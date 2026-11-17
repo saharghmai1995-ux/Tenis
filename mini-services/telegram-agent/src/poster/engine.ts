@@ -492,6 +492,7 @@ function drawPlayerPlate(
   accent: string,
   fav = false,
   seed?: number,
+  tele: { hold?: number; bps?: number; p?: number } = {},
 ): void {
   P.panel(x, y, w, h, PANEL);
   drawPixelBorder(P.ctx, x, y, w, h, accent);
@@ -505,14 +506,41 @@ function drawPlayerPlate(
   if (flag) {
     P.chipRight(flag, x + w - 18, y + 16, { font: fMono(18), fg: GREY, border: "#3d4654", bg: "rgba(61,70,84,0.3)", h: 34, padX: 10 });
   }
+  // v10 — per-player DEDICATED telemetry layout: when HOLD/BPS telemetry is
+  // present the plate packs [rank][seed][FAV]…[flag] on the top row, the big
+  // name at y+88, the full name at y+122 and the two telemetry rows at the
+  // bottom — nothing overlaps, every number is THIS player's own.
+  const hasTele = tele.hold !== undefined || tele.bps !== undefined;
+  const nameY = hasTele ? y + 88 : y + 112;
   const shortFont = fMono(40);
   const short = P.fit(name, w - 60, shortFont);
-  P.text(short, x + w / 2 + 3, y + 112 + 3, shortFont, "rgba(0,0,0,0.5)", "center");
-  P.text(short, x + w / 2, y + 112, shortFont, CREAM, "center");
+  P.text(short, x + w / 2 + 3, nameY + 3, shortFont, "rgba(0,0,0,0.5)", "center");
+  P.text(short, x + w / 2, nameY, shortFont, CREAM, "center");
   if (full && full !== name) {
-    P.text(P.fit(full, w - 60, fSans(20)), x + w / 2, y + 152, fSans(20, "normal"), GREY, "center");
+    P.text(P.fit(full, w - 60, fSans(20)), x + w / 2, hasTele ? y + 122 : y + 152, fSans(20, "normal"), GREY, "center");
   }
-  if (fav) {
+  const microRow = (label: string, value: number | undefined, ry: number) => {
+    if (value === undefined || !Number.isFinite(value)) return;
+    const pct = Math.max(0, Math.min(1, value));
+    P.ctx.font = fMono(15);
+    P.text(label, x + 18, ry, fMono(15), GREY, "left");
+    const barX = x + 130;
+    const barW = w - 218;
+    P.ctx.fillStyle = "rgba(255,255,255,0.10)";
+    P.ctx.fillRect(barX, ry - 10, barW, 10);
+    P.ctx.fillStyle = pct >= 0.8 ? GREEN : pct >= 0.6 ? GOLD : RED;
+    P.ctx.fillRect(barX, ry - 10, Math.max(4, Math.round(barW * pct)), 10);
+    P.text(`${Math.round(pct * 100)}%`, x + w - 18, ry, fMono(16), CREAM, "right");
+  };
+  if (hasTele) {
+    microRow("HOLD", tele.hold, y + h - 42);
+    microRow("BPS", tele.bps, y + h - 18);
+    if (fav) {
+      const favFont = fMono(16);
+      const favX = x + 18 + (rank !== undefined ? 76 : 0) + (seed !== undefined ? 74 : 0);
+      P.chip("FAV", favX, y + 16, { font: favFont, fg: INK, bg: GOLD, h: 34, padX: 10 });
+    }
+  } else if (fav) {
     const favFont = fMono(16);
     P.ctx.font = favFont;
     const tw = P.ctx.measureText("FAV").width;
@@ -627,10 +655,20 @@ function drawFlashcard(P: Painter, req: PosterRequest): void {
     P.text(P.fit(line, w - 80, fMono(22)), w / 2, 110, fMono(22), CYAN, "center");
   }
 
-  // player plates (favorite gets the star)
+  // player plates (favorite gets the star) — v10: per-player DEDICATED
+  // telemetry bars (HOLD% / BPS%) so every card shows ITS OWN two players'
+  // numbers, never a shared fixed value
   if (pl) {
-    drawPlayerPlate(P, 24, 130, 470, 190, pl.shortA ?? pl.a, pl.a, pl.rankA, pl.flagA, GOLD, intel?.favSide === "A", pl.seedA);
-    drawPlayerPlate(P, 586, 130, 470, 190, pl.shortB ?? pl.b, pl.b, pl.rankB, pl.flagB, CYAN, intel?.favSide === "B", pl.seedB);
+    drawPlayerPlate(P, 24, 130, 470, 190, pl.shortA ?? pl.a, pl.a, pl.rankA, pl.flagA, GOLD, intel?.favSide === "A", pl.seedA, {
+      hold: pl.holdA,
+      bps: pl.bpsA,
+      p: pl.markovPA,
+    });
+    drawPlayerPlate(P, 586, 130, 470, 190, pl.shortB ?? pl.b, pl.b, pl.rankB, pl.flagB, CYAN, intel?.favSide === "B", pl.seedB, {
+      hold: pl.holdB,
+      bps: pl.bpsB,
+      p: pl.markovPB,
+    });
 
     // center VS with ball above
     drawSprite(P.ctx, SPRITES.BALL, 516, 142, 4);
@@ -657,6 +695,13 @@ function drawFlashcard(P: Painter, req: PosterRequest): void {
   }
   if (intel?.rankGap) {
     enrich.push({ t: intel.rankGap.toUpperCase(), fg: MAGENTA, border: MAGENTA, bg: "rgba(255,77,214,0.08)" });
+  }
+  // v10 — the golden-gate verdict chips (pattern + guaranteed net return)
+  if (intel?.patternLabel) {
+    enrich.push({ t: intel.patternLabel.toUpperCase(), fg: GREEN, border: GREEN, bg: "rgba(66,226,130,0.10)" });
+  }
+  if (intel?.overlapNet) {
+    enrich.push({ t: `POSITIVE OVERLAP NET ${intel.overlapNet}`, fg: OPTIC, border: OPTIC, bg: "rgba(223,255,79,0.08)" });
   }
   let slipY = 452;
   if (enrich.length > 0) {

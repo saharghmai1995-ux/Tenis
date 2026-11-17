@@ -36,6 +36,16 @@ export interface CardMatch {
   /** tournament seed, drawn as S{n} chip next to the rank chip */
   seedA?: number;
   seedB?: number;
+  // ── v10 · per-player DEDICATED telemetry (anti-fixed-numbers law) ──────
+  holdA?: number; // service game-hold % of player A (this match's model)
+  holdB?: number;
+  bpsA?: number; // break-point saved % of player A
+  bpsB?: number;
+  markovPA?: number; // this match's own Markov serve points
+  markovPB?: number;
+  // ── v10 · positive-overlap golden gate verdict ──────────────────────
+  pattern?: string; // P1 | P2 | P3
+  overlapNetPct?: number; // guaranteed net return of every package win
   tour?: string;
   city?: string;
   tournament: string;
@@ -147,6 +157,15 @@ export function matchToCard(m: AnalyzedMatch): CardMatch {
     flagB: countryCodeOf(m.playerB.flagUrl),
     seedA: m.playerA.seed,
     seedB: m.playerB.seed,
+    // v10 — the two players' OWN telemetry (never a shared fixed number)
+    holdA: m.markov?.gA,
+    holdB: m.markov?.gB,
+    bpsA: m.markov?.bpsA,
+    bpsB: m.markov?.bpsB,
+    markovPA: m.markov?.pA,
+    markovPB: m.markov?.pB,
+    pattern: (m as { regime?: { pattern?: string } }).regime?.pattern,
+    overlapNetPct: (m as { regime?: { overlap?: { netReturnPct?: number } } }).regime?.overlap?.netReturnPct,
     tour: m.tour,
     city: m.city,
     tournament: m.tournament,

@@ -2,23 +2,16 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
-  ArrowRight,
   BadgeCheck,
   CalendarClock,
   Copy,
-  Crosshair,
   Crown,
   ExternalLink,
-  Gem,
   Layers,
-  Landmark,
-  Link2,
   Lock,
   Rocket,
   ShieldAlert,
   ShieldCheck,
-  Sparkles,
-  Target,
   Wallet,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -37,7 +30,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { TiltCard } from "@/components/tennis/spatial-tilt";
 import { OddsCalibrator } from "@/components/tennis/odds-calibrator";
 import { dedupeByKey } from "@/lib/tennis/dedupe";
-import { legLabelOf, REGIME_META } from "@/lib/tennis/supervisor";
+import { legLabelOf, OVERLAP_PATTERNS, REGIME_META } from "@/lib/tennis/supervisor";
 import type {
   AnalyzedMatch,
   CrownInfo,
@@ -788,77 +781,6 @@ function RegimeBadges({ item }: { item: LineItem }) {
   );
 }
 
-// ─── v5.5 Tab-BANKER flashcard: ONE safe single button (100u direct stake) ─
-
-function BankerFlashcard({ item }: { item: LineItem }) {
-  const matchLabel = `${item.playerA} × ${item.playerB}`;
-  return (
-    <TiltCard className="rise-in rounded-2xl border border-emerald-400/25 bg-emerald-400/[0.04]">
-      <div className="p-4">
-        <FlashHeader item={item} matchLabel={matchLabel} />
-        <RegimeBadges item={item} />
-        <div className="mt-3">
-          <MarketBox tone="A" wingLabel="بانکر امن — تک‌دکمه رسمی (استیک کامل ۱۰۰ واحد)" item={item} />
-        </div>
-        <FlashFooter item={item} matchLabel={matchLabel} />
-      </div>
-    </TiltCard>
-  );
-}
-
-// ─── v5.0 Tab-CLUSTER flashcard: 3 exact set/game scenarios (100u dutching) ─
-
-function ClusterFlashcard({ legs }: { legs: LineItem[] }) {
-  const first = legs[0];
-  const matchLabel = `${first.playerA} × ${first.playerB}`;
-  const totalStake = legs.reduce((s, l) => s + l.stake, 0);
-  const coverage = first.regime?.coverage ?? 0;
-  return (
-    <TiltCard className="rise-in rounded-2xl border border-fuchsia-400/25 bg-fuchsia-400/[0.04]">
-      <div className="p-4">
-        <FlashHeader item={first} matchLabel={matchLabel} />
-        <RegimeBadges item={first} />
-        <div className="mt-3 space-y-2.5">
-          {legs.map((l, i) => (
-            <MarketBox
-              key={l.leg}
-              tone={i === 0 ? "A" : i === 1 ? "B" : "single"}
-              wingLabel={`سناریو ${i + 1} — داچینگ ${totalStake > 0 ? ((l.stake / totalStake) * 100).toFixed(1) : "0"}٪`}
-              item={l}
-            />
-          ))}
-        </div>
-        <div className="mt-2.5 rounded-xl border border-fuchsia-400/30 bg-fuchsia-400/10 p-2.5 text-center">
-          <span className="text-[11px] font-bold text-fuchsia-200">
-            پوشش مشترک ۳ سناریو در ۱۰,۰۰۰ شبیه‌سازی:{" "}
-            <span className="mono-num">{(coverage * 100).toFixed(1)}%</span> — سود خالص هر سناریو{" "}
-            <span className="mono-num" dir="ltr">+35% تا +55%</span>
-          </span>
-        </div>
-        {/* v6.0 — live 1xBet calibrator on the two heaviest cluster scenarios */}
-        {legs.length >= 2 && (
-          <OddsCalibrator
-            legA={{
-              label: "سناریو ۱",
-              labelEn: "SCENARIO 1",
-              modelOdds: legs[0].odds,
-              marketEn: legs[0].marketEn,
-            }}
-            legB={{
-              label: "سناریو ۲",
-              labelEn: "SCENARIO 2",
-              modelOdds: legs[1].odds,
-              marketEn: legs[1].marketEn,
-            }}
-            matchLabel={matchLabel}
-          />
-        )}
-        <FlashFooter item={first} matchLabel={matchLabel} />
-      </div>
-    </TiltCard>
-  );
-}
-
 // ─── v4.0 Tab-DUAL flashcard: one card per match, Type A + Type B boxes ────
 
 function DualFlashcard({ pair }: { pair: { A: LineItem; B: LineItem } }) {
@@ -871,6 +793,7 @@ function DualFlashcard({ pair }: { pair: { A: LineItem; B: LineItem } }) {
         <FlashHeader item={A} matchLabel={matchLabel} />
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <ArchBadge item={A} />
+          <OverlapGateChip item={A} />
         </div>
         <V5Panel item={A} />
         <div className="mt-3 space-y-2.5">
@@ -917,137 +840,6 @@ function DualFlashcard({ pair }: { pair: { A: LineItem; B: LineItem } }) {
   );
 }
 
-// ─── v4.0 Tab-2 Multi-Match Parlay Slip card (legs table + combined odds) ──
-
-function legTime(iso: string | undefined): string {
-  if (!iso) return "—";
-  const t = new Date(iso).getTime();
-  if (!Number.isFinite(t)) return "—";
-  return faTime(iso);
-}
-
-function ParlaySlipCard({ item }: { item: LineItem }) {
-  const legs = item.legs ?? [];
-  const size = legs.length || 2;
-  const matchLabel = legs.map((l) => `${l.favShort ?? l.favName} × ${l.dogShort ?? l.dogName}`).join(" | ");
-  return (
-    <TiltCard className="rise-in rounded-2xl border border-cyan-400/25 bg-cyan-400/[0.04]">
-      <div className="p-4">
-        {/* official parlay slip header */}
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <span className="inline-flex items-center gap-1.5 text-xs font-black text-cyan-200">
-            <Link2 className="h-4 w-4" />
-            برگه میکس رسمی {size === 3 ? "۳" : "۲"} تایی
-            <span className="mono-num text-[10px] font-bold text-cyan-300/80" dir="ltr">
-              (Multi-Match Parlay Slip)
-            </span>
-          </span>
-          <span className="mono-num rounded-lg border border-cyan-400/30 bg-cyan-400/10 px-2 py-1 text-base font-extrabold text-white" dir="ltr">
-            {item.odds.toFixed(2)}x
-          </span>
-        </div>
-
-        {/* legs table — every base listed separately (v4.5: readable sizes) */}
-        <div className="scroll-slim mt-3 max-h-96 space-y-2 overflow-y-auto pe-1">
-          {legs.map((leg, i) => (
-            <div key={`${leg.eventKey}-${i}`} className="rounded-xl border border-white/10 bg-white/[0.04] p-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="mono-num text-xs font-black text-cyan-300" dir="ltr">
-                  LEG {i + 1}
-                </span>
-                <span className="text-xs font-bold text-white">
-                  {leg.favName} <span className="text-white/40">×</span> {leg.dogName}
-                </span>
-              </div>
-              <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-white/70">
-                <SurfaceDot surface={leg.surface} />
-                <span>{leg.tournament}</span>
-                <span dir="ltr">· {leg.tour} {leg.round}</span>
-                <span>· ساعت {legTime(leg.startTime)}</span>
-              </div>
-              <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
-                <span className="mono-num text-[11px] font-bold text-white/85" dir="ltr">
-                  MARKET: {leg.marketEn}
-                </span>
-                <span className="mono-num text-sm font-extrabold text-amber-200" dir="ltr">
-                  @{leg.odds.toFixed(2)}
-                </span>
-              </div>
-              <div className="mt-1 text-[11px] text-white/60">{leg.marketFa}</div>
-            </div>
-          ))}
-        </div>
-
-        {/* combined odds + suggested stake */}
-        <div className="mt-3 grid grid-cols-3 gap-2">
-          <div className="rounded-xl border border-white/10 bg-white/[0.04] p-2 text-center">
-            <div className="mono-num text-sm font-extrabold text-white" dir="ltr">
-              {item.odds.toFixed(2)}x
-            </div>
-            <div className="mt-0.5 text-[10px] text-white/65">ضریب کل میکس (Combined Odds)</div>
-          </div>
-          <div className="rounded-xl border border-white/10 bg-white/[0.04] p-2 text-center">
-            <div className="mono-num text-sm font-extrabold text-white" dir="ltr">
-              {(item.prob * 100).toFixed(1)}%
-            </div>
-            <div className="mt-0.5 text-[10px] text-white/65">احتمال زنجیره مارکوف</div>
-          </div>
-          <div className="rounded-xl border border-amber-300/30 bg-amber-300/10 p-2 text-center">
-            <div className="mono-num text-sm font-extrabold text-amber-200" dir="ltr">
-              {item.stake} واحد
-            </div>
-            <div className="mt-0.5 text-[10px] text-amber-200/70">مبلغ استیک پیشنهادی</div>
-          </div>
-        </div>
-
-        <FlashFooter item={item} matchLabel={matchLabel || item.descEn} />
-      </div>
-    </TiltCard>
-  );
-}
-
-// ─── v5.5 Tab-3 sniper flashcard — packaged position (main + capital-
-// protection cover, dutched 100-unit split, ONE card per match) ────────────
-
-function SniperPairCard({ main, cover }: { main: LineItem; cover: LineItem }) {
-  const matchLabel = `${main.playerA} × ${main.playerB}`;
-  const totalStake = main.stake + cover.stake;
-  return (
-    <TiltCard className="rise-in rounded-2xl border border-rose-400/25 bg-rose-400/[0.04]">
-      <div className="p-4">
-        <FlashHeader item={main} matchLabel={matchLabel} />
-        <V5Panel item={main} />
-        <div className="mt-3 space-y-2.5">
-          <MarketBox
-            tone="single"
-            wingLabel={`تک‌تیرانداز — تیپ اصلی (+EV ≥ ۱۴٪) · داچینگ ${totalStake > 0 ? ((main.stake / totalStake) * 100).toFixed(1) : "0"}٪`}
-            item={main}
-          />
-          <MarketBox
-            tone="orange"
-            wingLabel="پوشش اصل سرمایه — اسنایپر همیشه با پوشش بسته می‌شود"
-            item={cover}
-          />
-        </div>
-        <div className="mt-2.5 rounded-xl border border-rose-400/30 bg-rose-400/10 p-2.5 text-center">
-          <span className="text-[11px] font-bold text-rose-200">
-            پکیج ۱۰۰ واحدی: تیپ اصلی{" "}
-            <span className="mono-num" dir="ltr">{main.stake}u @ {main.odds.toFixed(2)}</span> + پوشش{" "}
-            <span className="mono-num" dir="ltr">{cover.stake}u @ {cover.odds.toFixed(2)}</span> — هیچ سطری با استیک ۱ یا ۲ واحدی در کارنامه ثبت نمی‌شود
-          </span>
-        </div>
-        {/* v6.0 — live 1xBet calibrator on the sniper package */}
-        <OddsCalibrator
-          legA={{ label: "تیپ اصلی", labelEn: "SNIPER MAIN", modelOdds: main.odds, marketEn: main.marketEn }}
-          legB={{ label: "پوشش سرمایه", labelEn: "CAPITAL COVER", modelOdds: cover.odds, marketEn: cover.marketEn }}
-          matchLabel={matchLabel}
-        />
-        <FlashFooter item={main} matchLabel={matchLabel} />
-      </div>
-    </TiltCard>
-  );
-}
-
 // ─── v5.0 REGCOMBO card: main + cover wings of one match ────────────────────
 
 function RegComboCard({ pair }: { pair: { main: LineItem; cover: LineItem } }) {
@@ -1058,6 +850,9 @@ function RegComboCard({ pair }: { pair: { main: LineItem; cover: LineItem } }) {
       <div className="p-4">
         <FlashHeader item={main} matchLabel={matchLabel} />
         <V5Panel item={main} />
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <OverlapGateChip item={main} />
+        </div>
         <div className="mt-3 space-y-2.5">
           <MarketBox tone="violet" wingLabel="کمبوی رسمی تک‌دکمه (تیپ اصلی)" item={main} />
           <MarketBox tone="emerald" wingLabel="پوشش رسمی مکمل (Cover)" item={cover} />
@@ -1069,33 +864,6 @@ function RegComboCard({ pair }: { pair: { main: LineItem; cover: LineItem } }) {
           matchLabel={matchLabel}
         />
         <FlashFooter item={main} matchLabel={matchLabel} />
-      </div>
-    </TiltCard>
-  );
-}
-
-// ─── v5.0 CLUSTER card: the three dutched exact scenarios of one match ──────
-
-function ClusterCard({ legs }: { legs: LineItem[] }) {
-  const item = legs[0];
-  const matchLabel = `${item.playerA} × ${item.playerB}`;
-  const totalStake = legs.reduce((s, l) => s + l.stake, 0);
-  const wingLabels = ["سناریو ۱ — داچینگ دقیق", "سناریو ۲ — داچینگ دقیق", "سناریو ۳ — داچینگ دقیق"];
-  const tones = ["orange", "violet", "lime"] as const;
-  return (
-    <TiltCard className="rise-in rounded-2xl border border-orange-400/25 bg-orange-400/[0.04]">
-      <div className="p-4">
-        <FlashHeader item={item} matchLabel={matchLabel} />
-        <V5Panel item={item} />
-        <div className="mt-3 space-y-2.5">
-          {legs.map((leg, i) => (
-            <MarketBox key={leg.leg} tone={tones[i % tones.length]} wingLabel={wingLabels[i]} item={leg} />
-          ))}
-        </div>
-        <div className="mono-num mt-2 rounded-lg border border-white/10 bg-black/20 px-3 py-1.5 text-[10px] text-white/70" dir="ltr">
-          DUTCHING PLAN: {legs.map((l) => `${l.stake}u @ ${l.odds.toFixed(2)}`).join(" + ")} = {Math.round(totalStake * 10) / 10}u · NET +35–55%
-        </div>
-        <FlashFooter item={item} matchLabel={matchLabel} />
       </div>
     </TiltCard>
   );
@@ -1174,223 +942,221 @@ function NearGateStrip({ matches }: { matches: AnalyzedMatch[] }) {
   );
 }
 
-// ─── v7.0 Production lines (THREE tabs — master-prompt v7.0 §2 · 100u each) ──
-// TAB 1 · 🔗 MIX-2 (2-leg precision parlay · 1.80x–2.25x · legs 1.34x–1.50x)
-// TAB 2 · 🎯 DEEP SINGLE (1.72x–2.15x · +6.5% probability edge vs live board)
-// TAB 3 · 🏦 BANKER (1.45x–1.65x · Top-25 + Elo gap ≥ 140) + 🔗 ACC-3 (2.70x–3.40x)
-// The dual-coverage / regcombo / cluster / sniper lines are RETIRED by the
-// v7.0 mandate; the shadow ledger strip stays as the honesty appendix.
+// ─── v10 · Overlap-gate chip (the golden filter verdict on every card) ──────
 
-/** v7.0 — extract the +EV edge + anchor state recorded in the card meta. */
-function deepMetaOf(item: LineItem): { edge: number; anchored: boolean } {
-  try {
-    const meta = item.meta ? (JSON.parse(item.meta) as { edge?: number; anchored?: boolean }) : {};
-    return { edge: meta.edge ?? 0, anchored: meta.anchored ?? false };
-  } catch {
-    return { edge: 0, anchored: false };
-  }
-}
-
-function DeepSingleCard({ item }: { item: LineItem }) {
-  const matchLabel = `${item.playerA} × ${item.playerB}`;
-  const { edge, anchored } = deepMetaOf(item);
+function OverlapGateChip({ item }: { item: LineItem }) {
+  const overlap = item.regime?.overlap;
+  const pattern = item.regime?.pattern;
+  if (!overlap && !pattern) return null;
+  const spec = pattern ? OVERLAP_PATTERNS[pattern] : undefined;
   return (
-    <TiltCard className="rise-in rounded-2xl border border-sky-400/25 bg-sky-400/[0.04]">
-      <div className="p-4">
-        <FlashHeader item={item} matchLabel={matchLabel} />
-        <RegimeBadges item={item} />
-        <div className="mt-3">
-          <MarketBox tone="single" wingLabel="تک‌گزینه عمیق — مارکت رسمی تک‌دکمه (استیک کامل ۱۰۰ واحد)" item={item} />
-        </div>
-        <div className="mt-2.5 rounded-xl border border-sky-400/30 bg-sky-400/10 p-2.5 text-center">
-          <span className="text-[11px] font-bold text-sky-200">
-            {anchored ? (
-              <>
-                برتری احتمال مدل نسبت به ضریب زنده 1xBet:{" "}
-                <span className="mono-num" dir="ltr">+{(edge * 100).toFixed(1)}%</span> — نقطه سر‌به‌سر{" "}
-                <span className="mono-num" dir="ltr">54%</span>
-              </>
-            ) : (
-              <>
-                قیمت فرمولی واقعی 1xBet (<span className="mono-num" dir="ltr">1/(p×1.055)</span>) — فید زنده
-                امروز برای این مارکت عرضه ندارد — نقطه سر‌به‌سر{" "}
-                <span className="mono-num" dir="ltr">54%</span>
-              </>
-            )}
-            {" "}· سود خالص هر برد{" "}
-            <span className="mono-num" dir="ltr">+{Math.round((item.odds - 1) * 100)} واحد</span>
-          </span>
-        </div>
-        <FlashFooter item={item} matchLabel={matchLabel} />
-      </div>
-    </TiltCard>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge
+          variant="outline"
+          className="gap-1 border-emerald-400/40 bg-emerald-400/10 text-[10px] font-bold text-emerald-200"
+          dir="ltr"
+        >
+          ✅ POSITIVE OVERLAP
+          {spec ? ` · ${spec.code}` : ""}
+          {overlap ? ` · NET +${overlap.netReturnPct.toFixed(1)}%` : ""}
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-[340px] text-[11px] leading-5">
+        <div className="font-bold">فیلتر ضریب همپوشانی مثبت — تایید سوپروایزر</div>
+        {spec && (
+          <p className="mt-1">
+            {spec.labelFa} — {spec.hookFa}
+          </p>
+        )}
+        {overlap && (
+          <p className="mono-num mt-1" dir="ltr">
+            impliedOverlapSum {overlap.impliedSum.toFixed(3)} ≤ 0.865 · effectiveOdds{" "}
+            {overlap.effectiveOdds.toFixed(2)}x · netOverlapReturn +
+            {overlap.netReturnPct.toFixed(1)}% ≥ +15.5%
+          </p>
+        )}
+        <p className="mt-1 text-[10px] text-muted-foreground">
+          هر برد این پکیج حداقل +۱۵.۵٪ سود خالص تضمین‌شده دارد؛ الگوهای بدون همپوشانی مثبت
+          توسط سوپروایزر وتو و هرگز وارد بانک نمی‌شوند.
+        </p>
+      </TooltipContent>
+    </Tooltip>
   );
 }
 
-export function ProductionLines({ feed }: { feed: FeedPayload }) {
-  const { banker, single, accumulator, combo2, shadow } = feed.lines;
+// ─── v10 Production lines (TWO peak tabs + the veto appendix) ────────────────
+// TAB 1 · ⚖️ DUAL-HEDGE golden pair — patterns P1 (Set Mastery 57.6/42.4),
+//          P2 (Double-Win 56/44 with the both-wins jackpot zone) and P3
+//          (Exact Set Split 60/40) — every package a gated 100-unit bet.
+// TAB 2 · 🧩 COPULA COMBO + COVER — the second allowed package form.
+// The BANKER / DEEP SINGLE / MIX / ACCA / CLUSTER / SNIPER lines are RETIRED
+// by the v10 mandate (the −1,029.92u drop era) and can never produce a card.
 
-  // v2.0 bug fix — the shadow ledger is grouped ONE row per match (the v1.0
-  // audit saw every match listed twice). Legs stay separate for settlement;
-  // the render unifies them by matchId with the canonical Map dedupe.
+export function ProductionLines({ feed }: { feed: FeedPayload }) {
+  const { dual, regCombo, shadow } = feed.lines;
+
+  // ⚖️ group the DUAL wings into ONE package per match (iron rule: 1 match =
+  // 1 package = 1 row; the render shows both wings side by side)
+  const dualPairs = useMemo(() => {
+    const byMatch = new Map<string, LineItem[]>();
+    for (const it of dual) {
+      const arr = byMatch.get(it.matchId) ?? [];
+      arr.push(it);
+      byMatch.set(it.matchId, arr);
+    }
+    return [...byMatch.values()]
+      .map((legs) => ({
+        A: legs.find((l) => l.meta?.includes('"dualA"')) ?? legs[0],
+        B: legs.find((l) => l.meta?.includes('"dualB"')) ?? legs[legs.length - 1],
+      }))
+      .filter((p) => p.A && p.B);
+  }, [dual]);
+
+  const comboPairs = useMemo(() => {
+    const byMatch = new Map<string, { main: LineItem; cover: LineItem }>();
+    for (const it of regCombo) {
+      const prev = byMatch.get(it.matchId);
+      const isMain = it.leg.includes("MAIN") || !!it.meta?.includes("regComboMain");
+      if (isMain) {
+        byMatch.set(it.matchId, { main: it, cover: prev?.cover ?? it });
+      } else {
+        byMatch.set(it.matchId, { main: prev?.main ?? it, cover: it });
+      }
+    }
+    return [...byMatch.values()].filter((p) => p.main && p.cover);
+  }, [regCombo]);
+
+  // v2.0 bug fix — the shadow ledger is grouped ONE row per match
   const shadowGroups = useMemo(() => {
     const first = dedupeByKey(
       [...shadow].sort((a, b) => a.matchId.localeCompare(b.matchId)),
       (s) => s.matchId
     );
-    return first.slice(0, 10);
+    return first.slice(0, 12);
   }, [shadow]);
 
-  const mixSlips = combo2; // v7.0 — 2-leg precision parlay slips only
-  const defaultTab = banker.length > 0 ? "banker" : single.length > 0 ? "single" : "mix";
+  const defaultTab = dualPairs.length > 0 ? "dual" : comboPairs.length > 0 ? "combo" : "shadow";
+  const overlapVetoes = shadowGroups.filter((s) => s.meta?.includes("OVERLAP") || s.desc.includes("همپوشانی")).length;
 
   return (
     <section aria-label="خطوط تولید" className="space-y-4">
       <Card className="spatial-card rounded-2xl">
         <CardHeader className="pb-2">
           <CardTitle className="flex flex-wrap items-center gap-2 text-sm font-bold">
-            <Rocket className="h-4 w-4 text-amber-300" />
-            خطوط تولید سیگنال — نسخه ۷.۰ (۳ خط تولید · ضرایب ۱۰۰٪ زنده اتوماتیک · استیک استاندارد ۱۰۰ واحدی)
+            <Layers className="h-4 w-4 text-amber-300" />
+            خطوط تولید سیگنال — نسخه ۱۰.۰ (بازگشت به معماری قله زوج‌تیپ همپوشان · فیلتر ضریب همپوشانی مثبت · استیک استاندارد ۱۰۰ واحدی)
             <span className="text-[11px] font-normal text-muted-foreground">
-              — خط لوله مارکوف ← کاپولا ← مونت‌کارلو ۱۰هزارتایی ← فید زنده ضرایب ← دروازه سوپروایزر · خروجی امروز:{" "}
-              {mixSlips.length} میکس ۲تایی · {single.length} تک‌گزینه عمیق · {banker.length} بانکر ·{" "}
-              {accumulator.length} آکومولاتور ۳تایی · {shadow.length} وتو
+              — خط لوله مارکوف ← کاپولا ← مونت‌کارلو ۱۰هزارتایی ← دروازه سوپروایزر + فیلتر همپوشانی مثبت · خروجی امروز:{" "}
+              {dualPairs.length} زوج‌تیپ همپوشان · {comboPairs.length} کمبوی کاپولا · {overlapVetoes} وتو همپوشانی · {shadow.length} وتو
             </span>
           </CardTitle>
         </CardHeader>
         <CardContent>
           <Tabs defaultValue={defaultTab}>
             <TabsList className="grid w-full grid-cols-3 gap-1 bg-white/5">
-              <TabsTrigger value="mix" className="gap-1.5 text-xs">
-                <Link2 className="h-3.5 w-3.5" /> میکس ۲تایی
+              <TabsTrigger value="dual" className="gap-1.5 text-xs">
+                <Layers className="h-3.5 w-3.5" /> زوج‌تیپ همپوشان
               </TabsTrigger>
-              <TabsTrigger value="single" className="gap-1.5 text-xs">
-                <Target className="h-3.5 w-3.5" /> تک‌گزینه عمیق
+              <TabsTrigger value="combo" className="gap-1.5 text-xs">
+                <ShieldCheck className="h-3.5 w-3.5" /> کمبو + پوشش
               </TabsTrigger>
-              <TabsTrigger value="banker" className="gap-1.5 text-xs">
-                <Wallet className="h-3.5 w-3.5" /> بانکر + آکومو
+              <TabsTrigger value="shadow" className="gap-1.5 text-xs">
+                <ShieldAlert className="h-3.5 w-3.5" /> وتوی سوپروایزر
               </TabsTrigger>
             </TabsList>
 
-            {/* ── Tab 1 · 🔗 MIX-2 — 2-Leg Precision Parlay (1.80x–2.25x) ── */}
-            <TabsContent value="mix" className="mt-4 space-y-3">
-              <div className="rounded-xl border border-cyan-400/25 bg-cyan-400/[0.06] px-3.5 py-2.5">
-                <div className="flex items-center gap-2 text-xs font-bold text-cyan-300">
-                  <Link2 className="h-4 w-4" />
-                  تب ۱ — میکس ۲ تایی سلاطین سرویس (2-Leg Precision Parlay)
-                  <span className="mono-num text-[10px] font-normal text-cyan-200/70" dir="ltr">
-                    legs 1.34x–1.50x · total 1.80x–2.25x · +80 تا +125 واحد هر برد · BE 50%
+            {/* ── Tab 1 · ⚖️ DUAL-HEDGE — the champion golden pair (100u package) ── */}
+            <TabsContent value="dual" className="mt-4 space-y-3">
+              <div className="rounded-xl border border-amber-300/25 bg-amber-300/[0.06] px-3.5 py-2.5">
+                <div className="flex items-center gap-2 text-xs font-bold text-amber-300">
+                  <Layers className="h-4 w-4" />
+                  تب ۱ — زوج‌تیپ طلایی همپوشان (Peak Dual-Hedge — معماری قله ۲,۴۴۵+ واحدی)
+                  <span className="mono-num text-[10px] font-normal text-amber-200/70" dir="ltr">
+                    P1 57.6/42.4 · P2 56/44 DOUBLE-WIN · P3 60/40 · NET +15.5%..+32u EVERY WIN
                   </span>
                 </div>
                 <div className="mt-1 text-[10px] text-muted-foreground">
-                  دو پایه مستقل از دو بازی مختلف (هندیکپ ست +۱.۵ / برد فاوریت / بالای ۱۹.۵ گیم) در هم ضرب
-                  می‌شوند — هر پایه با ضریب زندهٔ قفل‌شده و استیک ۱۰۰ واحدی.
+                  هر بازی فقط و فقط یک پکیج ۱۰۰ واحدی همپوشانی: الگوی ۱ (برد ۲-۰ فاوریت + بالای ۲.۵ ست)،
+                  الگوی ۲ (برد ۲-۰ + بالای ۲۰.۵ گیم با ناحیه برد دوبل همزمان) یا الگوی ۳ (تفکیک دقیق ست ۲-۰ / ۲-۱).
+                  فقط بازی‌های دارای ضریب همپوشانی مثبت (سود خالص هر برد ≥ +۱۵.۵٪ و شارپ ≥ ۰.۲۵) تایید می‌شوند.
                 </div>
               </div>
-              {mixSlips.length === 0 ? (
+              {dualPairs.length === 0 ? (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  جفت پایه‌های مستقل با ضریب کل <span className="mono-num">1.80x–2.25x</span> امروز ساخته نشد —
-                  برگه میکس فقط وقتی صادر می‌شود که حاصل‌ضرب واقعی دو ضریب زنده داخل پنجره قرار بگیرد.
+                  امروز هیچ بازی‌ای ضریب همپوشانی مثبت (سود خالص ≥{" "}
+                  <span className="mono-num">+15.5%</span> و مجموع معکوس ضرایب ≤{" "}
+                  <span className="mono-num">0.865</span>) نداشت — 🚫 وتوی سوپروایزر: هیچ پکیجی وارد بانک نمی‌شود.
                 </div>
               ) : (
                 <div className="grid gap-3 xl:grid-cols-2">
-                  {mixSlips.map((item) => (
-                    <ParlaySlipCard key={`${item.line}-${item.matchId}-${item.leg}`} item={item} />
+                  {dualPairs.map((pair) => (
+                    <DualFlashcard key={`${pair.A.matchId}-${pair.A.leg}`} pair={pair} />
                   ))}
                 </div>
               )}
             </TabsContent>
 
-            {/* ── Tab 2 · 🎯 DEEP SINGLE — Markov-Copula value pick (1.72x–2.15x) ── */}
-            <TabsContent value="single" className="mt-4 space-y-3">
-              <div className="rounded-xl border border-sky-400/25 bg-sky-400/[0.06] px-3.5 py-2.5">
-                <div className="flex items-center gap-2 text-xs font-bold text-sky-300">
-                  <Target className="h-4 w-4" />
-                  تب ۲ — تک‌گزینه عمیق مارکوف-کاپولا (Single Deep-Value Pick)
-                  <span className="mono-num text-[10px] font-normal text-sky-200/70" dir="ltr">
-                    odds 1.72x–2.15x · +EV edge ≥ +6.5% · BE 54%
+            {/* ── Tab 2 · 🧩 COPULA COMBO + COVER (the second allowed package) ── */}
+            <TabsContent value="combo" className="mt-4 space-y-3">
+              <div className="rounded-xl border border-violet-400/25 bg-violet-400/[0.06] px-3.5 py-2.5">
+                <div className="flex items-center gap-2 text-xs font-bold text-violet-300">
+                  <ShieldCheck className="h-4 w-4" />
+                  تب ۲ — کمبوی کاپولا + پوشش رسمی مکمل (Copula Combo + Cover)
+                  <span className="mono-num text-[10px] font-normal text-violet-200/70" dir="ltr">
+                    main + disjoint cover · dutching 100u · NET ≥ +15.5%
                   </span>
                 </div>
                 <div className="mt-1 text-[10px] text-muted-foreground">
-                  فقط «۱ دکمه رسمی» در هر بازی: نتایج دقیق ست ۲-۰ (وقتی P ≥ ۵۶٪)، هندیکپ گیم −۳.۵،
-                  بالای ۲۱.۵/۲۲.۵ گیم یا کمبوی رسمی برد فاوریت و زیر ۲۱.۵ گیم — ضریب ۱۰۰٪ زنده از فید.
+                  دومین قالب مجاز بانک: تیپ اصلی + پوشش مکمل به‌هم‌نمی‌بازند (فضای باخت همزمان دقیق از
+                  مونت‌کارلو) — همان قانون ۱۰۰ واحدی و همان فیلتر ضریب همپوشانی مثبت.
                 </div>
               </div>
-              {single.length === 0 ? (
+              {comboPairs.length === 0 ? (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  امتیاز +EV ≥ <span className="mono-num">+6.5%</span> نسبت به ضریب زنده امروز پیدا نشد —
-                  تک‌گزینه عمیق فقط وقتی صادر می‌شود که مدل، برتری احتمالی واقعی روی تابلوی زنده داشته باشد.
+                  امروز هیچ کمبوی کاپولای واجد فیلتر همپوشانی مثبت صادر نشد — پکیج بدون تایید سوپروایزر
+                  ساخته نمی‌شود.
                 </div>
               ) : (
                 <div className="grid gap-3 xl:grid-cols-2">
-                  {single.map((item) => (
-                    <DeepSingleCard key={`${item.matchId}-${item.leg}`} item={item} />
+                  {comboPairs.map((pair) => (
+                    <RegComboCard key={`${pair.main.matchId}-${pair.main.leg}`} pair={pair} />
                   ))}
                 </div>
               )}
             </TabsContent>
 
-            {/* ── Tab 3 · 🏦 SERVICE BANKER + 🔗 3-FOLD ACCA ── */}
-            <TabsContent value="banker" className="mt-4 space-y-3">
-              <div className="rounded-xl border border-emerald-400/25 bg-emerald-400/[0.06] px-3.5 py-2.5">
-                <div className="flex items-center gap-2 text-xs font-bold text-emerald-300">
-                  <Landmark className="h-4 w-4" />
-                  تب ۳ — تک‌ستون بنکر سرویس + آکومولاتور ۳ تایی (Service Banker & 3-Fold Acca)
-                  <span className="mono-num text-[10px] font-normal text-emerald-200/70" dir="ltr">
-                    banker 1.45x–1.65x · Top-25 · Elo gap ≥ 140 · acca 2.70x–3.40x
-                  </span>
+            {/* ── Tab 3 · 🛡️ THE SUPERVISOR VETO LEDGER (honesty appendix) ── */}
+            <TabsContent value="shadow" className="mt-4 space-y-3">
+              <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3.5 py-2.5">
+                <div className="flex items-center gap-2 text-xs font-bold text-muted-foreground">
+                  <ShieldAlert className="h-3.5 w-3.5" />
+                  🛡️ دفتر وتو سوپروایزر — ({shadow.length} تیپ وتوشده، بدون احتساب وین‌ریت و بانک)
                 </div>
                 <div className="mt-1 text-[10px] text-muted-foreground">
-                  بانکر تک‌شرط (برد مسابقه یا نتایج دقیق ست ۲-۰) با وین‌ریت ۷۸–۸۵٪ برای رشد پایدار بانک +
-                  برگه آکومولاتور ۳ تایی روز با ضریب واقعی بانکرها.
+                  «🚫 وتوی سوپروایزر — عدم وجود ضریب همپوشانی مثبت» بازی‌هایی که هیچ‌یک از ۳ الگو در
+                  آن‌ها سود خالص تضمین‌شده ≥ +۱۵.۵٪ نمی‌دهد — هرگز وارد کارنامه و بانک نمی‌شوند.
                 </div>
               </div>
-              {banker.length === 0 ? (
-                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  امروز هیچ بازی به پنجره بنکر سرویس (تاپ-۲۵ با گپ امتیازی ≥ ۱۴۰ و S_fav ≥ ۷۰٪) نرسید.
-                </div>
-              ) : (
-                <div className="grid gap-3 xl:grid-cols-2">
-                  {banker.map((item) => (
-                    <BankerFlashcard key={`${item.matchId}-${item.leg}`} item={item} />
-                  ))}
-                </div>
-              )}
-              {accumulator.length > 0 && (
-                <div className="space-y-2">
-                  <div className="flex items-center gap-2 pt-1 text-xs font-bold text-lime-300">
-                    <Link2 className="h-3.5 w-3.5" />
-                    برگه آکومولاتور ۳ تایی روز (ضریب کل <span className="mono-num" dir="ltr">2.70x–3.40x</span>)
-                  </div>
-                  <div className="grid gap-3 xl:grid-cols-2">
-                    {accumulator.map((item) => (
-                      <ParlaySlipCard key={`${item.line}-${item.matchId}-${item.leg}`} item={item} />
-                    ))}
-                  </div>
-                </div>
-              )}
-            </TabsContent>
-          </Tabs>
-
-          {shadow.length > 0 && (
-            <div className="mt-4 rounded-2xl border border-white/10 bg-white/[0.02] p-4">
-              <div className="flex items-center gap-2 text-xs font-bold text-muted-foreground">
-                <ShieldAlert className="h-3.5 w-3.5" />
-                🛡️ دفتر سایه — ({shadow.length} تیپ وتوشده، بدون احتساب وین‌ریت)
-              </div>
-              <div className="scroll-slim mt-2 grid max-h-40 gap-1.5 overflow-y-auto">
+              <div className="scroll-slim grid max-h-72 gap-1.5 overflow-y-auto">
                 {shadowGroups.map((s) => (
-                  <div key={s.matchId} className="flex items-center gap-2 rounded-lg border border-white/5 px-2.5 py-1.5 text-[11px]">
-                    <span className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${SURFACE_DOT[s.surface]}`} />
-                    <span className="truncate text-muted-foreground">{s.desc}</span>
-                    <span className="mono-num ms-auto shrink-0 text-[10px] text-white/40">
-                      {s.playerA.split(" ").pop()} × {s.playerB.split(" ").pop()}
-                    </span>
+                  <div key={s.matchId} className="rounded-lg border border-white/5 px-2.5 py-1.5 text-[11px]">
+                    <div className="flex items-center gap-2">
+                      <span className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${SURFACE_DOT[s.surface]}`} />
+                      <span className="truncate text-white/70">{s.playerA.split(" ").pop()} × {s.playerB.split(" ").pop()}</span>
+                      <span className="mono-num ms-auto shrink-0 text-[10px] text-white/40">{s.tournament}</span>
+                    </div>
+                    <p className="mt-1 truncate text-[10px] text-rose-300/80" dir="rtl">{s.desc}</p>
                   </div>
                 ))}
+                {shadow.length === 0 && (
+                  <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 text-center text-xs text-muted-foreground">
+                    امروز هیچ وتویی ثبت نشده است.
+                  </div>
+                )}
               </div>
-            </div>
-          )}
+            </TabsContent>
+          </Tabs>
         </CardContent>
       </Card>
     </section>

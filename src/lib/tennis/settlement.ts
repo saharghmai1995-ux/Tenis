@@ -55,6 +55,13 @@ function codeOf(setsA: number, setsB: number): ResultCode {
   return `${setsA}-${setsB}` as ResultCode;
 }
 
+// ─── v10 · RETIRED LOSS-MAKING LINES ───────────────────────────────────────
+// Master-prompt v10 §1: the DEEP SINGLE (تک‌گزینه عمیق) and the negative-
+// Sharpe BANKER singles are removed from the settlement contract — their
+// rows were purged from the ledger and any leftover pick settles VOID and
+// can never touch the bank again. MIX/ACCA rows were purged outright.
+const RETIRED_SETTLE_LINES = new Set(["SINGLE", "BANKER", "ACCUMULATOR"]);
+
 /** A linescore pair is only settleable when it looks like a finished set. */
 function terminalSet(a: number, b: number): boolean {
   const hi = Math.max(a, b);
@@ -148,37 +155,9 @@ function settlePick(
   const side = favSide(match.playerA, match.playerB, meta.favName);
   const profitOf = (won: boolean) => (won ? (pick.odds - 1) * pick.stake : -pick.stake);
 
-  // ─── v7.0 · 🎯 DEEP SINGLE — one 100-unit single market per match ────────
-  // Tab-2 settlement contract: SB-F20 (favorite swept 2-0) · GH-F35 (game
-  // margin ≥ 4) · TG-O215 / TG-O225 (total games) · RC-FWU215 (fav win &
-  // under 21.5 games). Win = +stake×(odds−1), loss = −stake exactly.
-  if (pick.line === "SINGLE") {
-    const favWonMatch =
-      side === "A"
-        ? result.setsA > result.setsB
-        : side === "B"
-          ? result.setsB > result.setsA
-          : false;
-    const favWon20 =
-      side === "A" ? result.code === "2-0" : side === "B" ? result.code === "0-2" : false;
-    const favMargin =
-      side === "A" ? result.gamesA - result.gamesB : side === "B" ? result.gamesB - result.gamesA : 0;
-    switch (pick.leg) {
-      case "SB-F20":
-        return { status: favWon20 ? "WON" : "LOST", profit: profitOf(favWon20) };
-      case "GH-F35":
-        return { status: favWonMatch && favMargin >= 4 ? "WON" : "LOST", profit: profitOf(favWonMatch && favMargin >= 4) };
-      case "TG-O215":
-        return { status: result.totalGames >= 22 ? "WON" : "LOST", profit: profitOf(result.totalGames >= 22) };
-      case "TG-O225":
-        return { status: result.totalGames >= 23 ? "WON" : "LOST", profit: profitOf(result.totalGames >= 23) };
-      case "TG-O235":
-        return { status: result.totalGames >= 24 ? "WON" : "LOST", profit: profitOf(result.totalGames >= 24) };
-      case "RC-FWU215":
-        return { status: favWonMatch && result.totalGames <= 21 ? "WON" : "LOST", profit: profitOf(favWonMatch && result.totalGames <= 21) };
-      default:
-        return { status: "VOID", profit: 0 };
-    }
+  // ─── v10 · retired lines settle VOID forever ─────────────────────────────
+  if (RETIRED_SETTLE_LINES.has(pick.line)) {
+    return { status: "VOID", profit: 0 };
   }
 
   if (pick.line === "DUAL" || pick.line === "SHADOW") {
@@ -242,10 +221,20 @@ function settlePick(
       const won = favWon20 && result.totalGames <= 22;
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
-    if (pick.leg === "B-O205") {
-      const covered = result.code === "2-1" || result.code === "1-2";
-      if (!covered) return { status: "LOST", profit: profitOf(false) };
+    if (pick.leg === "B-O205" || pick.leg === "TG-O205") {
+      // v6.0/v10 — the P2 Double-Win wing: TOTAL GAMES OVER 20.5
       const won = result.totalGames >= 21;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (pick.leg === "TG-U205") {
+      // v6.0/v10 — the heavy-favorite quick-sweep wing: TOTAL GAMES UNDER 20.5
+      const won = result.totalGames <= 20;
+      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+    }
+    if (pick.leg === "SB-F21") {
+      // v6.0/v10 — SET BETTING: favorite wins 2-1
+      const target: ResultCode = side === "A" ? "2-1" : side === "B" ? "1-2" : "2-1";
+      const won = result.code === target;
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
     // ─── v5.0 · COMBO regime wings (main + cover on the DUAL line) ────────
@@ -272,12 +261,10 @@ function settlePick(
     return { status: "VOID", profit: 0 };
   }
 
-  // ─── v5.5 · UNIFIED REGIME SETTLEMENT (BANKER / CLUSTER / REGCOMBO) ────
-  // BUG FIXED (v5.5 audit): the old early-return branches only knew the
-  // MW-FAV / SH-F15 / CL-F20U195 … legacy leg codes, so every v5.0
-  // BNK-WIN / BNK-SH15 banker pick and every CLU-1..3 cluster leg settled as
-  // VOID and the 4 new regime rows of the record table stayed at 0 (0) | +0.0.
-  if (pick.line === "BANKER" || pick.line === "REGCOMBO" || pick.line === "CLUSTER") {
+  // ─── v5.5 · UNIFIED REGIME SETTLEMENT (REGCOMBO / CLUSTER) ──────────
+  // v10 — BANKER is retired (VOID guard above); the copula combo and the
+  // settled CLUSTER history rows keep their exact contracts.
+  if (pick.line === "REGCOMBO" || pick.line === "CLUSTER") {
     const favWonMatch =
       side === "A"
         ? result.setsA > result.setsB
@@ -313,18 +300,7 @@ function settlePick(
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
 
-    // 🏦 BANKER — MATCH WINNER (BNK-WIN) / SET HANDICAP −1.5 (BNK-SH15)
-    // plus the legacy atomic codes (MW-FAV / SH-F15).
-    if (pick.line === "BANKER") {
-      const leg = pick.leg;
-      if (leg === "BNK-WIN" || leg === "MW-FAV") {
-        return { status: favWonMatch ? "WON" : "LOST", profit: profitOf(favWonMatch) };
-      }
-      if (leg === "BNK-SH15" || leg === "SH-F15") {
-        return { status: favWon20 ? "WON" : "LOST", profit: profitOf(favWon20) };
-      }
-      return { status: "VOID", profit: 0 };
-    }
+    // 🏦 BANKER — RETIRED (v10): handled by the top VOID guard; nothing to do.
 
     // 🧩 REGCOMBO — copula combo (main) + official cover leg
     if (pick.line === "REGCOMBO") {

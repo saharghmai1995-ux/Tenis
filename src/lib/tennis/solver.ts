@@ -144,13 +144,26 @@ function ensureLUT(): Float64Array {
 
 export function solveServeProbs(
   targetWinA: number,
-  spreadPrior = 0
+  spreadPrior = 0,
+  baseline?: number
 ): SolverResult {
   const table = ensureLUT();
+  // v10 TELEMETRY-DEDUPE FIX (master-prompt v10: «هر کارت تله‌متری اختصاصی
+  // همان دو تنیسور را نشان دهد»): the old objective had a FLAT zero-error
+  // plateau when targetWinA ≈ 0.5 (every pA = pB cell matched), so the FIRST
+  // grid corner (0.52, 0.52) always won and every no-market match with
+  // similar-quality players collapsed to the SAME pinned telemetry
+  // (Service Hold 60%/84% · Markov 54/66 repeated across different cards).
+  // A small tour-baseline anchor breaks the plateau: equal-quality matches
+  // solve to their own TOUR+SURFACE baseline; everything else keeps its own
+  // Elo/market-driven pair.
+  const anchor = baseline ?? (GRID_LO + GRID_HI) / 2;
   const objectiveFromWin = (win: number, pA: number, pB: number): number =>
-    Math.abs(win - targetWinA) + 0.12 * Math.abs(pA - pB - spreadPrior);
+    Math.abs(win - targetWinA) +
+    0.12 * Math.abs(pA - pB - spreadPrior) +
+    0.05 * (Math.abs(pA - anchor) + Math.abs(pB - anchor));
 
-  let best: SolverResult = { pA: 0.62, pB: 0.62, error: Infinity };
+  let best: SolverResult = { pA: anchor, pB: anchor, error: Infinity };
   for (let i = 0; i < GRID_N; i++) {
     const pA = GRID_LO + i * GRID_STEP;
     for (let j = 0; j < GRID_N; j++) {
@@ -204,9 +217,12 @@ export function reverseAnalysis(
 } {
   const eloWinA = eloWinProbA(pointsA, pointsB, surface);
   const spread = spreadPriorFromPoints(pointsA, pointsB);
+  // v10 — the tour+surface baseline anchor (telemetry-dedupe: every match
+  // solves to its OWN realistic pair, never to a shared grid corner)
+  const anchor = TOUR_SURFACE_BASE[tour][surface];
 
   // Elo-side serve probs: reverse-solve from the Elo win probability
-  const eloSolved = solveServeProbs(eloWinA, spread);
+  const eloSolved = solveServeProbs(eloWinA, spread, anchor);
 
   let pRawA: number;
   let pRawB: number;
@@ -226,7 +242,7 @@ export function reverseAnalysis(
     pRawB = eloSolved.pB;
     marketGap = true;
   } else {
-    marketSolved = solveServeProbs(marketProbA, spread);
+    marketSolved = solveServeProbs(marketProbA, spread, anchor);
     pRawA = 0.65 * marketSolved.pA + 0.35 * eloSolved.pA;
     pRawB = 0.65 * marketSolved.pB + 0.35 * eloSolved.pB;
     marketProbOut = marketProbA;

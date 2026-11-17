@@ -17,6 +17,19 @@ export type ProductionLine =
   | "SHADOW";
 export type ArchetypeCode = "ARCH1" | "ARCH2" | "ARCH3";
 
+// ─── v10 · Peak Dual-Hedge Restoration — overlap pattern identity ────────────
+/** The 3 positive-overlap golden pairs of the restored peak architecture. */
+export type OverlapPatternCode = "P1" | "P2" | "P3";
+/** STATION 4 — the positive-overlap gate metrics stamped on every approved package. */
+export interface OverlapGateTelemetry {
+  /** (1/oddsA) + (1/oddsB) — must stay ≤ 0.865 */
+  impliedSum: number;
+  /** 1 / impliedSum — the effective combined price of the package */
+  effectiveOdds: number;
+  /** (effectiveOdds − 1) × 100 — guaranteed net return of every win (≥ +15.5%) */
+  netReturnPct: number;
+}
+
 // ─── v5.0 · Copula-Markov-MonteCarlo Pipeline & 5-Regime Router ────────────
 /** STATION 2 — Gaussian copula dependency telemetry of one match. */
 export interface CopulaTelemetry {
@@ -111,6 +124,10 @@ export interface RegimeDecision {
   prob?: number;
   /** settlement leg codes of the regime position */
   legCodes?: { main: string; cover?: string };
+  /** v10 — the overlap pattern the DUAL-HEDGE package rides (P1/P2/P3) */
+  pattern?: OverlapPatternCode;
+  /** v10 — positive-overlap gate telemetry (crown gate of the peak architecture) */
+  overlap?: OverlapGateTelemetry;
   /** CLUSTER — the three dutched exact scenarios */
   scenarios?: {
     label: string;
@@ -346,7 +363,8 @@ export interface Slip {
 export interface VetoInfo {
   vetoed: boolean;
   reason?: string;
-  code?: "TOP100" | "P02_RISK" | "NONE" | "REGIME" | "MARKET_GAP";
+  /** v10 — OVERLAP = the positive-overlap coefficient gate rejected the match */
+  code?: "TOP100" | "P02_RISK" | "NONE" | "REGIME" | "MARKET_GAP" | "OVERLAP";
 }
 
 export interface TimingInfo {

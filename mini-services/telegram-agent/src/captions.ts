@@ -154,6 +154,13 @@ export function captionFlashcard(
     slipFa(card, "A"),
     slipFa(card, "B"),
     "",
+    // v10 — the positive-overlap golden gate verdict (director's peak law)
+    card.pattern
+      ? `🔁 الگوی همپوشان ${card.pattern === "P1" ? "۱ (تسلط ست‌ها ۵۷.۶/۴۲.۴)" : card.pattern === "P2" ? "۲ (برد دوبل همزمان ۵۶/۴۴ — اگر فاوریت ۲-۰ نزدیک ببرد هر دو تیپ همزمان می‌برند!)" : "۳ (تفکیک دقیق ست ۲-۰/۲-۱ با ۶۰/۴۰)"}`
+      : "",
+    card.overlapNetPct !== undefined
+      ? `✅ فیلتر ضریب همپوشانی مثبت: سود خالص تضمین‌شده هر برد +٪${card.overlapNetPct.toFixed(1)} (مجموع معکوس ضرایب ≤ ۰.۸۶۵ · پوشش ≥ ۸۹.۵٪ · شارپ ≥ ۰.۲۵)`
+      : "",
     `📐 پوشش دوپایی: ٪${Math.round((card.coverage ?? 0) * 100)} — یعنی در ${(card.coverage ?? 0) >= 0.9 ? "بیش از ۹۰" : "بخش عمده‌ای"} از مسیرهای ممکن بازی، حداقل یکی از دو تیپ برنده می‌شود.`,
     angle ? `🧠 نگاه این دور (${angle.labelFa}): ${angle.insightFa}` : "",
     adaptive

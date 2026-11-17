@@ -54,6 +54,21 @@ export interface AnalyzedMatch {
   veto: { vetoed: boolean; reason?: string; code?: string };
   dualEligible: boolean;
   archetype?: ArchetypeInfo;
+  /** v10 — per-match Markov telemetry (the two players' OWN numbers) */
+  markov?: {
+    gA: number;
+    gB: number;
+    bpsA: number;
+    bpsB: number;
+    pA: number;
+    pB: number;
+  };
+  /** v10 — the routed overlap package (pattern + golden-gate telemetry) */
+  regime?: {
+    code: string;
+    pattern?: string;
+    overlap?: { impliedSum: number; effectiveOdds: number; netReturnPct: number };
+  };
   slips: { A?: Slip; B?: Slip };
   timing: { label: string; code: string; optimal: boolean };
   hashPre?: string;

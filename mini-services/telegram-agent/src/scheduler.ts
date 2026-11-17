@@ -330,13 +330,22 @@ export interface FlashAngle {
 
 const FULL_CARD_LABEL_FA = "کارت کامل";
 
+/** v10 — English names of the three positive-overlap golden patterns */
+const PATTERN_EN: Record<string, string> = {
+  P1: "SET MASTERY OVERLAP",
+  P2: "DOUBLE-WIN OVERLAP",
+  P3: "EXACT SET SPLIT",
+};
+
 export function angleFor(card: CardMatch, _rotation = 0): FlashAngle {
   const cov = Math.round((card.coverage ?? 0) * 100);
+  const net = card.overlapNetPct;
+  const pat = card.pattern ? (PATTERN_EN[card.pattern] ?? "") : "";
   return {
     label: "FULL CARD",
     labelFa: FULL_CARD_LABEL_FA,
-    insightEn: `DUAL-WING STRUCTURE ONLINE - TYPE A + TYPE B TOGETHER COVER ${cov}% OF ALL POSSIBLE SCORE ROUTES.`,
-    insightFa: `ساختار دوپایی فعال است: ترکیب تیپ A و تیپ B حدود ٪${cov} از همه مسیرهای نتیجه بازی را پوشش می‌دهد.`,
+    insightEn: `${pat ? `${pat} PACKAGE - ` : ""}TYPE A + TYPE B TOGETHER COVER ${cov}% OF ALL SCORE ROUTES${net ? ` - EVERY WIN PAYS +${net.toFixed(1)}% NET` : ""}.`,
+    insightFa: `${card.pattern === "P2" ? "ناحیه برد دوبل فعال است: " : ""}ترکیب تیپ A و تیپ B حدود ٪${cov} از همه مسیرهای نتیجه را پوشش می‌دهد${net ? ` و هر برد حداقل +${net.toFixed(1)}٪ سود خالص دارد` : ""}.`,
   };
 }
 
@@ -445,6 +454,13 @@ function flashcardRequest(
       flagB: card.flagB,
       seedA: card.seedA,
       seedB: card.seedB,
+      // v10 — the two players' OWN dedicated telemetry on the poster
+      holdA: card.holdA,
+      holdB: card.holdB,
+      bpsA: card.bpsA,
+      bpsB: card.bpsB,
+      markovPA: card.markovPA,
+      markovPB: card.markovPB,
     },
     tournament: card.tournament,
     round: card.round,
@@ -465,6 +481,13 @@ function flashcardRequest(
       rankGap,
       totalStake,
       stakeDetail,
+      // v10 — the golden-gate verdict chips (pattern + guaranteed net return)
+      patternLabel: card.pattern
+        ? `${card.pattern} · ${PATTERN_EN[card.pattern] ?? "OVERLAP"}`
+        : undefined,
+      overlapNet: card.overlapNetPct !== undefined
+        ? `+${card.overlapNetPct.toFixed(1)}%`
+        : undefined,
     },
     seedSalt: salt,
     hash: card.hash,
