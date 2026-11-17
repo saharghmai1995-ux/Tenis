@@ -137,16 +137,14 @@ export const OFFICIAL_TENNIS_ATOMIC_ARCHETYPES: Record<
 };
 
 // Market-priced legs — the ledger simulates TAKING the tip at the real market
-// price (the official leg price above) while the model probability stays the
-// edge metric. Legacy v2/v3 leg codes keep their old prices so the stored
-// 7-day record is never re-priced against itself.
+// price while the model probability stays the edge metric.
+// v6.0 — the SIX atomic archetype legs (SB-F20, TS-O25, SB-P1-20, SB-P1-21,
+// TG-O225, GH-F45) + the new heavy-favorite game legs (TG-U205, TG-O205,
+// SB-F21) are DYNAMICALLY priced per match via computeReal1xBetTennisOdds;
+// they are NOT in this static map, so the re-pricing sync never flattens a
+// per-match real price back to a constant. Legacy v2/v3 leg codes keep their
+// old prices so the stored 7-day record is never re-priced against itself.
 export const DUAL_LEG_MARKET_ODDS: Record<string, number> = {
-  "SB-F20": OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH1.legA.price,
-  "TS-O25": OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH1.legB.price,
-  "SB-P1-20": OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH2.legA.price,
-  "SB-P1-21": OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH2.legB.price,
-  "TG-O225": OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH3.legA.price,
-  "GH-F45": OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH3.legB.price,
   // ─── v5.0 · 5-Regime Router official single-button prices ──────────────
   "MW-FAV": 1.48,   // BANKER — MATCH WINNER — FAVORITE (window 1.38-1.65)
   "SH-F15": 1.62,   // BANKER — SET HANDICAP — FAVORITE -1.5 SETS
@@ -166,6 +164,12 @@ export const DUAL_LEG_MARKET_ODDS: Record<string, number> = {
   "B-U225": 2.95,
 };
 
+/** legs whose price is computed per-match (never re-priced to a constant) */
+export const DYNAMIC_PRICED_LEGS = new Set([
+  "SB-F20", "TS-O25", "SB-P1-20", "SB-P1-21", "TG-O225", "GH-F45",
+  "TG-U205", "TG-O205", "SB-F21",
+]);
+
 // the two complementary wings of each archetype (leg → its pair leg)
 const LEG_PAIR: Record<string, string> = {
   "SB-F20": "TS-O25",
@@ -174,6 +178,10 @@ const LEG_PAIR: Record<string, string> = {
   "SB-P1-21": "SB-P1-20",
   "TG-O225": "GH-F45",
   "GH-F45": "TG-O225",
+  // v6.0 — heavy-favorite game-domain pair (Tip A handicap/under ⇄ Tip B over)
+  "TG-U205": "TG-O205",
+  "TG-O205": "TG-U205",
+  "SB-F21": "GH-F45",
   "A": "B",
   "B": "A",
   "A-O195": "B-ALT",
@@ -349,28 +357,111 @@ export function isDualEligible(m: AnalyzedMatch): boolean {
   return !m.veto.vetoed && !!m.archetype;
 }
 
+/**
+ * v6.0 — Monte-Carlo P(total games > 20.5) from the simulated games histogram.
+ * Feeds the heavy-favorite line switch (Bug-1 fix, Tab 1).
+ */
+function mcOverGames(m: AnalyzedMatch, line: number): number | undefined {
+  const mc = m.monteCarlo;
+  if (!mc || !mc.gamesDist || mc.runs <= 0) return undefined;
+  let hits = 0;
+  for (let g = Math.ceil(line); g < mc.gamesDist.length; g++) hits += mc.gamesDist[g];
+  return hits / mc.runs;
+}
+
 // ─── v4.0 · Official Atomic Slips ──────────────────────────────────────────
 // Every slip is EXACTLY ONE standard single-button bookmaker market with its
 // official English name (printed on the flashcard) and exact Persian text.
+// v6.0 — EVERY price is computeReal1xBetTennisOdds of THIS match's own
+// Markov/Monte-Carlo probability. The hardcoded 1.97x/2.68x constants of the
+// old table are NEVER printed again (Bug-1 fix), and heavy favorites are
+// auto-switched into dutchable game-domain lines.
 export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
   if (m.veto.vetoed || !m.archetype) return {};
   const fav = m.favorite;
   const favName = fav === "A" ? m.playerA.name : m.playerB.name;
-  const dogName = fav === "A" ? m.playerB.name : m.playerA.name;
   const a = m.markov.arch;
 
   switch (m.archetype.code) {
     case "ARCH1": {
-      // A — Set Betting: favorite sweeps 2-0 · B — Total Sets Over 2.5
-      const spec = OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH1;
       const p20Fav = fav === "A" ? m.markov.p20 : m.markov.p02;
       const over25 = m.markov.p21 + m.markov.p12;
+      // ── v6.0 HEAVY-FAVORITE LAW (master-prompt §2) ────────────────────────
+      // When the 2-0 sweep probability exceeds 58%, its REAL 1xBet price
+      // drops below ~1.45x — undutchable against an Over-2.5 wing (~3.0x).
+      // The pair switches to the GAMES-DOMAIN lines that keep BOTH wings
+      // inside the dutchable 1.80–3.20 band:
+      //   Tip A → GAME HANDICAP — FAVORITE −4.5 GAMES  (or UNDER 20.5 GAMES)
+      //   Tip B → TOTAL GAMES — OVER 20.5 GAMES        (or FAVORITE WINS 2-1)
+      if (p20Fav > 0.58) {
+        const pFav45 = a.fav20Margin5;
+        const mcOver205 = mcOverGames(m, 20.5);
+        const pOver205 = mcOver205 ?? a.over225;
+        const pUnder205 = mcOver205 !== undefined ? 1 - mcOver205 : undefined;
+        const pFav21 = fav === "A" ? m.markov.p21 : m.markov.p12;
+        // Tip A: handicap −4.5 when its real price stays dutchable (≥1.8x ⇔
+        // prob ≤ ~52.7%); otherwise the UNDER 20.5 games line.
+        const useHandicap = pFav45 > 0.04 && pFav45 <= 0.527;
+        const useUnder = !useHandicap && pUnder205 !== undefined && pUnder205 >= 0.3 && pUnder205 <= 0.527;
+        if (useHandicap || useUnder) {
+          const slipA: Slip = useHandicap
+            ? {
+                leg: "GH-F45",
+                text: `هندیکپ گیم فاوریت: برد ${favName} با اختلاف بیش از ۴.۵ گیم`,
+                textEn: `${favName.toUpperCase()} −4.5 GAMES`,
+                odds: computeReal1xBetTennisOdds(pFav45, ONEXBET_OVERROUND_PROP),
+                prob: pFav45,
+                targetWindow: [1.8, 2.6],
+                marketEn: "GAME HANDICAP — FAVORITE -4.5 GAMES",
+                marketFa: `هندیکپ گیم فاوریت: ${favName} −۴.۵ گیم (برد با اختلاف ≥ ۵ گیم)`,
+              }
+            : {
+                leg: "TG-U205",
+                text: `مجموع گیم‌های بازی: زیر ۲۰.۵ گیم (برد سریع فاوریت)`,
+                textEn: "TOTAL GAMES — UNDER 20.5 GAMES",
+                odds: computeReal1xBetTennisOdds(pUnder205!, ONEXBET_OVERROUND_PROP),
+                prob: pUnder205!,
+                targetWindow: [1.8, 2.4],
+                marketEn: "TOTAL GAMES — UNDER 20.5 GAMES",
+                marketFa: "مجموع گیم‌های مسابقه: زیر ۲۰.۵ گیم (دو ست کوتاه پیاپی)",
+              };
+          // Tip B: the complementary GAMES-domain wing (OVER 20.5) whenever
+          // its real price lands inside the dutchable band; otherwise the
+          // FAVORITE WINS 2-1 set-betting wing.
+          const pB = pOver205;
+          const slipB: Slip =
+            pB > 0.28 && pB < 0.527
+              ? {
+                  leg: "TG-O205",
+                  text: "مجموع گیم‌های بازی: بالای ۲۰.۵ گیم (بازی رقابتی‌تر از انتظار)",
+                  textEn: "TOTAL GAMES — OVER 20.5 GAMES",
+                  odds: computeReal1xBetTennisOdds(pB, ONEXBET_OVERROUND_PROP),
+                  prob: pB,
+                  targetWindow: [1.8, 2.6],
+                  marketEn: "TOTAL GAMES — OVER 20.5 GAMES",
+                  marketFa: "مجموع گیم‌های مسابقه: بالای ۲۰.۵ گیم",
+                }
+              : {
+                  leg: "SB-F21",
+                  text: `نتیجه دقیق ست‌ها: برد ۲-۱ ${favName} (فاوریت در سه ست)`,
+                  textEn: `${favName.toUpperCase()} WINS 2-1`,
+                  odds: computeReal1xBetTennisOdds(pFav21, ONEXBET_OVERROUND_MAIN),
+                  prob: pFav21,
+                  targetWindow: [2.45, 3.2],
+                  marketEn: "SET BETTING — FAVORITE WINS 2-1",
+                  marketFa: `نتیجه دقیق ست‌ها: برد ۲-۱ ${favName} (فاوریت در سه ست)`,
+                };
+          return { A: slipA, B: slipB };
+        }
+      }
+      // ── standard ARCH1 pair — now with REAL per-match 1xBet prices ────────
+      const spec = OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH1;
       return {
         A: {
           leg: spec.legA.leg,
           text: `نتیجه دقیق ست‌ها: برد ۲-۰ ${favName}`,
           textEn: `${favName.toUpperCase()} WINS 2-0`,
-          odds: marketOdds(spec.legA.leg),
+          odds: computeReal1xBetTennisOdds(p20Fav, ONEXBET_OVERROUND_MAIN),
           prob: p20Fav,
           targetWindow: spec.legA.oddsWindow,
           marketEn: spec.legA.marketEn,
@@ -379,8 +470,8 @@ export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
         B: {
           leg: spec.legB.leg,
           text: `مجموع ست‌های بازی: بالای ۲.۵ ست (رفتن بازی به ست سوم)`,
-          textEn: `OVER 2.5 SETS`,
-          odds: marketOdds(spec.legB.leg),
+          textEn: "OVER 2.5 SETS",
+          odds: computeReal1xBetTennisOdds(over25, ONEXBET_OVERROUND_MAIN),
           prob: over25,
           targetWindow: spec.legB.oddsWindow,
           marketEn: spec.legB.marketEn,
@@ -391,7 +482,8 @@ export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
     case "ARCH2": {
       // A — Set Betting Player 1 (2-0) · B — Set Betting Player 1 (2-1)
       // both legs side by side in the bookmaker Set Betting grid; together
-      // they cover 100% of player-1's win paths at high odds
+      // they cover 100% of player-1's win paths at high odds.
+      // v6.0 — REAL per-match 1xBet prices (no static 2.38/3.4 constants).
       const spec = OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH2;
       const p1Name = m.playerA.name; // ARCH2 window guarantees S_A ≥ 0.54 → player 1 is the favorite
       return {
@@ -399,7 +491,7 @@ export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
           leg: spec.legA.leg,
           text: `نتیجه دقیق ست‌ها: برد ۲-۰ ${p1Name} (بازیکن اول)`,
           textEn: `${p1Name.toUpperCase()} WINS 2-0`,
-          odds: marketOdds(spec.legA.leg),
+          odds: computeReal1xBetTennisOdds(m.markov.p20, ONEXBET_OVERROUND_MAIN),
           prob: m.markov.p20,
           targetWindow: spec.legA.oddsWindow,
           marketEn: spec.legA.marketEn,
@@ -409,7 +501,7 @@ export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
           leg: spec.legB.leg,
           text: `نتیجه دقیق ست‌ها: برد ۲-۱ ${p1Name} (بازیکن اول)`,
           textEn: `${p1Name.toUpperCase()} WINS 2-1`,
-          odds: marketOdds(spec.legB.leg),
+          odds: computeReal1xBetTennisOdds(m.markov.p21, ONEXBET_OVERROUND_MAIN),
           prob: m.markov.p21,
           targetWindow: spec.legB.oddsWindow,
           marketEn: spec.legB.marketEn,
@@ -419,13 +511,14 @@ export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
     }
     case "ARCH3": {
       // A — Total Games Over 22.5 · B — Game Handicap favorite −4.5 games
+      // v6.0 — REAL per-match 1xBet prices (no static 1.98/3.0 constants).
       const spec = OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH3;
       return {
         A: {
           leg: spec.legA.leg,
           text: `مجموع گیم‌های بازی: بالای ۲۲.۵ گیم`,
-          textEn: `OVER 22.5 TOTAL GAMES`,
-          odds: marketOdds(spec.legA.leg),
+          textEn: "OVER 22.5 TOTAL GAMES",
+          odds: computeReal1xBetTennisOdds(a.over225, ONEXBET_OVERROUND_PROP),
           prob: a.over225,
           targetWindow: spec.legA.oddsWindow,
           marketEn: spec.legA.marketEn,
@@ -435,7 +528,7 @@ export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
           leg: spec.legB.leg,
           text: `هندیکپ گیم فاوریت: برد ${favName} با اختلاف بیش از ۴.۵ گیم`,
           textEn: `${favName.toUpperCase()} −4.5 GAMES`,
-          odds: marketOdds(spec.legB.leg),
+          odds: computeReal1xBetTennisOdds(a.fav20Margin5, ONEXBET_OVERROUND_PROP),
           prob: a.fav20Margin5,
           targetWindow: spec.legB.oddsWindow,
           marketEn: spec.legB.marketEn,
@@ -523,15 +616,34 @@ const CLUSTER_MAX_ENTROPY = 1.3; // nats (ln 4 ≈ 1.386 → low-entropy matches
 const CLUSTER_MIN_MASS = 0.55;
 const DUAL_MAX_P02 = 0.088; // the champion pattern gate (88.2% win rate era)
 
-// bookmaker margin used to simulate the market price of each regime leg
-const BOOK_MARGIN_MAIN = 1.04;
-const BOOK_MARGIN_PROP = 1.07;
-const BOOK_MARGIN_EXOTIC = 1.1;
+// ─── v6.0 · 1xBET REAL-MARGIN PRICING (Bug-2 fix: DIVIDE by the overround!) ┐
+// The pre-v6.0 code priced every regime leg as (1/prob) × 1.07 — MULTIPLYING
+// by the book margin — which printed odds 12–18% HIGHER than the real 1xBet
+// board. The real board applies the overround by DEFLATING the fair odds:
+//   realOdds = 1 / (trueProb × overround)
+// On top of that, the old clampPrice(...) squeezed every price into artificial
+// windows (e.g. a 70.8% Over-21.5 wing with a REAL 1xBet price of 1.34x was
+// locked at 2.70x). Both distortions are removed by construction: every leg
+// now prints the exact 1xBet real price of its own Markov probability.
+export const ONEXBET_OVERROUND_MAIN = 1.052;   // ۵.۲٪ کارمزد خط اصلی برد/ست
+export const ONEXBET_OVERROUND_PROP = 1.065;   // ۶.۵٪ کارمزد مجموع گیم و کمبو
+export const ONEXBET_OVERROUND_EXOTIC = 1.075; // ۷.۵٪ کارمزد سناریوهای دقیق
 
-const clampPrice = (p: number, lo: number, hi: number) =>
-  Math.round(Math.max(lo, Math.min(hi, p)) * 100) / 100;
-const fairPrice = (prob: number, margin: number) =>
-  prob > 0.01 ? clampPrice((1 / prob) * margin, 1.01, 40) : 40;
+/**
+ * v6.0 — the exact 1xBet real-board price of a true probability (Bug-2 fix).
+ * DIVIDES by the overround (never multiplies), 2-decimal board precision.
+ */
+export function computeReal1xBetTennisOdds(
+  trueProb: number,
+  overround: number = ONEXBET_OVERROUND_MAIN
+): number {
+  const safeProb = Math.max(0.06, Math.min(0.9, trueProb));
+  const raw1xBetOdds = 1 / (safeProb * overround);
+  return Number(Math.max(1.14, Math.min(12.0, raw1xBetOdds)).toFixed(2));
+}
+
+const fairPrice = (prob: number, overround: number) =>
+  prob > 0.01 ? computeReal1xBetTennisOdds(prob, overround) : 12.0;
 
 /** Per-unit betting Sharpe of a single-leg position: EV / σ of the P&L. */
 export function bettingSharpe(prob: number, odds: number): number {
@@ -657,7 +769,9 @@ export function routeRegime(
     let best: (typeof cands)[number] | null = null;
     let bestPrice = 1.38;
     for (const c of cands) {
-      const price = clampPrice(Math.max(c.window[0], fairPrice(c.prob, BOOK_MARGIN_MAIN)), c.window[0], c.window[1]);
+      // v6.0 — REAL 1xBet price (divide by overround); the old
+      // clampPrice(window) squeeze that froze every banker at 1.38 is GONE.
+      const price = fairPrice(c.prob, ONEXBET_OVERROUND_MAIN);
       const sh = bettingSharpe(c.prob, price);
       if (sh > bestSharpe) {
         bestSharpe = sh;
@@ -704,10 +818,12 @@ export function routeRegime(
   {
     const windowOk = ctx.pDog20 <= DUAL_MAX_P02;
     const pairLoss = ctx.pDog20;
-    const oddsA = OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH1.legA.price;
-    const oddsB = OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH1.legB.price;
+    // v6.0 Bug-1 fix — the golden pair is priced from THIS match's own Markov
+    // probabilities; the hardcoded 1.97x/2.68x constants are gone.
     const pA = ctx.pFav20;
     const pB = mc.outcomes.p21 + mc.outcomes.p12;
+    const oddsA = computeReal1xBetTennisOdds(pA, ONEXBET_OVERROUND_MAIN);
+    const oddsB = computeReal1xBetTennisOdds(pB, ONEXBET_OVERROUND_MAIN);
     const { sharpe } = dutchedSharpe([pA, pB], [oddsA, oddsB]);
     evals.push({
       code: "DUAL-HEDGE",
@@ -777,8 +893,10 @@ export function routeRegime(
     }
     const coverage = Math.min(1, pMain + pCover);
     const pairLoss = Math.max(0, 1 - coverage);
-    const oddsMain = clampPrice(Math.max(1.85, fairPrice(pMain, BOOK_MARGIN_PROP)), 1.85, 2.4);
-    const oddsCover = clampPrice(Math.max(2.7, fairPrice(pCover, BOOK_MARGIN_PROP)), 2.7, 3.3);
+    // v6.0 Bug-3 fix — the 70.8% Over-21.5 wing now prints its REAL 1xBet
+    // price (≈ 1.34x) instead of the old clampPrice(...,2.7,3.3) lie of 2.70x.
+    const oddsMain = fairPrice(pMain, ONEXBET_OVERROUND_PROP);
+    const oddsCover = fairPrice(pCover, ONEXBET_OVERROUND_PROP);
     const { sharpe } = dutchedSharpe([pMain, pCover], [oddsMain, oddsCover]);
     const minCoverage = dominant ? COMBO_MIN_COVERAGE : COMBO_MIN_COVERAGE_SRV;
     const eligible = windowOk && coverage >= minCoverage;
@@ -827,9 +945,10 @@ export function routeRegime(
   {
     const windowOk = mc.entropy < CLUSTER_MAX_ENTROPY && mc.topScenariosMass >= CLUSTER_MIN_MASS;
     const pairLoss = Math.max(0, 1 - mc.topScenariosMass);
-    const odds = mc.topScenarios.map(
-      (s) => clampPrice(Math.max(2.8, fairPrice(s.prob, BOOK_MARGIN_EXOTIC)), 2.8, 4.2)
-    );
+    // v6.0 Bug-3 fix — exact-scenario odds are the REAL 1xBet exotic prices of
+    // their own probabilities; the old clampPrice(...,2.8,4.2) lock that froze
+    // scenarios 2 & 3 at 4.20x is removed.
+    const odds = mc.topScenarios.map((s) => fairPrice(s.prob, ONEXBET_OVERROUND_EXOTIC));
     const probs = mc.topScenarios.map((s) => s.prob);
     const { sharpe } = dutchedSharpe(probs, odds);
     evals.push({
@@ -1022,7 +1141,8 @@ export function forceRegimeRoute(
     let best: (typeof cands)[number] | null = null;
     let bestPrice = 1.38;
     for (const c of cands) {
-      const price = clampPrice(Math.max(c.window[0], fairPrice(c.prob, BOOK_MARGIN_MAIN)), c.window[0], c.window[1]);
+      // v6.0 — real 1xBet banker price, no artificial window clamp
+      const price = fairPrice(c.prob, ONEXBET_OVERROUND_MAIN);
       const sh = bettingSharpe(c.prob, price);
       if (sh > bestSharpe) {
         bestSharpe = sh;
@@ -1079,8 +1199,9 @@ export function forceRegimeRoute(
     }
     const coverage = Math.min(1, pMain + pCover);
     const pairLoss = Math.max(0, 1 - coverage);
-    const oddsMain = clampPrice(Math.max(1.85, fairPrice(pMain, BOOK_MARGIN_PROP)), 1.85, 2.4);
-    const oddsCover = clampPrice(Math.max(2.7, fairPrice(pCover, BOOK_MARGIN_PROP)), 2.7, 3.3);
+    // v6.0 — real 1xBet prices for the force-routed copula combo too
+    const oddsMain = fairPrice(pMain, ONEXBET_OVERROUND_PROP);
+    const oddsCover = fairPrice(pCover, ONEXBET_OVERROUND_PROP);
     const { sharpe } = dutchedSharpe([pMain, pCover], [oddsMain, oddsCover]);
     const variant = dominant ? "DOM" : "SRV";
     return {
@@ -1115,9 +1236,8 @@ export function forceRegimeRoute(
 
   if (code === "CLUSTER") {
     const pairLoss = Math.max(0, 1 - mc.topScenariosMass);
-    const odds = mc.topScenarios.map(
-      (s) => clampPrice(Math.max(2.8, fairPrice(s.prob, BOOK_MARGIN_EXOTIC)), 2.8, 4.2)
-    );
+    // v6.0 — real 1xBet exotic prices, no 4.20x lock
+    const odds = mc.topScenarios.map((s) => fairPrice(s.prob, ONEXBET_OVERROUND_EXOTIC));
     const probs = mc.topScenarios.map((s) => s.prob);
     const { sharpe } = dutchedSharpe(probs, odds);
     const stakes = dutchN(odds, STANDARD_MATCH_STAKE);
@@ -1154,10 +1274,11 @@ export function forceRegimeRoute(
 
   if (code === "DUAL-HEDGE") {
     const pairLoss = ctx.pDog20;
-    const oddsA = OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH1.legA.price;
-    const oddsB = OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH1.legB.price;
+    // v6.0 Bug-1 fix — force-routed golden pair priced from its own probs
     const pA = ctx.pFav20;
     const pB = mc.outcomes.p21 + mc.outcomes.p12;
+    const oddsA = computeReal1xBetTennisOdds(pA, ONEXBET_OVERROUND_MAIN);
+    const oddsB = computeReal1xBetTennisOdds(pB, ONEXBET_OVERROUND_MAIN);
     const { sharpe } = dutchedSharpe([pA, pB], [oddsA, oddsB]);
     return {
       pairLoss,

@@ -35,6 +35,7 @@ import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { TiltCard } from "@/components/tennis/spatial-tilt";
+import { OddsCalibrator } from "@/components/tennis/odds-calibrator";
 import { dedupeByKey } from "@/lib/tennis/dedupe";
 import { legLabelOf, REGIME_META } from "@/lib/tennis/supervisor";
 import type {
@@ -834,6 +835,24 @@ function ClusterFlashcard({ legs }: { legs: LineItem[] }) {
             <span className="mono-num" dir="ltr">+35% تا +55%</span>
           </span>
         </div>
+        {/* v6.0 — live 1xBet calibrator on the two heaviest cluster scenarios */}
+        {legs.length >= 2 && (
+          <OddsCalibrator
+            legA={{
+              label: "سناریو ۱",
+              labelEn: "SCENARIO 1",
+              modelOdds: legs[0].odds,
+              marketEn: legs[0].marketEn,
+            }}
+            legB={{
+              label: "سناریو ۲",
+              labelEn: "SCENARIO 2",
+              modelOdds: legs[1].odds,
+              marketEn: legs[1].marketEn,
+            }}
+            matchLabel={matchLabel}
+          />
+        )}
         <FlashFooter item={first} matchLabel={matchLabel} />
       </div>
     </TiltCard>
@@ -876,6 +895,22 @@ function DualFlashcard({ pair }: { pair: { A: LineItem; B: LineItem } }) {
             </span>
           </div>
         )}
+        {/* v6.0 — live 1xBet odds calibrator (director enters the real board odds) */}
+        <OddsCalibrator
+          legA={{
+            label: isComboRegime ? "تیپ اصلی" : "تیپ A",
+            labelEn: isComboRegime ? "COMBO MAIN" : "TYPE A",
+            modelOdds: A.odds,
+            marketEn: A.marketEn,
+          }}
+          legB={{
+            label: isComboRegime ? "پوشش مکمل" : "تیپ B",
+            labelEn: isComboRegime ? "COVER" : "TYPE B",
+            modelOdds: B.odds,
+            marketEn: B.marketEn,
+          }}
+          matchLabel={matchLabel}
+        />
         <FlashFooter item={A} matchLabel={matchLabel} />
       </div>
     </TiltCard>
@@ -1001,6 +1036,12 @@ function SniperPairCard({ main, cover }: { main: LineItem; cover: LineItem }) {
             <span className="mono-num" dir="ltr">{cover.stake}u @ {cover.odds.toFixed(2)}</span> — هیچ سطری با استیک ۱ یا ۲ واحدی در کارنامه ثبت نمی‌شود
           </span>
         </div>
+        {/* v6.0 — live 1xBet calibrator on the sniper package */}
+        <OddsCalibrator
+          legA={{ label: "تیپ اصلی", labelEn: "SNIPER MAIN", modelOdds: main.odds, marketEn: main.marketEn }}
+          legB={{ label: "پوشش سرمایه", labelEn: "CAPITAL COVER", modelOdds: cover.odds, marketEn: cover.marketEn }}
+          matchLabel={matchLabel}
+        />
         <FlashFooter item={main} matchLabel={matchLabel} />
       </div>
     </TiltCard>
@@ -1021,6 +1062,12 @@ function RegComboCard({ pair }: { pair: { main: LineItem; cover: LineItem } }) {
           <MarketBox tone="violet" wingLabel="کمبوی رسمی تک‌دکمه (تیپ اصلی)" item={main} />
           <MarketBox tone="emerald" wingLabel="پوشش رسمی مکمل (Cover)" item={cover} />
         </div>
+        {/* v6.0 — live 1xBet calibrator on the copula combo pair */}
+        <OddsCalibrator
+          legA={{ label: "تیپ اصلی", labelEn: "COMBO MAIN", modelOdds: main.odds, marketEn: main.marketEn }}
+          legB={{ label: "پوشش مکمل", labelEn: "COVER", modelOdds: cover.odds, marketEn: cover.marketEn }}
+          matchLabel={matchLabel}
+        />
         <FlashFooter item={main} matchLabel={matchLabel} />
       </div>
     </TiltCard>

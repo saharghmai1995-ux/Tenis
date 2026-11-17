@@ -28,6 +28,7 @@ import {
   isDualEligible,
   supervisorGate,
   DUAL_LEG_MARKET_ODDS,
+  DYNAMIC_PRICED_LEGS,
   OFFICIAL_TENNIS_ATOMIC_ARCHETYPES,
   routeRegime,
   routeRegimeAdaptive,
@@ -125,7 +126,10 @@ export function resolvePlayerRankAndApprove(
   return { rank, points: pointsForRank(rank), source: "TOUR_BASE" };
 }
 
-/** Attach resolved rankings to both competitors of a match (in place). */
+/** Attach resolved rankings to both competitors of a match (in place).
+ *  v6.0 — also records the RESOLUTION SOURCE: "TABLE" = the player exists in
+ *  the official ATP/WTA ranking list; "TOUR_BASE" = the rank was INVENTED by
+ *  the name-hash fallback (the player is officially unknown). */
 function attachResolvedRanks(m: EspnMatch, rankLookup: Map<string, RankRow>) {
   const a = resolvePlayerRankAndApprove(m.playerA.name, m.playerA.seed, rankLookup);
   const b = resolvePlayerRankAndApprove(m.playerB.name, m.playerB.seed, rankLookup);
@@ -133,6 +137,8 @@ function attachResolvedRanks(m: EspnMatch, rankLookup: Map<string, RankRow>) {
   m.playerA.points = m.playerA.points ?? a.points;
   m.playerB.rank = b.rank;
   m.playerB.points = m.playerB.points ?? b.points;
+  m.playerA.rankSource = a.source;
+  m.playerB.rankSource = b.source;
 }
 
 /** v3.0 — SHA-256 pre-lock of the approved regime position (slips or regime). */
@@ -305,6 +311,27 @@ function analyzeMatch(
   am.archEvals = archReport.evals;
   am.archetype = archReport.selected;
   am.veto = supervisorGate(am, archReport.selected);
+
+  // ── v6.0 STATION 3.5 — INCOMPLETE MARKET DATA VETO ──────────────────
+  // Master-prompt §3: a match with NO real market odds (marketGap) whose two
+  // players are BOTH outside the official ATP/WTA ranking list (rankSource
+  // = TOUR_BASE → the rank was invented by the name-hash fallback) has no
+  // honest pricing anchor. Such matches are stamped «⏸️ Incomplete market data
+  // — supervisor veto» and NEVER receive an approved card; only official
+  // ATP/WTA matches with real 1xBet liquidity get cards.
+  if (
+    !am.veto.vetoed &&
+    am.reverse.marketGap &&
+    m.playerA.rankSource === "TOUR_BASE" &&
+    m.playerB.rankSource === "TOUR_BASE"
+  ) {
+    am.veto = {
+      vetoed: true,
+      code: "MARKET_GAP",
+      reason:
+        "⏸️ Incomplete market data — supervisor veto: this match has neither real market odds nor officially ranked players (outside the ATP/WTA official list) — no honest pricing anchor",
+    };
+  }
 
   // ── v5.0 STATION 4 — non-linear 5-regime router ──────────────────────────
   const route = routeRegime(am, mc, archReport.selected?.pairLoss ?? 0);
@@ -569,6 +596,10 @@ export function enforceApprovalQuotaV5(analyzed: AnalyzedMatch[]): QuotaTelemetr
     const remaining = quota - approvedCount;
     const candidates = pool
       .filter((m) => m.veto.vetoed || !m.regime || m.regime.code === "VETOED")
+      // v6.0 — the incomplete-market-data veto is QUOTA-EXEMPT: the 65%
+      // adaptive quota can never force-approve a match with no honest
+      // pricing anchor (no market odds + both players officially unknown).
+      .filter((m) => m.veto.code !== "MARKET_GAP")
       .filter((m) => !!m.monteCarlo)
       .sort((a, b) => b.favWinProb - a.favWinProb) // strongest favorites first
       .slice(0, remaining);
@@ -1060,7 +1091,12 @@ async function syncDualAccounting(items: LineItem[]) {
     // v4.0 — every DUAL wing rides its official market price AND its exact
     // dutching stake (equal-profit split of the 100-unit match budget);
     // legacy v2/v3 legs keep their historical price + 50/50 split.
+    // v6.0 — the DYNAMICALLY priced atomic legs (SB-F20, TS-O25, SB-P1-*,
+    // TG-O225, GH-F45, TG-U205, TG-O205, SB-F21) are SKIPPED here: each match
+    // now carries its own real 1xBet price from computeReal1xBetTennisOdds,
+    // and re-pricing them to one constant would destroy the per-match board.
     for (const [leg, odds] of Object.entries(DUAL_LEG_MARKET_ODDS)) {
+      if (DYNAMIC_PRICED_LEGS.has(leg)) continue;
       await db.tennisPick.updateMany({
         where: { line: "DUAL", leg, odds: { not: odds } },
         data: { odds, stake: dualStakeFor(leg) },
@@ -1241,9 +1277,10 @@ function espnMatchUrl(eventKey: string): string | undefined {
     : undefined;
 }
 
-/** v5.5 — fair market price for the sniper capital-protection cover legs. */
+/** v6.0 — fair market price for the sniper capital-protection cover legs
+ *  (Bug-2 parity fix: DIVIDE by the book overround — never multiply). */
 function fairPrice1(prob: number, margin: number): number {
-  return prob > 0.01 ? Math.round((1 / prob) * margin * 100) / 100 : 40;
+  return prob > 0.01 ? Math.round((1 / (prob * margin)) * 100) / 100 : 40;
 }
 
 /** v5.5 — 2-decimal clamp helper (sniper cover price windows). */

@@ -19,6 +19,8 @@ import { sha256 } from "./hash";
 import type { QuotaTelemetry } from "./supervisor";
 import type {
   BankAudit,
+  BankHistory,
+  BankPeriodBucket,
   BankPoint,
   LedgerLeg,
   LedgerMatchRow,
@@ -29,7 +31,156 @@ import type {
   Tour,
 } from "./types";
 
+// ─── v6.0 · Professional Bank-Growth Analytics (Tehran-anchored buckets) ────
+// Buckets the settled match stream into Tehran DAYS, Iranian WEEKS (Saturday
+// start) and CALENDAR MONTHS. Every bucket reports the P&L, match count,
+// win/loss split, win rate, ROI and the bank level at the end of the period —
+// exactly the «تغییرات روزانه/هفتگی/ماهانه، تعداد بازی‌های روزانه، برد و
+// باخت» detail set the director mandated. Also computes the all-time peak and
+// the max drawdown of the bank (units + %) for the professional KPI row.
+
+const TEHRAN_DATE_FMT = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Asia/Tehran",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+/** Tehran calendar day key (YYYYMMDD) of an ISO timestamp */
+function tehranDayKey(iso: string): string {
+  const [d, m, y] = TEHRAN_DATE_FMT.format(new Date(iso)).split("/");
+  return `${y}${m}${d}`;
+}
+
+/** Iranian week key (weeks start SATURDAY in Tehran) + label */
+function tehranWeekKey(iso: string): { key: string; label: string } {
+  const [dStr, mStr, yStr] = TEHRAN_DATE_FMT.format(new Date(iso)).split("/");
+  const d = new Date(Number(yStr), Number(mStr) - 1, Number(dStr));
+  // JS dow: 6=Saturday → shift so Saturday = 0 (Sat=0, Sun=1, … Fri=6)
+  const offset = (d.getDay() + 1) % 7;
+  d.setDate(d.getDate() - offset); // back to the Saturday week-start
+  const [sd, sm, sy] = TEHRAN_DATE_FMT.format(d).split("/");
+  return { key: `${sy}${sm}${sd}`, label: `هفته ${sd}/${sm}` };
+}
+
+const FA_MONTHS = [
+  "ژانویه", "فوریه", "مارس", "آوریل", "مه", "ژوئن",
+  "ژوئیه", "اوت", "سپتامبر", "اکتبر", "نوامبر", "دسامبر",
+];
+
+function bucketize(
+  points: BankPoint[],
+  keyOf: (iso: string) => { key: string; label: string }
+): BankPeriodBucket[] {
+  const order: string[] = [];
+  const map = new Map<string, BankPeriodBucket>();
+  for (const p of points) {
+    if (!p.at || p.index === 0) continue; // skip the START point
+    const { key, label } = keyOf(p.at);
+    let b = map.get(key);
+    if (!b) {
+      b = { period: key, label, pnl: 0, wins: 0, losses: 0, matches: 0, winRate: 0, bankEnd: 0, staked: 0, roi: 0 };
+      map.set(key, b);
+      order.push(key);
+    }
+    b.pnl += p.delta ?? 0;
+    b.matches += 1;
+    if (p.status === "WON") b.wins += 1;
+    else if (p.status === "LOST") b.losses += 1;
+    b.bankEnd = p.bank;
+  }
+  return order.map((k) => {
+    const b = map.get(k)!;
+    b.pnl = Math.round(b.pnl * 100) / 100;
+    const decided = b.wins + b.losses;
+    b.winRate = decided > 0 ? b.wins / decided : 0;
+    b.roi = b.staked > 0 ? b.pnl / b.staked : b.pnl > 0 ? 1 : b.pnl < 0 ? -1 : 0;
+    return b;
+  });
+}
+
 const BANK_START = 1000;
+
+function buildBankHistory(bankCurve: BankPoint[], chronological: LedgerMatchRow[]): BankHistory {
+  const daily = bucketize(bankCurve, (iso) => {
+    const key = tehranDayKey(iso);
+    return { key, label: `${key.slice(6, 8)}/${key.slice(4, 6)}` };
+  });
+  // stake totals per daily bucket from chronological rows
+  const dayKeyOfRow = (r: LedgerMatchRow) => tehranDayKey(r.settledAt ?? r.createdAt);
+  const dayStakes = new Map<string, number>();
+  for (const r of chronological) {
+    const k = dayKeyOfRow(r);
+    dayStakes.set(k, (dayStakes.get(k) ?? 0) + r.stake);
+  }
+  for (const b of daily) b.staked = Math.round((dayStakes.get(b.period) ?? 0) * 100) / 100;
+
+  const weekly = bucketize(bankCurve, (iso) => tehranWeekKey(iso));
+  const weekStakes = new Map<string, number>();
+  for (const r of chronological) {
+    const { key } = tehranWeekKey(r.settledAt ?? r.createdAt);
+    weekStakes.set(key, (weekStakes.get(key) ?? 0) + r.stake);
+  }
+  for (const b of weekly) b.staked = Math.round((weekStakes.get(b.period) ?? 0) * 100) / 100;
+
+  const monthly = bucketize(bankCurve, (iso) => {
+    const key = tehranDayKey(iso);
+    const mk = `${key.slice(0, 6)}`;
+    return { key: mk, label: `${FA_MONTHS[Number(key.slice(4, 6)) - 1] ?? mk} ${key.slice(0, 4)}` };
+  });
+  const monthStakes = new Map<string, number>();
+  for (const r of chronological) {
+    const k = tehranDayKey(r.settledAt ?? r.createdAt).slice(0, 6);
+    monthStakes.set(k, (monthStakes.get(k) ?? 0) + r.stake);
+  }
+  for (const b of monthly) b.staked = Math.round((monthStakes.get(b.period) ?? 0) * 100) / 100;
+
+  const decidedDaily = daily.filter((b) => b.matches > 0);
+  const bestDay = [...decidedDaily].sort((a, b) => b.pnl - a.pnl)[0];
+  const worstDay = [...decidedDaily].sort((a, b) => a.pnl - b.pnl)[0];
+
+  const todayKey = tehranDayKey(new Date().toISOString());
+  const todayRows = chronological.filter((r) => dayKeyOfRow(r) === todayKey);
+  const todayWins = todayRows.filter((r) => r.status === "WON").length;
+  const todayLosses = todayRows.filter((r) => r.status === "LOST").length;
+  const todayMatches = todayRows.length;
+
+  // peak & max drawdown over the full point series
+  let peak: { bank: number; at: string } = { bank: BANK_START, at: bankCurve[0]?.at ?? new Date().toISOString() };
+  let peakBank = BANK_START;
+  let maxDd = { units: 0, pct: 0, from: "", to: "" };
+  let ddPeakAt = bankCurve[0]?.at ?? new Date().toISOString();
+  for (const p of bankCurve) {
+    if (p.bank >= peakBank) {
+      peakBank = p.bank;
+      peak = { bank: p.bank, at: p.at ?? ddPeakAt };
+      ddPeakAt = p.at ?? ddPeakAt;
+    } else {
+      const ddUnits = Math.round((peakBank - p.bank) * 100) / 100;
+      const ddPct = peakBank > 0 ? Math.round((ddUnits / peakBank) * 10000) / 100 : 0;
+      if (ddUnits > maxDd.units) {
+        maxDd = { units: ddUnits, pct: ddPct, from: ddPeakAt, to: p.at ?? ddPeakAt };
+      }
+    }
+  }
+
+  return {
+    daily,
+    weekly,
+    monthly,
+    bestDay,
+    worstDay,
+    today: {
+      matches: todayMatches,
+      wins: todayWins,
+      losses: todayLosses,
+      pnl: Math.round(todayRows.reduce((s, r) => s + r.profit, 0) * 100) / 100,
+      winRate: todayWins + todayLosses > 0 ? todayWins / (todayWins + todayLosses) : 0,
+    },
+    peak,
+    maxDrawdown: maxDd,
+  };
+}
 
 // ─── v5.5 · STANDARD MATCH STAKE mirror (ledger side of the 100-unit law) ──
 // Every ledger row — dual pairs, bankers, copula combos, exact clusters,
@@ -473,6 +624,8 @@ export async function buildLedgerPayload(
     .reduce((s, r) => s + r.stake, 0);
 
   // bank curve over decided rows (chronological, match-level P&L for DUAL)
+  // v6.0 — every point now carries its settle timestamp, outcome and delta so
+  // the dashboard can bucket the curve into daily/weekly/monthly analytics.
   const chronological = [...decidedRows].sort(
     (a, b) => (a.settledAt ?? a.createdAt).localeCompare(b.settledAt ?? b.createdAt)
   );
@@ -484,8 +637,14 @@ export async function buildLedgerPayload(
       index: i + 1,
       bank: Math.round(bank * 100) / 100,
       label: `${r.matchLabel} · ${r.status}`,
+      at: r.settledAt ?? r.createdAt,
+      status: r.status === "WON" || r.status === "LOST" ? r.status : undefined,
+      delta: Math.round(r.profit * 100) / 100,
     });
   });
+
+  // ── v6.0 · Professional bank-growth analytics (Tehran-anchored buckets) ──
+  const bankHistory = buildBankHistory(bankCurve, chronological);
 
   // current streak — one result event per match (DUAL collapsed)
   const resultEvents = chronological.map((r) => ({
@@ -599,6 +758,7 @@ export async function buildLedgerPayload(
     rows,
     quota,
     bankCurve,
+    bankHistory,
     bankAudit,
   };
 }

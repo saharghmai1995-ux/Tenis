@@ -199,6 +199,9 @@ export interface EspnCompetitor {
   rank?: number; // official world ranking (from /rankings table)
   seed?: number; // curatedRank.current — tournament seed shown in scoreboard
   points?: number;
+  /** v6.0 — how the rank was resolved: TABLE = official list, SEED = main-draw
+   *  seed, TOUR_BASE = INVENTED by the name-hash fallback (player unknown) */
+  rankSource?: "TABLE" | "SEED" | "TOUR_BASE";
   linescores: { value: number; tiebreak?: number; winner?: boolean }[];
   winner?: boolean;
   espnAthleteId?: string;
@@ -341,7 +344,7 @@ export interface Slip {
 export interface VetoInfo {
   vetoed: boolean;
   reason?: string;
-  code?: "TOP100" | "P02_RISK" | "NONE" | "REGIME";
+  code?: "TOP100" | "P02_RISK" | "NONE" | "REGIME" | "MARKET_GAP";
 }
 
 export interface TimingInfo {
@@ -545,6 +548,40 @@ export interface BankPoint {
   index: number;
   bank: number;
   label: string;
+  /** v6.0 — ISO settle timestamp of the point (drives daily/weekly/monthly buckets) */
+  at?: string;
+  /** v6.0 — outcome of the settled match behind this point */
+  status?: "WON" | "LOST";
+  /** v6.0 — match-level P&L delta applied at this point */
+  delta?: number;
+}
+
+// ─── v6.0 · Professional Bank-Growth Analytics (daily/weekly/monthly) ───────
+/** One aggregated bank-growth bucket (a Tehran day / Iranian week / month). */
+export interface BankPeriodBucket {
+  /** stable bucket key, e.g. 20261117 (daily) · 2026-W46 · 2026-11 */
+  period: string;
+  /** human-readable Persian label */
+  label: string;
+  pnl: number;
+  wins: number;
+  losses: number;
+  matches: number;
+  winRate: number;
+  bankEnd: number;
+  staked: number;
+  roi: number;
+}
+
+export interface BankHistory {
+  daily: BankPeriodBucket[];
+  weekly: BankPeriodBucket[];
+  monthly: BankPeriodBucket[];
+  bestDay?: BankPeriodBucket;
+  worstDay?: BankPeriodBucket;
+  today: { matches: number; wins: number; losses: number; pnl: number; winRate: number };
+  peak: { bank: number; at: string };
+  maxDrawdown: { units: number; pct: number; from: string; to: string };
 }
 
 export interface LedgerPayload {
@@ -582,6 +619,8 @@ export interface LedgerPayload {
     ratio: number;
   };
   bankCurve: BankPoint[];
+  /** v6.0 — professional bank-growth analytics (daily/weekly/monthly) */
+  bankHistory?: BankHistory;
   /** v5.0 — Live Bankroll Audit Inspector (🧮 1,647-unit accounting box) */
   bankAudit?: BankAudit;
 }

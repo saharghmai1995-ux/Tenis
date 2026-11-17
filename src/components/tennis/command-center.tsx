@@ -1,6 +1,5 @@
 "use client";
 
-import { useMemo } from "react";
 import {
   ArrowDownRight,
   ArrowUpRight,
@@ -21,6 +20,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { BankGrowthPro } from "@/components/tennis/bank-growth-pro";
 import { GyroGauge } from "@/components/tennis/gyro-gauge";
 import type { LedgerPayload, ProductionLine } from "@/lib/tennis/types";
 
@@ -45,47 +45,6 @@ const LINE_COLORS: Record<ProductionLine, string> = {
   SNIPER: "text-rose-300",
   SHADOW: "text-muted-foreground",
 };
-
-// ─── Bank growth curve (custom SVG area) ───────────────────────────────────
-function BankCurve({ bank, start }: { bank: number; start: number }) {
-  const { path, area, last } = useMemo(() => {
-    const W = 560;
-    const H = 150;
-    const min = Math.min(start, bank) * 0.998;
-    const max = Math.max(start, bank) * 1.002 || 1;
-    const y = (v: number) => H - 8 - ((v - min) / (max - min || 1)) * (H - 20);
-    const lastY = y(bank);
-    const lastX = W - 4;
-    const startY = y(start);
-    const path = `M 4 ${startY} L ${lastX} ${lastY}`;
-    const area = `M 4 ${startY} L ${lastX} ${lastY} L ${lastX} ${H} L 4 ${H} Z`;
-    return { path, area, last: { x: lastX, y: lastY } };
-  }, [bank, start]);
-
-  const up = bank >= start;
-  return (
-    <svg viewBox="0 0 560 150" className="w-full" preserveAspectRatio="none">
-      <defs>
-        <linearGradient id="bankGrad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor={up ? "#34d399" : "#fb7185"} stopOpacity="0.28" />
-          <stop offset="100%" stopColor={up ? "#34d399" : "#fb7185"} stopOpacity="0" />
-        </linearGradient>
-      </defs>
-      <path d={area} fill="url(#bankGrad)" />
-      <path
-        d={path}
-        fill="none"
-        stroke={up ? "#34d399" : "#fb7185"}
-        strokeWidth="2.5"
-        strokeLinecap="round"
-        style={{ transition: "d 1s ease" }}
-      />
-      <circle cx={last.x} cy={last.y} r="4" fill={up ? "#34d399" : "#fb7185"}>
-        <animate attributeName="r" values="4;7;4" dur="2s" repeatCount="indefinite" />
-      </circle>
-    </svg>
-  );
-}
 
 export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
   const { stats, groups } = ledger;
@@ -174,32 +133,8 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
           </CardContent>
         </Card>
 
-        {/* bank curve */}
-        <Card className="spatial-card rise-in rounded-2xl lg:col-span-2">
-          <CardHeader className="pb-0">
-            <CardTitle className="flex items-center gap-2 text-sm font-bold">
-              <Banknote className="h-4 w-4 text-emerald-300" />
-              منحنی رشد بانک ۱۰۰۰ واحدی — حسابداری سطح مسابقه
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2 pt-2">
-            <BankCurve bank={stats.bank} start={stats.bankStart} />
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-              {kpis.map((k) => (
-                <div key={k.label} className="rounded-xl border border-white/10 bg-white/[0.04] p-2.5">
-                  <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-                    <k.icon className="h-3 w-3" />
-                    {k.label}
-                  </div>
-                  <div className={`mono-num mt-1 text-lg font-bold ${k.tone}`} dir="ltr">
-                    {k.value}
-                  </div>
-                  <div className="text-[10px] text-muted-foreground">{k.hint}</div>
-                </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
+        {/* v6.0 — professional bank-growth module (daily/weekly/monthly) */}
+        <BankGrowthPro history={ledger.bankHistory} bankStart={stats.bankStart} bank={stats.bank} />
       </div>
 
       {/* disjoint ledger */}

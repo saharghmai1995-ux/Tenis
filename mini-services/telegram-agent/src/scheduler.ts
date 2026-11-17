@@ -895,12 +895,31 @@ export function startScheduler(): void {
   void discoverVipLoop();
 }
 
-/** capture the VIP channel id from any chat the bot can see */
+/** capture the VIP channel id from any chat the bot can see.
+ *  .env PRIORITY LAW: when TELEGRAM_VIP_CHAT_ID is explicitly configured it
+ *  is the single source of truth — discovery NEVER overwrites it (the old
+ *  bug captured the PUBLIC channel as VIP whenever publicChatId was numeric,
+ *  because `publicChatId.includes(username)` can never match a numeric id). */
 async function discoverVipLoop(): Promise<void> {
+  if (CONFIG.vipChatId) {
+    // explicit director config wins — keep the title fresh, never the id
+    try {
+      for (const ch of await telegram.discoverChats()) {
+        if (String(ch.id) === CONFIG.vipChatId && ch.title) {
+          store.kvSet("vipChatTitle", ch.title);
+        }
+      }
+    } catch {
+      /* best-effort */
+    }
+    return;
+  }
   try {
     const chats = await telegram.discoverChats();
     for (const ch of chats) {
-      const isPublic = !!ch.username && CONFIG.publicChatId.includes(ch.username);
+      const isPublic =
+        (!!ch.username && CONFIG.publicChatId.includes(ch.username)) ||
+        String(ch.id) === CONFIG.publicChatId;
       const isChannelish = ch.type === "channel" || ch.type === "supergroup";
       if (isChannelish && ch.id) {
         store.kvSet(`chatSeen:${ch.id}`, JSON.stringify(ch));
