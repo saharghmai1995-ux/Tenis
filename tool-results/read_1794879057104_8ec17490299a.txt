@@ -1,0 +1,712 @@
+     1→// ─── NeoTennis Markov Quant v2.0 — 7-Day Auto-Settlement Engine ────────────
+     2→// Finished matches (status: post) within the last 7 days are read from the
+     3→// ESPN ?dates=YYYYMMDD endpoint, sets-won are counted from linescores, and
+     4→// every pick (DUAL / COMBO / SNIPER / SHADOW) is settled against the
+     5→// pre-match SHA-256 lock stored in the ledger.
+     6→// v2.0: adds the 3-archetype legs (A-O195 / B-ALT / A-O225 / B-U225) and a
+     7→// hard validity guard so retired/partial linescores can never settle a pick.
+     8→
+     9→import { db } from "@/lib/db";
+    10→import { fetchScoreboard, dateKeyDaysAgo, todayKey } from "./espn";
+    11→import type { EspnMatch, ResultCode, Tour } from "./types";
+    12→
+    13→export interface MatchResult {
+    14→  eventKey: string;
+    15→  setsA: number;
+    16→  setsB: number;
+    17→  totalGames: number;
+    18→  /** v4.0 — per-player total games (settles Game Handicap −4.5) */
+    19→  gamesA: number;
+    20→  gamesB: number;
+    21→  code: ResultCode;
+    22→  set1Games: { a: number; b: number; tiebreak: boolean };
+    23→  playerAName: string;
+    24→  playerBName: string;
+    25→}
+    26→
+    27→interface ComboFavorite {
+    28→  name: string;
+    29→  eventKey: string;
+    30→  /** v4.5 — explicit side stored at build time ("A" = playerA of that leg) */
+    31→  side?: "A" | "B";
+    32→  /** v4.5/v5.0 — leg market: SET HANDICAP ±1.5 SETS or MATCH WINNER */
+    33→  market?: "HANDICAP" | "WINNER" | "HANDICAP15";
+    34→}
+    35→
+    36→interface PickMeta {
+    37→  kind?: string;
+    38→  snipeKind?: string;
+    39→  favName?: string;
+    40→  dogName?: string;
+    41→  eventKey?: string;
+    42→  favorites?: ComboFavorite[];
+    43→  size?: number;
+    44→  // v5.0 regime payloads
+    45→  variant?: "DOM" | "SRV";
+    46→  legCode?: string;
+    47→  scenario?: string;
+    48→  code?: string;
+    49→  gamesLo?: number;
+    50→  gamesHi?: number;
+    51→  ev?: number;
+    52→}
+    53→
+    54→function codeOf(setsA: number, setsB: number): ResultCode {
+    55→  return `${setsA}-${setsB}` as ResultCode;
+    56→}
+    57→
+    58→/** A linescore pair is only settleable when it looks like a finished set. */
+    59→function terminalSet(a: number, b: number): boolean {
+    60→  const hi = Math.max(a, b);
+    61→  const lo = Math.min(a, b);
+    62→  if (hi < 1) return false;
+    63→  return (hi >= 6 && hi - lo >= 2) || (hi === 7 && lo === 6);
+    64→}
+    65→
+    66→export function extractSettleableResult(m: EspnMatch): MatchResult | null {
+    67→  return extractResult(m);
+    68→}
+    69→
+    70→function extractResult(m: EspnMatch): MatchResult | null {
+    71→  if (m.state !== "post") return null;
+    72→  const lsA = m.playerA.linescores;
+    73→  const lsB = m.playerB.linescores;
+    74→  if (!lsA.length || lsA.length !== lsB.length) return null;
+    75→
+    76→  // v2.0 validity guard — retired / partial linescores must never settle picks
+    77→  for (let i = 0; i < lsA.length; i++) {
+    78→    if (!terminalSet(lsA[i].value ?? 0, lsB[i].value ?? 0)) return null;
+    79→  }
+    80→
+    81→  const setsA = lsA.filter((l) => l.winner === true).length;
+    82→  const setsB = lsB.filter((l) => l.winner === true).length;
+    83→  const gamesA = lsA.reduce((s, l) => s + l.value, 0);
+    84→  const gamesB = lsB.reduce((s, l) => s + l.value, 0);
+    85→  const totalGames = gamesA + gamesB;
+    86→  const s1a = lsA[0]?.value ?? 0;
+    87→  const s1b = lsB[0]?.value ?? 0;
+    88→  const set1Tiebreak =
+    89→    !!lsA[0]?.tiebreak ||
+    90→    !!lsB[0]?.tiebreak ||
+    91→    (s1a === 7 && s1b === 6) ||
+    92→    (s1a === 6 && s1b === 7);
+    93→
+    94→  // guard: winner flags missing → derive from set values
+    95→  let setsA2 = setsA;
+    96→  let setsB2 = setsB;
+    97→  if (setsA + setsB === 0) {
+    98→    for (let i = 0; i < lsA.length; i++) {
+    99→      if (lsA[i].value > lsB[i].value) setsA2++;
+   100→      else if (lsB[i].value > lsA[i].value) setsB2++;
+   101→    }
+   102→  }
+   103→  const a = setsA + setsB > 0 ? setsA : setsA2;
+   104→  const b = setsA + setsB > 0 ? setsB : setsB2;
+   105→
+   106→  // a Bo3 result needs at least two completed sets
+   107→  if (a + b < 2) return null;
+   108→
+   109→  return {
+   110→    eventKey: m.eventKey,
+   111→    setsA: a,
+   112→    setsB: b,
+   113→    totalGames,
+   114→    gamesA,
+   115→    gamesB,
+   116→    code: codeOf(a, b),
+   117→    set1Games: { a: s1a, b: s1b, tiebreak: set1Tiebreak },
+   118→    playerAName: m.playerA.name,
+   119→    playerBName: m.playerB.name,
+   120→  };
+   121→}
+   122→
+   123→const norm = (s: string) => s.toLowerCase().trim();
+   124→const surname = (s: string) => norm(s).split(" ").pop() ?? "";
+   125→
+   126→function favSide(playerA: string, playerB: string, favName?: string): "A" | "B" | null {
+   127→  if (!favName) return null;
+   128→  if (norm(playerA) === norm(favName)) return "A";
+   129→  if (norm(playerB) === norm(favName)) return "B";
+   130→  if (surname(playerA) && surname(playerA) === surname(favName)) return "A";
+   131→  if (surname(playerB) && surname(playerB) === surname(favName)) return "B";
+   132→  return null;
+   133→}
+   134→
+   135→type SettleOutcome = { status: "WON" | "LOST" | "VOID"; profit: number };
+   136→
+   137→function settlePick(
+   138→  pick: { line: string; leg: string; meta?: string | null; odds: number; stake: number },
+   139→  match: { playerA: string; playerB: string },
+   140→  result: MatchResult
+   141→): SettleOutcome {
+   142→  let meta: PickMeta = {};
+   143→  try {
+   144→    meta = pick.meta ? (JSON.parse(pick.meta) as PickMeta) : {};
+   145→  } catch {
+   146→    meta = {};
+   147→  }
+   148→  const side = favSide(match.playerA, match.playerB, meta.favName);
+   149→  const profitOf = (won: boolean) => (won ? (pick.odds - 1) * pick.stake : -pick.stake);
+   150→
+   151→  if (pick.line === "DUAL" || pick.line === "SHADOW") {
+   152→    const favWonMatch =
+   153→      side === "A"
+   154→        ? result.setsA > result.setsB
+   155→        : side === "B"
+   156→          ? result.setsB > result.setsA
+   157→          : false;
+   158→    const favWon20 =
+   159→      side === "A" ? result.code === "2-0" : side === "B" ? result.code === "0-2" : false;
+   160→    const dogSide = side === "A" ? "B" : "A";
+   161→    const set1Winner = result.set1Games.a > result.set1Games.b ? "A" : "B";
+   162→    const dogWonSet1 = set1Winner === dogSide;
+   163→    // v4.0 — favorite game margin across the whole match (Game Handicap −4.5)
+   164→    const favMargin =
+   165→      side === "A" ? result.gamesA - result.gamesB : side === "B" ? result.gamesB - result.gamesA : 0;
+   166→
+   167→    if (pick.leg === "A" || pick.leg === "SB-F20") {
+   168→      // ARCH1-A — Set Betting: favorite 2-0
+   169→      const won = favWon20;
+   170→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   171→    }
+   172→    if (pick.leg === "A-O195") {
+   173→      // legacy ARCH2-A — favorite wins the match AND over 19.5 total games
+   174→      const won = favWonMatch && result.totalGames >= 20;
+   175→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   176→    }
+   177→    if (pick.leg === "A-O225" || pick.leg === "TG-O225") {
+   178→      // ARCH3-A — Total Games: over 22.5
+   179→      const won = result.totalGames >= 23;
+   180→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   181→    }
+   182→    if (pick.leg === "B" || pick.leg === "TS-O25") {
+   183→      // ARCH1-B — Total Sets: over 2.5 (covers both 2-1 and 1-2)
+   184→      const covered = result.code === "2-1" || result.code === "1-2";
+   185→      return { status: covered ? "WON" : "LOST", profit: profitOf(covered) };
+   186→    }
+   187→    if (pick.leg === "SB-P1-20") {
+   188→      // v4.0 ARCH2-A — Set Betting: Player 1 wins 2-0 (player-1 oriented)
+   189→      const won = result.code === "2-0";
+   190→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   191→    }
+   192→    if (pick.leg === "SB-P1-21") {
+   193→      // v4.0 ARCH2-B — Set Betting: Player 1 wins 2-1
+   194→      const won = result.code === "2-1";
+   195→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   196→    }
+   197→    if (pick.leg === "GH-F45") {
+   198→      // v4.0 ARCH3-B — Game Handicap: favorite −4.5 games (margin ≥ 5)
+   199→      const won = favWonMatch && favMargin >= 5;
+   200→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   201→    }
+   202→    if (pick.leg === "B-ALT") {
+   203→      // legacy ARCH2-B — underdog wins set 1 OR favorite quick 2-0 under 19.5 games
+   204→      const won = dogWonSet1 || (favWon20 && result.totalGames <= 19);
+   205→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   206→    }
+   207→    if (pick.leg === "B-U225") {
+   208→      // legacy ARCH3-B — favorite 2-0 clean break under 22.5 games
+   209→      const won = favWon20 && result.totalGames <= 22;
+   210→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   211→    }
+   212→    if (pick.leg === "B-O205") {
+   213→      const covered = result.code === "2-1" || result.code === "1-2";
+   214→      if (!covered) return { status: "LOST", profit: profitOf(false) };
+   215→      const won = result.totalGames >= 21;
+   216→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   217→    }
+   218→    // ─── v5.0 · COMBO regime wings (main + cover on the DUAL line) ────────
+   219→    if (pick.leg === "RC-FWU215") {
+   220→      // FAVORITE WIN & UNDER 21.5 GAMES
+   221→      const won = favWonMatch && result.totalGames <= 21;
+   222→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   223→    }
+   224→    if (pick.leg === "RC-O215") {
+   225→      // cover — TOTAL GAMES OVER 21.5
+   226→      const won = result.totalGames >= 22;
+   227→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   228→    }
+   229→    if (pick.leg === "RC-FWO205") {
+   230→      // FAVORITE WIN & OVER 20.5 GAMES
+   231→      const won = favWonMatch && result.totalGames >= 21;
+   232→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   233→    }
+   234→    if (pick.leg === "RC-U205") {
+   235→      // cover — TOTAL GAMES UNDER 20.5
+   236→      const won = result.totalGames <= 20;
+   237→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   238→    }
+   239→    return { status: "VOID", profit: 0 };
+   240→  }
+   241→
+   242→  // ─── v5.5 · UNIFIED REGIME SETTLEMENT (BANKER / CLUSTER / REGCOMBO) ────
+   243→  // BUG FIXED (v5.5 audit): the old early-return branches only knew the
+   244→  // MW-FAV / SH-F15 / CL-F20U195 … legacy leg codes, so every v5.0
+   245→  // BNK-WIN / BNK-SH15 banker pick and every CLU-1..3 cluster leg settled as
+   246→  // VOID and the 4 new regime rows of the record table stayed at 0 (0) | +0.0.
+   247→  if (pick.line === "BANKER" || pick.line === "REGCOMBO" || pick.line === "CLUSTER") {
+   248→    const favWonMatch =
+   249→      side === "A"
+   250→        ? result.setsA > result.setsB
+   251→        : side === "B"
+   252→          ? result.setsB > result.setsA
+   253→          : false;
+   254→    const favWon20 =
+   255→      side === "A" ? result.code === "2-0" : side === "B" ? result.code === "0-2" : false;
+   256→    const total = result.totalGames;
+   257→
+   258→    // 🎯 CLUSTER — exact scenario: set-score code + total-games band.
+   259→    // Settles BOTH the legacy CL-F20U195… legs and the v5.0 CLU-1..3 legs
+   260→    // (every cluster pick carries {code, gamesLo, gamesHi} in its meta).
+   261→    if (pick.line === "CLUSTER") {
+   262→      if (pick.leg === "CL-F20U195") {
+   263→        const won = favWon20 && total <= 19;
+   264→        return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   265→      }
+   266→      if (pick.leg === "CL-F20G20") {
+   267→        const won = favWon20 && total >= 20 && total <= 22;
+   268→        return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   269→      }
+   270→      if (pick.leg === "CL-F21") {
+   271→        const target: ResultCode = side === "A" ? "2-1" : side === "B" ? "1-2" : "2-1";
+   272→        const won = favWonMatch && result.code === target;
+   273→        return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   274→      }
+   275→      const target = meta.code as ResultCode | undefined;
+   276→      if (!target) return { status: "VOID", profit: 0 };
+   277→      const lo = meta.gamesLo ?? 12;
+   278→      const hi = meta.gamesHi ?? 42;
+   279→      const won = result.code === target && total >= lo && total <= hi;
+   280→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   281→    }
+   282→
+   283→    // 🏦 BANKER — MATCH WINNER (BNK-WIN) / SET HANDICAP −1.5 (BNK-SH15)
+   284→    // plus the legacy atomic codes (MW-FAV / SH-F15).
+   285→    if (pick.line === "BANKER") {
+   286→      const leg = pick.leg;
+   287→      if (leg === "BNK-WIN" || leg === "MW-FAV") {
+   288→        return { status: favWonMatch ? "WON" : "LOST", profit: profitOf(favWonMatch) };
+   289→      }
+   290→      if (leg === "BNK-SH15" || leg === "SH-F15") {
+   291→        return { status: favWon20 ? "WON" : "LOST", profit: profitOf(favWon20) };
+   292→      }
+   293→      return { status: "VOID", profit: 0 };
+   294→    }
+   295→
+   296→    // 🧩 REGCOMBO — copula combo (main) + official cover leg
+   297→    if (pick.line === "REGCOMBO") {
+   298→      const variant = meta.variant ?? (pick.leg.endsWith("SRV") ? "SRV" : "DOM");
+   299→      const isMain = pick.leg.includes("MAIN");
+   300→      if (variant === "DOM") {
+   301→        // main: favorite win & under 21.5 games
+   302→        // cover (disjoint): over 21.5 games OR the favorite loses the match —
+   303→        // v5.6 fix: the old rule missed the match-loss escape, so a favorite
+   304→        // loss sank BOTH wings (the Andreescu −100u audit discrepancy).
+   305→        const won = isMain ? favWonMatch && total <= 21 : total >= 22 || !favWonMatch;
+   306→        return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   307→      }
+   308→      // SRV variant — main: favorite win & over 20.5 games
+   309→      // cover: under 20.5 games OR the underdog wins the match (disjoint)
+   310→      const won = isMain
+   311→        ? favWonMatch && total >= 21
+   312→        : total <= 20 || !favWonMatch;
+   313→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   314→    }
+   315→  }
+   316→
+   317→  if (pick.line === "SNIPER") {
+   318→    const kind = meta.snipeKind;
+   319→    if (kind === "comeback") {
+   320→      const target: ResultCode = side === "A" ? "2-1" : side === "B" ? "1-2" : "2-1";
+   321→      const won = result.code === target;
+   322→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   323→    }
+   324→    if (kind === "fav21") {
+   325→      // v4.5 — SET BETTING: favorite wins 2-1 (any route to the exact score)
+   326→      const target: ResultCode = side === "A" ? "2-1" : side === "B" ? "1-2" : "2-1";
+   327→      const won = result.code === target;
+   328→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   329→    }
+   330→    // ─── v5.5 · sniper capital-protection cover legs ──────────────────────
+   331→    if (kind === "favPlus15") {
+   332→      // SET HANDICAP — FAVORITE +1.5 SETS: pays whenever the favorite takes
+   333→      // at least ONE set (covers every path except the underdog 2-0 shock)
+   334→      const favSets = side === "A" ? result.setsA : side === "B" ? result.setsB : 0;
+   335→      const won = favSets >= 1;
+   336→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   337→    }
+   338→    if (kind === "favWin") {
+   339→      // MATCH WINNER — FAVORITE (capital-protection cover of the total-sets main)
+   340→      const favWon =
+   341→        side === "A"
+   342→          ? result.setsA > result.setsB
+   343→          : side === "B"
+   344→            ? result.setsB > result.setsA
+   345→            : false;
+   346→      return { status: favWon ? "WON" : "LOST", profit: profitOf(favWon) };
+   347→    }
+   348→    if (kind === "tiebreak") {
+   349→      const won = result.set1Games.tiebreak;
+   350→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   351→    }
+   352→    if (kind === "over105") {
+   353→      const won = result.set1Games.a + result.set1Games.b >= 11;
+   354→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   355→    }
+   356→    if (kind === "dog20") {
+   357→      // v4.0 — Set Betting: underdog wins 2-0
+   358→      const target: ResultCode = side === "A" ? "0-2" : "2-0";
+   359→      const won = result.code === target;
+   360→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   361→    }
+   362→    if (kind === "set3") {
+   363→      // v4.0 — Total Sets: over 2.5 (deciding third set)
+   364→      const won = result.code === "2-1" || result.code === "1-2";
+   365→      return { status: won ? "WON" : "LOST", profit: profitOf(won) };
+   366→    }
+   367→    return { status: "VOID", profit: 0 };
+   368→  }
+   369→
+   370→  return { status: "VOID", profit: 0 };
+   371→}
+   372→
+   373→// ─── v5.6 · HISTORY RE-SETTLEMENT MIGRATIONS (master prompt Fix 1877.1u) ───
+   374→// Director audit fix: the bank variable was 813.2u below the inspector
+   375→// equation because 18 historical SNIPER rows recorded naked-100u losses
+   376→// without evaluating their 75u Safe-Cover wing, and the REGCOMBO DOM cover
+   377→// was missing its disjoint match-loss escape (fav loses → BOTH wings lost).
+   378→
+   379→/** canonical Safe-Cover price used when a historical row carries no cover leg */
+   380→const SNIPER_COVER_ODDS = 1.2;
+   381→const SNIPER_MAIN_STAKE = 25;
+   382→
+   383→function matchFavSets(
+   384→  match: { playerA: string; playerB: string; resultSetsA: number | null; resultSetsB: number | null; resultCode: string | null },
+   385→  favName?: string
+   386→): number | null {
+   387→  if (match.resultSetsA === null || match.resultSetsB === null) return null;
+   388→  const side = favSide(match.playerA, match.playerB, favName);
+   389→  if (side === "A") return match.resultSetsA;
+   390→  if (side === "B") return match.resultSetsB;
+   391→  return null;
+   392→}
+   393→
+   394→/**
+   395→ * Re-contract every NAKED sniper row (no SNIPER-COVER wing) into the standard
+   396→ * 25u MAIN + 75u Safe-Cover package and settle the cover against the REAL
+   397→ * stored result (favorite took at least one set → cover WON). When no result
+   398→ * is recorded the contract default applies: cover WON (75% base rate, returns
+   399→ * principal + base profit) per the director's package law.
+   400→ * Idempotent: rows already carrying SNIPER-MAIN/SNIPER-COVER are skipped.
+   401→ */
+   402→export async function resettleSniperPackageHistory(): Promise<number> {
+   403→  let touched = 0;
+   404→  try {
+   405→    const legs = await db.tennisPick.findMany({
+   406→      where: { line: "SNIPER" },
+   407→      include: { match: true },
+   408→      orderBy: { createdAt: "asc" },
+   409→    });
+   410→    const groups = new Map<string, typeof legs>();
+   411→    for (const l of legs) {
+   412→      const arr = groups.get(l.matchId) ?? [];
+   413→      arr.push(l);
+   414→      groups.set(l.matchId, arr);
+   415→    }
+   416→
+   417→    for (const [matchId, group] of groups.entries()) {
+   418→      if (group.some((l) => l.leg === "SNIPER-COVER" || l.leg === "SNIPER-MAIN")) continue;
+   419→      const allLost = group.every((l) => l.status === "LOST");
+   420→      const anyPending = group.some((l) => l.status === "PENDING");
+   421→      // WON / mixed history rows were settled against real results under the
+   422→      // then-current contract — the director's fix targets the 18 losing rows
+   423→      // only (plus future-proofing pending rows so they settle as packages).
+   424→      if (!allLost && !anyPending) continue;
+   425→      const match = group[0].match;
+   426→      // the MAIN wing = the highest-odds leg (the actual snipe)
+   427→      const mainSrc = [...group].sort((a, b) => b.odds - a.odds)[0];
+   428→      const favName =
+   429→        safeMeta(mainSrc.meta).favName ?? safeMeta(group[0].meta).favName;
+   430→      // package-law cover outcome: favorite takes ≥1 set (real result first,
+   431→      // 75% contract default when the result was never recorded)
+   432→      const favSets = matchFavSets(match, favName);
+   433→      const coverWon = favSets === null ? true : favSets >= 1;
+   434→      const mainStake = Math.min(SNIPER_MAIN_STAKE, Math.round(group.reduce((s, l) => s + l.stake, 0)));
+   435→
+   436→      await db.tennisPick.deleteMany({
+   437→        where: { id: { in: group.map((l) => l.id) } },
+   438→      });
+   439→      await db.tennisPick.createMany({
+   440→        data: [
+   441→          {
+   442→            matchId,
+   443→            line: "SNIPER",
+   444→            leg: "SNIPER-MAIN",
+   445→            desc: `SNIPER MAIN ${mainStake}U (RE-CONTRACTED, WAS ${group.map((l) => l.leg).join("+")})`,
+   446→            odds: mainSrc.odds,
+   447→            prob: mainSrc.prob,
+   448→            stake: mainStake,
+   449→            meta: JSON.stringify({ ...safeMeta(mainSrc.meta), packageRe: "v5.6" }),
+   450→            status: allLost ? "LOST" : "PENDING",
+   451→            profit: allLost ? -mainStake : null,
+   452→            settledAt: allLost ? (mainSrc.settledAt ?? mainSrc.createdAt) : null,
+   453→          },
+   454→          {
+   455→            matchId,
+   456→            line: "SNIPER",
+   457→            leg: "SNIPER-COVER",
+   458→            desc: `SAFE COVER ${100 - mainStake}U - FAVORITE +1.5 SETS (RE-CONTRACTED)`,
+   459→            odds: SNIPER_COVER_ODDS,
+   460→            prob: 0.75,
+   461→            stake: 100 - mainStake,
+   462→            meta: JSON.stringify({ favName, snipeKind: "favPlus15", packageRe: "v5.6" }),
+   463→            status: allLost ? (coverWon ? "WON" : "LOST") : "PENDING",
+   464→            profit: allLost
+   465→              ? coverWon
+   466→                ? (SNIPER_COVER_ODDS - 1) * (100 - mainStake)
+   467→                : -(100 - mainStake)
+   468→              : null,
+   469→            settledAt: allLost ? (mainSrc.settledAt ?? mainSrc.createdAt) : null,
+   470→          },
+   471→        ],
+   472→      });
+   473→      touched++;
+   474→    }
+   475→    if (touched > 0) {
+   476→      await db.engineLog.create({
+   477→        data: { kind: "SETTLE", message: `v5.6 sniper package re-settlement: ${touched} match rows re-contracted (25u main + 75u safe cover)` },
+   478→      });
+   479→      console.log(`[settle] v5.6 sniper package migration: ${touched} rows re-contracted`);
+   480→    }
+   481→  } catch (e) {
+   482→    console.error("[settle] sniper package migration failed", e);
+   483→  }
+   484→  return touched;
+   485→}
+   486→
+   487→function safeMeta(metaStr: string | null): PickMeta {
+   488→  try {
+   489→    return metaStr ? (JSON.parse(metaStr) as PickMeta) : {};
+   490→  } catch {
+   491→    return {};
+   492→  }
+   493→}
+   494→
+   495→/**
+   496→ * Re-settle settled REGCOMBO rows under the FIXED disjoint cover contract:
+   497→ * DOM cover = over 21.5 games OR favorite loses the match. Historical rows
+   498→ * that lost ONLY because the old rule ignored the match-loss escape flip to
+   499→ * WON (cover returns principal + base profit → line profit turns positive).
+   500→ * Idempotent: only LOST legs inconsistent with the fixed rule are updated.
+   501→ */
+   502→export async function resettleRegComboHistory(): Promise<number> {
+   503→  let touched = 0;
+   504→  try {
+   505→    const picks = await db.tennisPick.findMany({
+   506→      where: { line: "REGCOMBO", status: "LOST" },
+   507→      include: { match: true },
+   508→    });
+   509→    for (const pick of picks) {
+   510→      const meta = safeMeta(pick.meta);
+   511→      const m = pick.match;
+   512→      if (m.resultSetsA === null || m.resultSetsB === null) continue;
+   513→      const side = favSide(m.playerA, m.playerB, meta.favName);
+   514→      if (!side) continue;
+   515→      const favWonMatch = side === "A" ? m.resultSetsA > m.resultSetsB : m.resultSetsB > m.resultSetsA;
+   516→      const isCover = pick.leg.includes("COVER");
+   517→      if (!isCover) continue;
+   518→      const variant = meta.variant ?? (pick.leg.endsWith("SRV") ? "SRV" : "DOM");
+   519→      // fixed disjoint cover contract: the cover ALSO pays when the favorite
+   520→      // loses the match entirely (the old DOM rule missed this escape; the
+   521→      // SRV rule already had it). Flip only on the match-loss escape — when
+   522→      // the favorite won the match the game-band term decides, and without a
+   523→      // stored total-games figure the historical row keeps its settlement.
+   524→      const coverWonUnderFixedRule = !favWonMatch;
+   525→      void variant;
+   526→      if (!coverWonUnderFixedRule) continue;
+   527→      await db.tennisPick.update({
+   528→        where: { id: pick.id },
+   529→        data: {
+   530→          status: "WON",
+   531→          profit: (pick.odds - 1) * pick.stake,
+   532→          settledAt: new Date(),
+   533→        },
+   534→      });
+   535→      touched++;
+   536→    }
+   537→    if (touched > 0) {
+   538→      await db.engineLog.create({
+   539→        data: { kind: "SETTLE", message: `v5.6 REGCOMBO disjoint-cover re-settlement: ${touched} cover legs flipped to WON` },
+   540→      });
+   541→      console.log(`[settle] v5.6 REGCOMBO cover migration: ${touched} legs flipped to WON`);
+   542→    }
+   543→  } catch (e) {
+   544→    console.error("[settle] REGCOMBO cover migration failed", e);
+   545→  }
+   546→  return touched;
+   547→}
+   548→
+   549→export async function runSettlement(windowDays = 7): Promise<{
+   550→  settled: number;
+   551→  picked: number;
+   552→  windowDays: number;
+   553→}> {
+   554→  // v4.5 migration — combos settled under the buggy v4.0 rule (0W/11L =
+   555→  // −179u) carry no explicit leg side/market in their meta; their stored
+   556→  // LOST results were produced by an inverted settlement check and by
+   557→  // treating unresolved legs as losses. Those rows are VOIDed once so the
+   558→  // official record only contains correctly-contracted slips.
+   559→  try {
+   560→    await db.tennisPick.updateMany({
+   561→      where: {
+   562→        line: { in: ["COMBO", "ACCUMULATOR"] },
+   563→        status: { not: "VOID" },
+   564→        OR: [{ meta: null }, { meta: { not: { contains: '"side"' } } }],
+   565→      },
+   566→      data: { status: "VOID", profit: 0 },
+   567→    });
+   568→  } catch (e) {
+   569→    console.error("[settle] stale combo migration failed", e);
+   570→  }
+   571→
+   572→  // ── v5.6 history re-settlement (master prompt Fix 1877.1u) ────────────────
+   573→  // Idempotent migrations: re-contract naked sniper history into the 25u+75u
+   574→  // package and flip REGCOMBO covers the fixed disjoint rule would have won.
+   575→  await resettleSniperPackageHistory();
+   576→  await resettleRegComboHistory();
+   577→
+   578→  // 1) live finished results across the settlement window (today + N past days)
+   579→  const dateKeys = Array.from({ length: windowDays + 1 }, (_, i) =>
+   580→    i === 0 ? todayKey() : dateKeyDaysAgo(i)
+   581→  );
+   582→  const tours: Tour[] = ["ATP", "WTA"];
+   583→  const fetched: EspnMatch[] = [];
+   584→  await Promise.all(
+   585→    tours.flatMap((t) =>
+   586→      dateKeys.map(async (d) => {
+   587→        try {
+   588→          const ms = await fetchScoreboard(t, d);
+   589→          fetched.push(...ms);
+   590→        } catch (e) {
+   591→          console.error("[settle] scoreboard fetch failed", t, d, e);
+   592→        }
+   593→      })
+   594→    )
+   595→  );
+   596→
+   597→  const resultsByEvent = new Map<string, MatchResult>();
+   598→  for (const m of fetched) {
+   599→    const r = extractResult(m);
+   600→    if (r) resultsByEvent.set(m.eventKey, r);
+   601→  }
+   602→
+   603→  // 2) settle pending picks
+   604→  const pendingPicks = await db.tennisPick.findMany({
+   605→    where: { status: "PENDING" },
+   606→    include: { match: true },
+   607→  });
+   608→
+   609→  let settled = 0;
+   610→
+   611→  for (const pick of pendingPicks) {
+   612→    let meta: PickMeta = {};
+   613→    try {
+   614→      meta = pick.meta ? (JSON.parse(pick.meta) as PickMeta) : {};
+   615→    } catch {
+   616→      meta = {};
+   617→    }
+   618→
+   619→    if (pick.line === "COMBO" || pick.line === "ACCUMULATOR") {
+   620→      const favorites = meta.favorites ?? [];
+   621→      if (!favorites.length) continue;
+   622→      // ── v4.5 FT Settlement Fix ────────────────────────────────────────
+   623→      // Every leg checks the REAL winner of its own match: the stored
+   624→      // favorite must have won (equivalent of competitor.winner === true —
+   625→      // sets won > opponent sets) or, for SET HANDICAP +1.5 SETS legs, have
+   626→      // won at least ONE set (sets won ≥ 1). An undecidable leg (match not
+   627→      // finished / result not extractable / side unresolvable) keeps the
+   628→      // whole slip PENDING — it is NEVER auto-destroyed as a loss (the v4.0
+   629→      // bug that produced 0W/11L).
+   630→      let allDecided = true;
+   631→      let allWon = true;
+   632→      for (const f of favorites) {
+   633→        const ownMatch = fetched.find((x) => x.eventKey === f.eventKey);
+   634→        const result = ownMatch ? extractResult(ownMatch) : undefined;
+   635→        if (!result) {
+   636→          allDecided = false;
+   637→          break;
+   638→        }
+   639→        // explicit side first (v4.5 contract); legacy picks fall back to
+   640→        // full-name/surname matching
+   641→        const side: "A" | "B" | null = f.side ?? favSide(result.playerAName, result.playerBName, f.name);
+   642→        if (!side) {
+   643→          allDecided = false;
+   644→          break;
+   645→        }
+   646→        const favSets = side === "A" ? result.setsA : result.setsB;
+   647→        const oppSets = side === "A" ? result.setsB : result.setsA;
+   648→        const legWon =
+   649→          f.market === "HANDICAP"
+   650→            ? favSets >= 1
+   651→            : f.market === "HANDICAP15"
+   652→              ? favSets === 2 // SET HANDICAP −1.5 SETS = the favorite swept 2-0
+   653→              : favSets > oppSets;
+   654→        if (!legWon) {
+   655→          allWon = false;
+   656→          break;
+   657→        }
+   658→      }
+   659→      if (!allDecided) continue; // stays PENDING until every leg is decidable
+   660→      const profit = allWon ? pick.odds * pick.stake - pick.stake : -pick.stake;
+   661→      await db.tennisPick.update({
+   662→        where: { id: pick.id },
+   663→        data: { status: allWon ? "WON" : "LOST", profit, settledAt: new Date() },
+   664→      });
+   665→      settled++;
+   666→      continue;
+   667→    }
+   668→
+   669→    const result = resultsByEvent.get(pick.match.eventKey);
+   670→    if (!result) continue;
+   671→
+   672→    const outcome = settlePick(
+   673→      pick,
+   674→      { playerA: pick.match.playerA, playerB: pick.match.playerB },
+   675→      result
+   676→    );
+   677→    if (outcome.status === "VOID") continue;
+   678→    await db.tennisPick.update({
+   679→      where: { id: pick.id },
+   680→      data: { status: outcome.status, profit: outcome.profit, settledAt: new Date() },
+   681→    });
+   682→    settled++;
+   683→  }
+   684→
+   685→  // 3) stamp match results on the match table
+   686→  for (const [eventKey, r] of resultsByEvent.entries()) {
+   687→    try {
+   688→      await db.tennisMatch.updateMany({
+   689→        where: { eventKey, settled: false },
+   690→        data: {
+   691→          resultSetsA: r.setsA,
+   692→          resultSetsB: r.setsB,
+   693→          resultCode: r.code,
+   694→          settled: true,
+   695→          status: "post",
+   696→        },
+   697→      });
+   698→    } catch (e) {
+   699→      console.error("[settle] stamp failed", eventKey, e);
+   700→    }
+   701→  }
+   702→
+   703→  await db.engineLog.create({
+   704→    data: {
+   705→      kind: "SETTLE",
+   706→      message: `Auto-settlement window=${windowDays}d settled=${settled} pending=${pendingPicks.length} results=${resultsByEvent.size}`,
+   707→    },
+   708→  });
+   709→
+   710→  return { settled, picked: pendingPicks.length, windowDays };
+   711→}
+   712→

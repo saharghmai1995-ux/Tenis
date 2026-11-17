@@ -49,6 +49,59 @@ async function getJson(url: string, timeoutMs = 12000): Promise<unknown> {
   return (await res.json()) as unknown;
 }
 
+// ─── v7.0 · ESPN Core Tennis Odds (100% automated live-odds pipeline) ──────
+// Master-prompt v7.0 §1: the odds feed is Polymarket Gamma + ESPN Core Odds.
+// Polymarket only lists a subset of tour matches, so every match WITHOUT a
+// Gamma quote gets its live match-winner price from the ESPN CORE odds API
+// (sports.core.api.espn.com) — zero manual input, zero fixed constants.
+
+interface EspnCoreOddsRaw {
+  provider?: { name?: string };
+  moneyLineHome?: number | { value?: number; decimalOdds?: number; americanOdds?: number } | null;
+  moneyLineAway?: number | { value?: number; decimalOdds?: number; americanOdds?: number } | null;
+  moneylineHome?: number | { value?: number; decimalOdds?: number; americanOdds?: number } | null;
+  moneylineAway?: number | { value?: number; decimalOdds?: number; americanOdds?: number } | null;
+  details?: string;
+}
+
+/** American (-250 / +180) or decimal odds → decimal price. */
+function toDecimalOdds(v: number | undefined | null): number | undefined {
+  if (typeof v !== "number" || !Number.isFinite(v) || v === 0) return undefined;
+  if (v < 0) return Number((1 + 100 / Math.abs(v)).toFixed(3)); // american favorite
+  if (v > 100) return Number(v.toFixed(3)); // already decimal
+  return Number((1 + v / 100).toFixed(3)); // american underdog
+}
+
+function moneylineValue(
+  ml: EspnCoreOddsRaw["moneyLineHome"]
+): number | undefined {
+  if (typeof ml === "number") return ml;
+  if (!ml || typeof ml !== "object") return undefined;
+  return ml.decimalOdds ?? ml.americanOdds ?? ml.value;
+}
+
+/** Live match-winner odds of ONE match from the ESPN Core odds endpoint. */
+export async function fetchEspnMatchOdds(
+  tour: Tour,
+  eventKey: string
+): Promise<{ oddsA: number; oddsB: number; provider: string } | null> {
+  const league = tour.toLowerCase();
+  const url = `https://sports.core.api.espn.com/v2/sports/tennis/leagues/${league}/events/${eventKey}/competitions/${eventKey}/odds`;
+  try {
+    const raw = (await getJson(url, 7000)) as EspnCoreOddsRaw;
+    const home = toDecimalOdds(moneylineValue(raw.moneyLineHome ?? raw.moneylineHome));
+    const away = toDecimalOdds(moneylineValue(raw.moneyLineAway ?? raw.moneylineAway));
+    if (!home || !away || home <= 1.01 || away <= 1.01) return null;
+    return {
+      oddsA: home,
+      oddsB: away,
+      provider: raw.provider?.name ?? "ESPN Core",
+    };
+  } catch {
+    return null; // odds coverage is best-effort — never blocks the pipeline
+  }
+}
+
 // ─── Scoreboard parsing ────────────────────────────────────────────────────
 
 interface EspnLinescore {

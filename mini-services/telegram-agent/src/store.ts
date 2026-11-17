@@ -136,6 +136,11 @@ class Store {
       .run(key, value);
   }
 
+  /** v7.0 — delete a stale kv entry (vipChatId residue purge). */
+  kvDelete(key: string): void {
+    this.db.query("DELETE FROM kv WHERE key = ?").run(key);
+  }
+
   // ── news dedupe (keep 7 days) ─────────────────────────────────────────────
   hasNews(id: string): boolean {
     return !!this.db.query("SELECT 1 FROM news_seen WHERE id = ?").get(id);

@@ -8,6 +8,7 @@ import {
   fetchNews,
   fetchRankings,
   fetchScoreboard,
+  fetchEspnMatchOdds,
   buildRankingLookup,
   todayKey,
   dateKeyDaysAgo,
@@ -15,14 +16,13 @@ import {
 } from "./espn";
 import { fetchPolymarketOdds, matchMarket } from "./polymarket";
 import { fetchCityWeather } from "./weather";
-import { bo3Outcomes, breakPointSavedProb, fullMarkov, matchWinProbA } from "./markov";
+import { breakPointSavedProb, fullMarkov, matchWinProbA } from "./markov";
 import { removeMargin, reverseAnalysis } from "./solver";
 // v5.5 — the ghost Station-3 twin (montecarlo.ts) is retired; the one
 // authoritative copula Monte-Carlo engine lives in ./copula (runMonteCarlo).
 import { deriveCopulaTelemetry, runMonteCarlo } from "./copula";
 import {
   buildSlips,
-  dutchStakes,
   dualStakeFor,
   evaluateArchetypes,
   isDualEligible,
@@ -36,6 +36,11 @@ import {
   finalizeRegimeScore,
   forceRegimeRoute,
   STANDARD_MATCH_STAKE,
+  // v7.0 — the three production lines (live-locked pricing)
+  buildDeepSingle,
+  buildMix2Leg,
+  getLive1xBetTennisOdds,
+  V7_WINDOWS,
 } from "./supervisor";
 import type { QuotaTelemetry } from "./supervisor";
 import { canonicalMatchString, sha256 } from "./hash";
@@ -69,29 +74,25 @@ let feedPromise: Promise<FeedPayload> | null = null;
 // Top-100 and vetoed ALL 40 matches of the day. curatedRank is in fact the
 // TOURNAMENT SEED — never a world ranking.
 //
-// v3.0 resolution ladder (a main-tour ATP/WTA singles player can NEVER end
-// up with rank 999/undefined):
+// v3.0 resolution ladder:
 //   1) official /rankings table (authoritative world ranking)
 //   2) tournament seed 1–32 → main-draw player → clamped rank in [12, 68]
-//   3) stable name-hash fallback → valid rank in [12, 68] (Top-70 Main Tour)
-//      + interpolated ranking points, which the Kovalchik calibration maps
-//      into the tour baselines p_A ∈ [0.64, 0.71] / p_B ∈ [0.57, 0.63].
+//
+// ─── v7.0 · nameHash32 FAKE RANKING REMOVED (master-prompt v7.0 §1.2) ──────
+// The old tier-3 fallback invented a stable rank in [12, 68] for ANY unknown
+// name (nameHash32 % 57). That fake ranking is DELETED by construction: a
+// match whose players are neither in the official ATP/WTA ranking list nor
+// seeded cannot produce an honest pricing anchor, so resolvePlayerRankAndApprove
+// now returns rank = undefined for them and the supervisor's TOP-100 gate
+// auto-vetoes the match (plus the MARKET_GAP veto below). No fabricated
+// ranking ever feeds the Kovalchik calibration again.
 const TOUR_RANK_MIN = 12;
 const TOUR_RANK_MAX = 68;
 
 export interface ResolvedRank {
   rank: number;
   points: number;
-  source: "TABLE" | "SEED" | "TOUR_BASE";
-}
-
-function nameHash32(name: string): number {
-  let h = 2166136261;
-  for (let i = 0; i < name.length; i++) {
-    h ^= name.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
+  source: "TABLE" | "SEED";
 }
 
 /** Monotone ranking-points interpolation: #12 ≈ 2138 pts … #68 ≈ 682 pts. */
@@ -103,7 +104,7 @@ export function resolvePlayerRankAndApprove(
   name: string,
   seed: number | undefined,
   rankLookup: Map<string, RankRow>
-): ResolvedRank {
+): ResolvedRank | null {
   // 1) official rankings table — exact full name, then surname disambiguation
   const exact = rankLookup.get(name.toLowerCase());
   if (exact) return { rank: exact.rank, points: exact.points, source: "TABLE" };
@@ -119,26 +120,23 @@ export function resolvePlayerRankAndApprove(
     return { rank, points: pointsForRank(rank), source: "SEED" };
   }
 
-  // 3) ATP/WTA tour-base fallback — official main-tour match, never 999
-  const rank =
-    TOUR_RANK_MIN +
-    (nameHash32(name.toLowerCase()) % (TOUR_RANK_MAX - TOUR_RANK_MIN + 1));
-  return { rank, points: pointsForRank(rank), source: "TOUR_BASE" };
+  // 3) v7.0 — NO name-hash invention: officially unknown player → no rank.
+  return null;
 }
 
 /** Attach resolved rankings to both competitors of a match (in place).
- *  v6.0 — also records the RESOLUTION SOURCE: "TABLE" = the player exists in
- *  the official ATP/WTA ranking list; "TOUR_BASE" = the rank was INVENTED by
- *  the name-hash fallback (the player is officially unknown). */
+ *  v7.0 — rankSource is "TABLE" / "SEED" or undefined: a player absent from
+ *  the official ATP/WTA ranking list (and unseeded) stays UNRANKED and the
+ *  supervisor auto-vetoes the match (no fake rank, no card). */
 function attachResolvedRanks(m: EspnMatch, rankLookup: Map<string, RankRow>) {
   const a = resolvePlayerRankAndApprove(m.playerA.name, m.playerA.seed, rankLookup);
   const b = resolvePlayerRankAndApprove(m.playerB.name, m.playerB.seed, rankLookup);
-  m.playerA.rank = a.rank;
-  m.playerA.points = m.playerA.points ?? a.points;
-  m.playerB.rank = b.rank;
-  m.playerB.points = m.playerB.points ?? b.points;
-  m.playerA.rankSource = a.source;
-  m.playerB.rankSource = b.source;
+  m.playerA.rank = a?.rank;
+  m.playerA.points = m.playerA.points ?? a?.points;
+  m.playerB.rank = b?.rank;
+  m.playerB.points = m.playerB.points ?? b?.points;
+  m.playerA.rankSource = a?.source;
+  m.playerB.rankSource = b?.source;
 }
 
 /** v3.0 — SHA-256 pre-lock of the approved regime position (slips or regime). */
@@ -465,6 +463,49 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
         )
       : new Map<string, MarketOdds>();
 
+    // ── v7.0 · ESPN CORE ODDS BACKFILL (master-prompt §1: 100% automated) ──
+    // Matches without a Polymarket quote get their LIVE match-winner price
+    // from sports.core.api.espn.com — the second mandated odds feed. The
+    // 5.5% 1xBet de-vig is applied by removeMargin at analysis time.
+    const missingOddsMatches = unique
+      .filter(
+        (m) =>
+          m.state !== "post" &&
+          /^\d+$/.test(m.eventKey) &&
+          !marketMap.has(`${m.playerA.name}__${m.playerB.name}`)
+      )
+      .slice(0, 36);
+    if (missingOddsMatches.length > 0) {
+      const espnOdds = await Promise.all(
+        missingOddsMatches.map((m) => fetchEspnMatchOdds(m.tour, m.eventKey))
+      );
+      let espnFilled = 0;
+      espnOdds.forEach((o, i) => {
+        const m = missingOddsMatches[i];
+        if (!o) return;
+        const rm = removeMargin([o.oddsA, o.oddsB], "shin");
+        marketMap.set(`${m.playerA.name}__${m.playerB.name}`, {
+          playerA: m.playerA.name,
+          playerB: m.playerB.name,
+          probA: rm.probs[0],
+          probB: rm.probs[1],
+          oddsA: o.oddsA,
+          oddsB: o.oddsB,
+          source: "espn-core",
+          eventTitle: m.tournament,
+        });
+        espnFilled++;
+      });
+      if (espnFilled > 0) {
+        sources.espn_core_odds = {
+          ok: true,
+          latencyMs: 0,
+          count: espnFilled,
+        };
+        console.log(`[engine] ESPN core odds live for ${espnFilled}/${missingOddsMatches.length} matches`);
+      }
+    }
+
     // ── per-match analysis (unified v5.5 path for pre / in / post) ────────
     // 4-station pipeline per match — no transient tuple map anymore
     const analyzed: AnalyzedMatch[] = [];
@@ -509,6 +550,7 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
     const settledItems = [
       ...lines.dual,
       ...lines.banker,
+      ...lines.single,
       ...lines.regCombo,
       ...lines.cluster,
       ...lines.accumulator,
@@ -717,12 +759,13 @@ function allocateFiveRegimes(analyzed: AnalyzedMatch[], includePost = false): vo
 }
 
 // ─── v2.0 · 7-Day Historical Auto-Settlement ───────────────────────────────
-// v5.5 — the settled 7-day record is (re)built through the SAME 5-regime
-// pipeline as today's card: analyze → crown → allocateFiveRegimes → regime
-// item builders, so every regime of the «دفترکل افرازی» table holds settled
-// rows too. `historyVersion` marks the pipeline revision a match was
-// processed under; bumping the constant re-backfills the 7-day window ONCE.
-const HISTORY_PIPELINE_VERSION = 6; // v5.5 = 6
+// v7.0 — the settled 7-day record is (re)built through the THREE v7 production
+// lines exactly as mandated: 🔗 MIX-2 (1.80x–2.25x) · 🎯 DEEP SINGLE
+// (1.72x–2.15x) · 🏦 BANKER (1.45x–1.65x) + 3-FOLD ACCA (2.70x–3.40x), every
+// stake the standard 100 units, every win +100×(odds−1) and every loss exactly
+// −100.0. `historyVersion` marks the pipeline revision a match was processed
+// under; bumping the constant re-backfills the 7-day window ONCE.
+const HISTORY_PIPELINE_VERSION = 7; // v7.0 = 7 (3 production lines + live pricing)
 
 interface HistorySummary {
   analyzed: number;
@@ -804,54 +847,79 @@ async function processHistorySettlement(
     allocateFiveRegimes(freshAnalyzed, true);
 
     // 4) persist match rows (marks them processed) and build the routed items
+    // v7.0 — every settled match feeds the THREE production lines: the BANKER
+    // regime rides Tab 3 (1.45x–1.65x) and every match with an honest pricing
+    // anchor rides Tab 2 (DEEP SINGLE 1.72x–2.15x) at the real 1/(prob×1.055)
+    // price of its own Monte-Carlo probability.
     await persistMatches(freshAnalyzed, true);
     for (const am of freshAnalyzed) {
       const result = extractSettleableResult(am);
       const approved =
         !am.veto.vetoed && !!am.regime && am.regime.code !== "VETOED" && !!am.crown;
       if (approved && result) {
-        switch (am.regime?.code) {
-          case "BANKER": {
-            const item = bankerItemOf(am);
-            if (item) summary.items.push(item);
-            break;
-          }
-          case "CLUSTER":
-            summary.items.push(...clusterItemsOf(am));
-            break;
-          case "COMBO":
-            summary.items.push(...comboRegimeItemsOf(am));
-            break;
-          default:
-            if (am.slips.A && am.slips.B) summary.items.push(...dualItemsOf(am));
+        if (am.regime?.code === "BANKER") {
+          const item = bankerItemOf(am);
+          if (item) summary.items.push(item);
         }
+        const single = singleItemOf(am);
+        if (single) summary.items.push(single);
         summary.approved++;
       }
     }
 
-    // 4.5) v5.5 — 🔗 SERVICE KINGS ACCUMULATOR for the settled record: the
-    // 2/3 strongest BANKER-routed matches of each settled date combine into
-    // a 100-unit parlay item with the explicit per-leg settlement contract.
-    const bankerByDate = new Map<string, AnalyzedMatch[]>();
+    // 4.5) v7.0 — 🔗 MIX-2 + 🏦 3-FOLD ACCA for the settled record: per settled
+    // date the strongest mix legs pair into 2-leg slips (total 1.80x–2.25x)
+    // and the top bankers combine into the day's 3-fold acca (2.70x–3.40x),
+    // both with the explicit per-leg settlement contract.
+    const dayPool = new Map<string, AnalyzedMatch[]>();
     for (const am of freshAnalyzed) {
-      if (
-        am.regime?.code === "BANKER" &&
-        !am.veto.vetoed &&
-        !!am.crown &&
-        extractSettleableResult(am)
-      ) {
-        const arr = bankerByDate.get(am.dateKey) ?? [];
+      if (!am.veto.vetoed && !!am.crown && extractSettleableResult(am)) {
+        const arr = dayPool.get(am.dateKey) ?? [];
         arr.push(am);
-        bankerByDate.set(am.dateKey, arr);
+        dayPool.set(am.dateKey, arr);
       }
     }
-    for (const [, legs] of bankerByDate) {
-      const ranked = legs
-        .sort((a, b) => (b.mc?.bankerProb ?? b.favWinProb) - (a.mc?.bankerProb ?? a.favWinProb));
-      const acc2 = accumulatorItemOf(ranked.slice(0, 2), "ACC-2");
-      const acc3 = accumulatorItemOf(ranked.slice(0, 3), "ACC-3");
-      if (acc2) summary.items.push(acc2);
-      if (acc3) summary.items.push(acc3);
+    for (const [, legs] of dayPool) {
+      // 🔗 MIX-2 (Tab 1) — pair the best legs of DIFFERENT matches, 1.80x–2.25x
+      const mixLegs = legs
+        .map((m) => ({ m, leg: buildMix2Leg(m, { history: true }) }))
+        .filter((x): x is MixLegSource => !!x.leg)
+        .sort((a, b) => b.leg.prob - a.leg.prob);
+      // 🏦 3-FOLD ACCA (Tab 3) — strongest trio of the day whose honest
+      // product lands inside 2.70x–3.40x (same official leg markets)
+      let acca: LineItem | null = null;
+      let accaProb = -1;
+      for (let a = 0; a < mixLegs.length; a++) {
+        for (let b = a + 1; b < mixLegs.length; b++) {
+          for (let c = b + 1; c < mixLegs.length; c++) {
+            const trio = [mixLegs[a], mixLegs[b], mixLegs[c]];
+            const total =
+              Math.round(trio.reduce((s, x) => s * x.leg.odds, 1) * 100) / 100;
+            if (total < V7_WINDOWS.ACCA3[0] || total > V7_WINDOWS.ACCA3[1]) continue;
+            const joint = trio.reduce((s, x) => s * x.leg.prob, 1);
+            if (joint > accaProb) {
+              accaProb = joint;
+              acca = accaItemOf(trio, "ACC-3", total);
+            }
+          }
+        }
+      }
+      if (acca) summary.items.push(acca);
+      const used = new Set<string>();
+      for (let i = 0; i < mixLegs.length && summary.items.length < 4000; i++) {
+        for (let j = i + 1; j < mixLegs.length; j++) {
+          if (used.has(mixLegs[i].m.eventKey) || used.has(mixLegs[j].m.eventKey)) continue;
+          const total = Math.round(mixLegs[i].leg.odds * mixLegs[j].leg.odds * 100) / 100;
+          if (total < V7_WINDOWS.MIX2_TOTAL[0] || total > V7_WINDOWS.MIX2_TOTAL[1]) continue;
+          const item = mix2ItemOf(mixLegs[i], mixLegs[j]);
+          if (item) {
+            summary.items.push(item);
+            used.add(mixLegs[i].m.eventKey);
+            used.add(mixLegs[j].m.eventKey);
+          }
+          break; // one mix slip per leg pair — next anchor match
+        }
+      }
     }
     summary.analyzed = freshAnalyzed.length;
 
@@ -860,7 +928,7 @@ async function processHistorySettlement(
       .create({
         data: {
           kind: "HISTORY",
-          message: `v5.5 7-day auto-settlement scan: analyzed=${summary.analyzed} approved=${summary.approved} items=${summary.items.length}`,
+          message: `v7.0 7-day auto-settlement scan (3 production lines): analyzed=${summary.analyzed} approved=${summary.approved} items=${summary.items.length}`,
         },
       })
       .catch(() => undefined);
@@ -916,167 +984,171 @@ function bankerItemOf(m: AnalyzedMatch): LineItem | null {
   };
 }
 
-function clusterItemsOf(m: AnalyzedMatch): LineItem[] {
-  const regime = m.regime;
-  if (!regime || regime.code !== "CLUSTER" || !regime.scenarios) return [];
+// ─── v7.0 · settled-record item builders for the THREE production lines ─────
+// (the live card builders live inside buildLines; these mirror the exact same
+// market/stake math for post-state matches of the settlement window)
+
+/**
+ * TAB 2 — 🎯 DEEP SINGLE settled item: the match's ONE optimal deep-value
+ * market at the real 1/(prob × 1.055) price (no live quote exists for finished
+ * matches — the formula IS the v7.0 §3 settlement contract), 100-unit stake.
+ */
+function singleItemOf(m: AnalyzedMatch): LineItem | null {
+  const pick = buildDeepSingle(m, { history: true });
+  if (!pick) return null;
   const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
-  return regime.scenarios.map((sc, i) => ({
+  return {
     ...baseItem(m),
-    line: "CLUSTER",
-    leg: `CLU-${i + 1}`,
-    desc: sc.descFa,
-    descEn: sc.descEn,
-    odds: sc.price,
-    prob: sc.prob,
-    stake: Math.round(sc.stake * 10) / 10,
-    marketEn: sc.descEn,
-    marketFa: sc.descFa,
+    line: "SINGLE",
+    leg: pick.leg,
+    desc: pick.textFa,
+    descEn: pick.marketEn,
+    odds: pick.odds,
+    prob: pick.prob,
+    stake: STANDARD_MATCH_STAKE,
+    marketEn: pick.marketEn,
+    marketFa: pick.marketFa,
     espnUrl: espnMatchUrl(m.eventKey),
-    targetWindow: [2.8, 4.2] as [number, number],
-    regime,
+    targetWindow: V7_WINDOWS.DEEP_SINGLE,
+    regime: m.regime,
     crown: m.crown,
     pipeline: m.pipeline,
     copula: m.copula,
     monteCarlo: m.monteCarlo,
     meta: JSON.stringify({
-      kind: "cluster",
-      scenario: sc.label,
-      code: sc.code,
-      gamesLo: sc.gamesLo,
-      gamesHi: sc.gamesHi,
+      kind: "single",
+      legCode: pick.leg,
       favName,
       eventKey: m.eventKey,
-      adaptive: !!regime.adaptive,
+      edge: Math.round(pick.edge * 1000) / 1000,
+      history: true,
     }),
-  }));
-}
-
-function comboRegimeItemsOf(m: AnalyzedMatch): LineItem[] {
-  const regime = m.regime;
-  if (!regime || regime.code !== "COMBO" || !regime.comboLegs || !regime.legCodes) return [];
-  const legs = regime.comboLegs;
-  const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
-  const { stakeA, stakeB } = dutchStakes(legs.mainPrice, legs.coverPrice);
-  const adaptive = !!regime.adaptive;
-  const v5 = {
-    regime,
-    crown: m.crown,
-    pipeline: m.pipeline,
-    copula: m.copula,
-    monteCarlo: m.monteCarlo,
   };
-  return [
-    {
-      ...baseItem(m),
-      line: "REGCOMBO",
-      leg: regime.legCodes.main,
-      desc: legs.mainFa,
-      descEn: legs.mainEn,
-      odds: legs.mainPrice,
-      prob: legs.mainProb,
-      stake: Math.round(stakeA * 10) / 10,
-      marketEn: legs.mainEn,
-      marketFa: legs.mainFa,
-      espnUrl: espnMatchUrl(m.eventKey),
-      targetWindow: [1.85, 2.4] as [number, number],
-      ...v5,
-      meta: JSON.stringify({
-        kind: "regComboMain",
-        variant: regime.legCodes.main.endsWith("DOM") ? "DOM" : "SRV",
-        favName,
-        eventKey: m.eventKey,
-        adaptive,
-      }),
-    },
-    {
-      ...baseItem(m),
-      line: "REGCOMBO",
-      leg: regime.legCodes.cover ?? "RC-COVER",
-      desc: legs.coverFa,
-      descEn: legs.coverEn,
-      odds: legs.coverPrice,
-      prob: legs.coverProb,
-      stake: Math.round(stakeB * 10) / 10,
-      marketEn: legs.coverEn,
-      marketFa: legs.coverFa,
-      espnUrl: espnMatchUrl(m.eventKey),
-      targetWindow: [2.7, 3.3] as [number, number],
-      ...v5,
-      meta: JSON.stringify({
-        kind: "regComboCover",
-        variant: regime.legCodes.main.endsWith("DOM") ? "DOM" : "SRV",
-        favName,
-        eventKey: m.eventKey,
-        adaptive,
-      }),
-    },
-  ];
 }
 
-/** v5.5 — SERVICE KINGS ACCUMULATOR item over settled BANKER matches. */
-function accumulatorItemOf(legs: AnalyzedMatch[], legTag: string): LineItem | null {
-  if (legs.length < 2) return null;
+interface MixLegSource {
+  m: AnalyzedMatch;
+  leg: NonNullable<ReturnType<typeof buildMix2Leg>>;
+}
+
+/**
+ * TAB 1 — 🔗 MIX-2 settled item: two INDEPENDENT matches multiplied into one
+ * 2-leg slip (total 1.80x–2.25x), explicit per-leg settlement contract
+ * (side + market), one standard 100-unit stake.
+ */
+function mix2ItemOf(a: MixLegSource, b: MixLegSource): LineItem | null {
+  const legs = [a, b];
   let prob = 1;
   let odds = 1;
   const favorites: {
     name: string;
     eventKey: string;
     side: "A" | "B";
-    market: "WINNER" | "HANDICAP15";
+    market: "HANDICAP" | "WINNER" | "OVER195";
   }[] = [];
   const legRows: MixLeg[] = [];
-  for (const l of legs) {
-    const regime = l.regime!;
-    const fav = l.favorite === "A" ? l.playerA.name : l.playerB.name;
-    const dog = l.favorite === "A" ? l.playerB.name : l.playerA.name;
-    const isWinMarket = !regime.legCodes?.main || regime.legCodes.main === "BNK-WIN";
-    const legOdds = Math.max(1.3, Math.min(1.7, regime.price ?? 1.45));
-    const legProb = regime.prob ?? l.favWinProb;
-    prob *= legProb;
-    odds *= legOdds;
+  for (const { m, leg } of legs) {
+    const fav = m.favorite === "A" ? m.playerA.name : m.playerB.name;
+    const dog = m.favorite === "A" ? m.playerB.name : m.playerA.name;
+    prob *= leg.prob;
+    odds *= leg.odds;
     favorites.push({
       name: fav,
-      eventKey: l.eventKey,
-      side: l.favorite,
-      market: isWinMarket ? "WINNER" : "HANDICAP15",
+      eventKey: m.eventKey,
+      side: m.favorite,
+      market: leg.leg,
     });
     legRows.push({
       favName: fav,
       dogName: dog,
-      favShort: l.favorite === "A" ? l.playerA.shortName : l.playerB.shortName,
-      dogShort: l.favorite === "A" ? l.playerB.shortName : l.playerA.shortName,
-      tournament: l.tournament,
-      round: l.round,
-      tour: l.tour,
-      surface: l.surface,
-      startTime: l.startTime,
-      marketEn: isWinMarket
-        ? `MATCH WINNER — ${fav.toUpperCase()}`
-        : `SET HANDICAP — ${fav.toUpperCase()} −1.5 SETS`,
-      marketFa: isWinMarket
-        ? `برد مسابقه: ${fav}`
-        : `هندیکپ ست: ${fav} ۲-۰`,
-      odds: legOdds,
-      eventKey: l.eventKey,
+      favShort: m.favorite === "A" ? m.playerA.shortName : m.playerB.shortName,
+      dogShort: m.favorite === "A" ? m.playerB.shortName : m.playerA.shortName,
+      tournament: m.tournament,
+      round: m.round,
+      tour: m.tour,
+      surface: m.surface,
+      startTime: m.startTime,
+      marketEn: leg.marketEn,
+      marketFa: leg.marketFa,
+      odds: leg.odds,
+      eventKey: m.eventKey,
     });
   }
-  const size = legs.length;
   const marketEn = legRows.map((r) => r.marketEn).join(" + ");
-  const first = legs[0];
   return {
-    ...baseItem(first),
-    line: "ACCUMULATOR",
-    leg: legTag,
-    desc: `آکومولاتور سلاطین سرویس ${size === 3 ? "۳" : "۲"} تایی — ${legRows.map((r) => r.favName).join(" × ")}`,
-    descEn: `SERVICE KINGS ${size}-FOLD — ${marketEn}`,
+    ...baseItem(a.m),
+    line: "COMBO",
+    leg: "MIX2",
+    desc: `میکس ۲ تایی سلاطین سرویس — ${legRows.map((r) => r.favName).join(" × ")}`,
+    descEn: `2-LEG PRECISION PARLAY — ${marketEn}`,
     odds: Math.round(odds * 100) / 100,
     prob,
     stake: STANDARD_MATCH_STAKE,
-    timing: first.timing,
+    timing: a.m.timing,
     marketEn,
-    marketFa: `آکومولاتور ${size} تایی سلاطین سرویس — ${legRows.map((r) => r.favName).join("، ")}`,
+    marketFa: `میکس ۲ تایی سلاطین سرویس — ${legRows.map((r) => r.favName).join("، ")}`,
     legs: legRows,
-    meta: JSON.stringify({ kind: "combo", favorites, size }),
+    meta: JSON.stringify({ kind: "combo", favorites, size: 2 }),
+  };
+}
+
+/**
+ * TAB 3 — 🏦 SERVICE 3-FOLD ACCA: three of the day's strongest service-king
+ * legs (official 1-click markets, explicit side+market settlement contract)
+ * multiplied into one 100-unit slip. The caller pre-filters the honest total
+ * into the printed 2.70x–3.40x contract.
+ */
+function accaItemOf(sources: MixLegSource[], legTag: string, total: number): LineItem | null {
+  if (sources.length !== 3) return null;
+  let prob = 1;
+  const favorites: {
+    name: string;
+    eventKey: string;
+    side: "A" | "B";
+    market: "HANDICAP" | "WINNER" | "OVER195";
+  }[] = [];
+  const legRows: MixLeg[] = [];
+  for (const { m, leg } of sources) {
+    const fav = m.favorite === "A" ? m.playerA.name : m.playerB.name;
+    const dog = m.favorite === "A" ? m.playerB.name : m.playerA.name;
+    prob *= leg.prob;
+    favorites.push({
+      name: fav,
+      eventKey: m.eventKey,
+      side: m.favorite,
+      market: leg.leg,
+    });
+    legRows.push({
+      favName: fav,
+      dogName: dog,
+      favShort: m.favorite === "A" ? m.playerA.shortName : m.playerB.shortName,
+      dogShort: m.favorite === "A" ? m.playerB.shortName : m.playerA.shortName,
+      tournament: m.tournament,
+      round: m.round,
+      tour: m.tour,
+      surface: m.surface,
+      startTime: m.startTime,
+      marketEn: leg.marketEn,
+      marketFa: leg.marketFa,
+      odds: leg.odds,
+      eventKey: m.eventKey,
+    });
+  }
+  const marketEn = legRows.map((r) => r.marketEn).join(" + ");
+  return {
+    ...baseItem(sources[0].m),
+    line: "ACCUMULATOR",
+    leg: legTag,
+    desc: `آکومولاتور سلاطین سرویس ۳ تایی — ${legRows.map((r) => r.favName).join(" × ")}`,
+    descEn: `SERVICE KINGS 3-FOLD — ${marketEn}`,
+    odds: total,
+    prob,
+    stake: STANDARD_MATCH_STAKE,
+    timing: sources[0].m.timing,
+    marketEn,
+    marketFa: `آکومولاتور ۳ تایی سلاطین سرویس — ${legRows.map((r) => r.favName).join("، ")}`,
+    legs: legRows,
+    meta: JSON.stringify({ kind: "combo", favorites, size: 3 }),
   };
 }
 
@@ -1243,49 +1315,11 @@ async function persistPicks(items: LineItem[]) {
 // leg, so a 2-leg slip always lands in 2.05x–2.40x and a 3-leg slip in
 // 2.90x–3.80x. The old 2.80x–5.80x window anchored on 55% favorites and
 // settled every ambiguous leg as a loss (0W/11L = −179u).
-const COMBO2_MIN_ODDS = 2.0;
-const COMBO2_MAX_ODDS = 2.45;
-const COMBO3_MIN_ODDS = 2.9;
-const COMBO3_MAX_ODDS = 3.8;
-// v4.5 — Tab 2 guarantee: at least 4 safe-anchor combos (2-leg & 3-leg)
-const COMBO_GUARANTEE = 4;
-const COMBO_FALLBACK2: [number, number] = [1.9, 2.9];
-const COMBO_FALLBACK3: [number, number] = [2.8, 4.4];
-// v5.0 — Tab 3 sniper: ONLY copula +EV signals inside 3.20x–4.80x are
-// emitted (≥14% expected-value edge over the official price; the 34
-// positions @ >6.00x with a 16% win rate are delisted by design).
-const SNIPER_MIN_ODDS = 3.2;
-const SNIPER_MAX_ODDS = 4.8;
-const SNIPER_MIN_EV = 0.14;
-const SNIPER_GUARANTEE = 5;
-// v5.0 — simulated bookmaker margin for the sniper candidate pricing
-const BOOK_MARGIN_SNIPER = 1.07;
-
-/** v4.5 — Safe-Anchor leg pricing: a ≥91% probability leg rides a realistic
- *  soft-book price (fair × 1.30 margin), clamped into the 1.43x–1.55x anchor
- *  band so the combined 2-leg slip stays inside the promised 2.05x–2.40x. */
-function anchorLegOdds(prob: number): number {
-  const fair = 1 / Math.max(prob, 0.01);
-  const clamped = Math.max(1.43, Math.min(1.55, fair * 1.3));
-  return Math.round(clamped * 100) / 100;
-}
-
 /** ESPN match page for the click-to-verify hash modal (v4.0). */
 function espnMatchUrl(eventKey: string): string | undefined {
   return /^\d+$/.test(eventKey)
     ? `https://www.espn.com/tennis/match/_/gameId/${eventKey}`
     : undefined;
-}
-
-/** v6.0 — fair market price for the sniper capital-protection cover legs
- *  (Bug-2 parity fix: DIVIDE by the book overround — never multiply). */
-function fairPrice1(prob: number, margin: number): number {
-  return prob > 0.01 ? Math.round((1 / (prob * margin)) * 100) / 100 : 40;
-}
-
-/** v5.5 — 2-decimal clamp helper (sniper cover price windows). */
-function clamp1(p: number, lo: number, hi: number): number {
-  return Math.round(Math.max(lo, Math.min(hi, p)) * 100) / 100;
 }
 
 function baseItem(m: AnalyzedMatch): Omit<
@@ -1328,86 +1362,25 @@ function baseItem(m: AnalyzedMatch): Omit<
   };
 }
 
-/** The two complementary DUAL legs of an approved match (archetype-aware).
- *  v4.0 — Official Atomic Markets: each wing is ONE standard single-button
- *  bookmaker market; the 100-unit match budget is split by equal-profit
- *  dutching (stake ∝ 1/odds) so every outcome pays the same return.
- *  v5.5 — silver/adaptive crowns NO LONGER halve the stake: every card rides
- *  the full STANDARD_MATCH_STAKE = 100-unit budget. */
-function dualItemsOf(m: AnalyzedMatch): LineItem[] {
-  if (!m.slips.A || !m.slips.B) return [];
-  const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
-  const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
-  const { stakeA, stakeB } = dutchStakes(m.slips.A.odds, m.slips.B.odds);
-  return [
-    {
-      ...baseItem(m),
-      line: "DUAL",
-      leg: m.slips.A.leg,
-      desc: m.slips.A.text,
-      descEn: m.slips.A.textEn,
-      odds: m.slips.A.odds,
-      prob: m.slips.A.prob,
-      stake: Math.round(stakeA * 10) / 10,
-      stakePct: stakeA,
-      slipProbA: m.slips.A.prob,
-      slipProbB: m.slips.B.prob,
-      marketEn: m.slips.A.marketEn,
-      marketFa: m.slips.A.marketFa,
-      espnUrl: espnMatchUrl(m.eventKey),
-      targetWindow: m.slips.A.targetWindow,
-      meta: JSON.stringify({
-        kind: "dualA",
-        arch: m.archetype?.code,
-        archLabelFa: m.archetype?.labelFa,
-        archLabelEn: m.archetype?.labelEn,
-        archCoverage: m.archetype?.coverage,
-        archAdaptive: m.archetype?.adaptive,
-        favName,
-        marketEn: m.slips.A.marketEn,
-        stakePct: stakeA,
-        eventKey: m.eventKey,
-      }),
-    },
-    {
-      ...baseItem(m),
-      line: "DUAL",
-      leg: m.slips.B.leg,
-      desc: m.slips.B.text,
-      descEn: m.slips.B.textEn,
-      odds: m.slips.B.odds,
-      prob: m.slips.B.prob,
-      stake: Math.round(stakeB * 10) / 10,
-      stakePct: stakeB,
-      slipProbA: m.slips.A.prob,
-      slipProbB: m.slips.B.prob,
-      marketEn: m.slips.B.marketEn,
-      marketFa: m.slips.B.marketFa,
-      espnUrl: espnMatchUrl(m.eventKey),
-      targetWindow: m.slips.B.targetWindow,
-      meta: JSON.stringify({
-        kind: "dualB",
-        arch: m.archetype?.code,
-        favName,
-        dogName,
-        marketEn: m.slips.B.marketEn,
-        stakePct: stakeB,
-        eventKey: m.eventKey,
-      }),
-    },
-  ];
-}
-
 export function buildLines(analyzed: AnalyzedMatch[]) {
-  const dual: LineItem[] = [];
+  // ─── v7.0 · THREE PRODUCTION LINES (master-prompt v7.0 §2) ────────────────
+  // The dual-coverage strategy (two options inside ONE match) is RETIRED and
+  // the REGCOMBO / CLUSTER / SNIPER / COMBO-3 lines are delisted. Every card
+  // is now exactly ONE standard 100-unit stake on one of:
+  //   TAB 1 · 🔗 MIX-2  (2-leg precision parlay · total 1.80x–2.25x)
+  //   TAB 2 · 🎯 SINGLE (deep-value pick · 1.72x–2.15x · +6.5% EV edge)
+  //   TAB 3 · 🏦 BANKER (1.45x–1.65x) + 🔗 ACC-3 (2.70x–3.40x)
+  const dual: LineItem[] = []; // v7.0 — retired by construction (kept for payload compat)
   const banker: LineItem[] = [];
-  const regCombo: LineItem[] = [];
-  const cluster: LineItem[] = [];
+  const single: LineItem[] = [];
   const accumulator: LineItem[] = [];
+  const regCombo: LineItem[] = []; // v7.0 — delisted
+  const cluster: LineItem[] = []; // v7.0 — delisted
+  const sniper: LineItem[] = []; // v7.0 — delisted (replaced by the DEEP SINGLE line)
   const shadow: LineItem[] = [];
   const eligible = analyzed.filter((m) => m.state !== "post");
 
-  // ── v5.0 · 5-Regime dispatch — exactly ONE production card per match ─────
+  // ── v7.0 per-match dispatch — BANKER (Tab 3) + DEEP SINGLE (Tab 2) ────────
   for (const m of eligible) {
     const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
     const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
@@ -1418,116 +1391,67 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
       copula: m.copula,
       monteCarlo: m.monteCarlo,
     };
-    const stakeScale = 1; // v5.5 — the 100-unit law: silver cards no longer halve stakes
 
-    if (!m.veto.vetoed && m.slips.A && m.slips.B && m.dualEligible) {
-      dual.push(...dualItemsOf(m));
+    // 🏦 TAB 3 — SERVICE BANKER: live-locked 1xBet price, 100-unit stake
+    const regime = m.regime;
+    if (!m.veto.vetoed && regime && regime.code === "BANKER" && regime.price && regime.legCodes) {
+      banker.push({
+        ...baseItem(m),
+        line: "BANKER",
+        leg: regime.legCodes.main,
+        desc: regime.marketFa ?? regime.marketEn ?? "",
+        descEn: regime.marketEn ?? "",
+        odds: regime.price,
+        prob: regime.prob ?? m.favWinProb,
+        stake: STANDARD_MATCH_STAKE,
+        marketEn: regime.marketEn,
+        marketFa: regime.marketFa,
+        espnUrl: espnMatchUrl(m.eventKey),
+        targetWindow: regime.targetWindow ?? V7_WINDOWS.BANKER,
+        ...v5,
+        meta: JSON.stringify({
+          kind: "banker",
+          legCode: regime.legCodes.main,
+          favName,
+          eventKey: m.eventKey,
+          adaptive: regime.adaptive,
+        }),
+      });
     }
 
-    // ── v5.0 · regime production lines ─────────────────────────────────────
-    const regime = m.regime;
-    if (!m.veto.vetoed && regime && regime.code !== "VETOED") {
-      if (regime.code === "BANKER" && regime.price && regime.legCodes) {
-        banker.push({
+    // 🎯 TAB 2 — DEEP SINGLE: +6.5% probability edge over the LIVE board when
+    // a feed quote exists; formula-priced (5.5% margin) on feed-less days.
+    // Price live-locked inside 1.72x–2.15x, 100-unit stake.
+    if (!m.veto.vetoed && m.state !== "post") {
+      const deep = buildDeepSingle(m);
+      if (deep) {
+        single.push({
           ...baseItem(m),
-          line: "BANKER",
-          leg: regime.legCodes.main,
-          desc: regime.marketFa ?? regime.marketEn ?? "",
-          descEn: regime.marketEn ?? "",
-          odds: regime.price,
-          prob: regime.prob ?? m.favWinProb,
+          line: "SINGLE",
+          leg: deep.leg,
+          desc: deep.anchored
+            ? `${deep.textFa} — برتری احتمال +${(deep.edge * 100).toFixed(1)}%`
+            : `${deep.textFa} — قیمت فرمولی ۵.۵٪ (بدون فید زنده)` ,
+          descEn: deep.anchored
+            ? `${deep.marketEn} · +EV EDGE`
+            : `${deep.marketEn} · FORMULA-PRICED`,
+          odds: deep.odds,
+          prob: deep.prob,
           stake: STANDARD_MATCH_STAKE,
-          marketEn: regime.marketEn,
-          marketFa: regime.marketFa,
+          marketEn: deep.marketEn,
+          marketFa: deep.marketFa,
           espnUrl: espnMatchUrl(m.eventKey),
-          targetWindow: regime.targetWindow,
+          targetWindow: V7_WINDOWS.DEEP_SINGLE,
           ...v5,
           meta: JSON.stringify({
-            kind: "banker",
-            legCode: regime.legCodes.main,
-            favName,
-            eventKey: m.eventKey,
-            adaptive: regime.adaptive,
-          }),
-        });
-      }
-      if (regime.code === "COMBO" && regime.comboLegs && regime.legCodes) {
-        const legs = regime.comboLegs;
-        const { stakeA, stakeB } = dutchStakes(legs.mainPrice, legs.coverPrice);
-        const adaptive = !!regime.adaptive;
-        regCombo.push({
-          ...baseItem(m),
-          line: "REGCOMBO",
-          leg: regime.legCodes.main,
-          desc: legs.mainFa,
-          descEn: legs.mainEn,
-          odds: legs.mainPrice,
-          prob: legs.mainProb,
-          stake: Math.round(stakeA * 10) / 10,
-          marketEn: legs.mainEn,
-          marketFa: legs.mainFa,
-          espnUrl: espnMatchUrl(m.eventKey),
-          targetWindow: [1.85, 2.4],
-          ...v5,
-          meta: JSON.stringify({
-            kind: "regComboMain",
-            variant: regime.legCodes.main.endsWith("DOM") ? "DOM" : "SRV",
-            favName,
-            eventKey: m.eventKey,
-            adaptive,
-          }),
-        });
-        regCombo.push({
-          ...baseItem(m),
-          line: "REGCOMBO",
-          leg: regime.legCodes.cover ?? "RC-COVER",
-          desc: legs.coverFa,
-          descEn: legs.coverEn,
-          odds: legs.coverPrice,
-          prob: legs.coverProb,
-          stake: Math.round(stakeB * 10) / 10,
-          marketEn: legs.coverEn,
-          marketFa: legs.coverFa,
-          espnUrl: espnMatchUrl(m.eventKey),
-          targetWindow: [2.7, 3.3],
-          ...v5,
-          meta: JSON.stringify({
-            kind: "regComboCover",
-            variant: regime.legCodes.main.endsWith("DOM") ? "DOM" : "SRV",
+            kind: "single",
+            legCode: deep.leg,
             favName,
             dogName,
             eventKey: m.eventKey,
-            adaptive,
+            edge: Math.round(deep.edge * 1000) / 1000,
+            anchored: deep.anchored,
           }),
-        });
-      }
-      if (regime.code === "CLUSTER" && regime.scenarios) {
-        regime.scenarios.forEach((sc, i) => {
-          cluster.push({
-            ...baseItem(m),
-            line: "CLUSTER",
-            leg: `CLU-${i + 1}`,
-            desc: sc.descFa,
-            descEn: sc.descEn,
-            odds: sc.price,
-            prob: sc.prob,
-            stake: Math.round(sc.stake * 10) / 10,
-            marketEn: sc.descEn,
-            marketFa: sc.descFa,
-            espnUrl: espnMatchUrl(m.eventKey),
-            targetWindow: [2.8, 4.2],
-            ...v5,
-            meta: JSON.stringify({
-              kind: "cluster",
-              scenario: sc.label,
-              code: sc.code,
-              gamesLo: sc.gamesLo,
-              gamesHi: sc.gamesHi,
-              favName,
-              eventKey: m.eventKey,
-              adaptive: !!regime.adaptive,
-            }),
-          });
         });
       }
     }
@@ -1560,421 +1484,92 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
     }
   }
 
-  // ── v5.0 · SERVICE KINGS ACCUMULATOR (regime 5) — 2/3-fold parlays ──────
-  // Auto-combines the top BANKER-regime matches of the day (S_fav ≥ 0.72,
-  // Hold ≥ 85%, 10k MC ≥ 86%); when the BANKER pool is thin the proven
-  // v4.5 safe-anchor ladder (P_win ≥ 0.74 ∧ S_fav ≥ 0.66) backfills so the
-  // tab never goes empty. Windows: 2-fold ≈ 2.05–2.40 · 3-fold ≈ 2.90–3.80.
-  const approved = analyzed.filter(
-    (m) => !m.veto.vetoed && m.state !== "post" && m.favWinProb > 0.55
-  );
-  const anchorEligible = (m: AnalyzedMatch): boolean => {
-    if (m.veto.vetoed || m.state === "post") return false;
-    const sFav = m.favorite === "A" ? m.markov.setWinA : 1 - m.markov.setWinA;
-    return m.favWinProb >= 0.74 && sFav >= 0.66;
-  };
-  const bankerPool = analyzed
-    .filter((m) => m.regime?.code === "BANKER" && m.state !== "post")
-    .sort((a, b) => (b.mc?.bankerProb ?? 0) - (a.mc?.bankerProb ?? 0));
-  const anchorPool = bankerPool.length >= 2
-    ? bankerPool
-    : [...bankerPool, ...analyzed.filter((m) => !bankerPool.includes(m) && anchorEligible(m))]
-        .sort((a, b) => (b.mc?.bankerProb ?? b.favWinProb) - (a.mc?.bankerProb ?? a.favWinProb));
-  const byStrength = anchorPool;
+  // ── v7.0 · 🔗 TAB 1 — MIX-2 LEGS (1.80x–2.25x) + 🏦 3-FOLD ACCA ──────────
+  // Every leg is ONE official 1-click market (Favorite +1.5 Sets / Match
+  // Winner / Total Games Over 19.5) live-locked inside 1.34x–1.50x from a
+  // DIFFERENT match; the pair product must land inside 1.80x–2.25x. The ACCA
+  // combines the day's strongest real-priced bankers into the 2.70x–3.40x
+  // 3-fold slip. No clamps anywhere — slips that miss the contract are simply
+  // not issued (honest by construction).
+  const mixPool = eligible
+    .map((m) => ({ m, leg: buildMix2Leg(m) }))
+    .filter((x): x is { m: AnalyzedMatch; leg: NonNullable<ReturnType<typeof buildMix2Leg>> } => !!x.leg)
+    .sort((a, b) => b.leg.prob - a.leg.prob);
+
   const combo2: LineItem[] = [];
   const combo3: LineItem[] = [];
-
-  const makeCombo = (legs: AnalyzedMatch[], legTag: string): LineItem | null => {
-    if (legs.length < 2) return null;
-    let prob = 1;
-    let odds = 1;
-    // v4.5 — the settlement contract: explicit side + market per leg (no more
-    // fuzzy name matching at settle time)
-    const favorites: {
-      name: string;
-      eventKey: string;
-      side: "A" | "B";
-      market: "HANDICAP" | "WINNER";
-    }[] = [];
-    // each base of the parlay is the OFFICIAL single-button market listed
-    // leg-by-leg on the slip card
-    const legRows: MixLeg[] = [];
-    for (const l of legs) {
-      const fav = l.favorite === "A" ? l.playerA.name : l.playerB.name;
-      const dog = l.favorite === "A" ? l.playerB.name : l.playerA.name;
-      // v4.5 — per-leg market: the +1.5 SETS handicap (favorite wins at
-      // least ONE set) when its probability is ≥ 91%, otherwise the plain
-      // Match Winner button. Both price into the 1.43x–1.55x anchor band.
-      const pFavLose02 = l.favorite === "A" ? l.markov.p02 : l.markov.p20;
-      const pFavPlus15 = 1 - pFavLose02;
-      const useHandicap = pFavPlus15 >= 0.91;
-      const legProb = useHandicap ? pFavPlus15 : l.favWinProb;
-      const legOdds = anchorLegOdds(legProb);
-      prob *= legProb;
-      odds *= legOdds;
-      favorites.push({
-        name: fav,
-        eventKey: l.eventKey,
-        side: l.favorite,
-        market: useHandicap ? "HANDICAP" : "WINNER",
-      });
-      legRows.push({
-        favName: fav,
-        dogName: dog,
-        favShort: l.favorite === "A" ? l.playerA.shortName : l.playerB.shortName,
-        dogShort: l.favorite === "A" ? l.playerB.shortName : l.playerA.shortName,
-        tournament: l.tournament,
-        round: l.round,
-        tour: l.tour,
-        surface: l.surface,
-        startTime: l.startTime,
-        marketEn: useHandicap
-          ? `SET HANDICAP — ${fav.toUpperCase()} +1.5 SETS`
-          : `MATCH WINNER — ${fav.toUpperCase()}`,
-        marketFa: useHandicap
-          ? `هندیکپ ست: ${fav} +۱.۵ ست — برد حداقل یک ست`
-          : `برد مسابقه: ${fav}`,
-        odds: legOdds,
-        eventKey: l.eventKey,
-      });
+  const usedMix = new Set<string>();
+  for (let i = 0; i < mixPool.length; i++) {
+    if (usedMix.has(mixPool[i].m.eventKey)) continue;
+    let matched: MixLegSource | null = null;
+    for (let j = i + 1; j < mixPool.length; j++) {
+      if (usedMix.has(mixPool[j].m.eventKey)) continue;
+      if (mixPool[j].m.eventKey === mixPool[i].m.eventKey) continue;
+      const total = Math.round(mixPool[i].leg.odds * mixPool[j].leg.odds * 100) / 100;
+      if (total >= V7_WINDOWS.MIX2_TOTAL[0] && total <= V7_WINDOWS.MIX2_TOTAL[1]) {
+        matched = mixPool[j];
+        break;
+      }
     }
-    const size = legs.length;
-    const marketEn = legRows.map((r) => r.marketEn).join(" + ");
-    return {
-      ...baseItem(legs[0]),
-      line: "COMBO",
-      leg: legTag,
-      desc: `برگه میکس رسمی ${size === 3 ? "۳" : "۲"} تایی — برد مسابقه: ${legRows.map((r) => r.favName).join(" × ")}`,
-      descEn: marketEn,
-      odds: Math.round(odds * 100) / 100,
-      prob,
-      stake: STANDARD_MATCH_STAKE,
-      timing: legs[0].timing,
-      marketEn,
-      marketFa: `برگه میکس رسمی ${size} تایی — برد مسابقه (Match Winner) برای ${legRows.map((r) => r.favName).join("، ")}`,
-      legs: legRows,
-      meta: JSON.stringify({ kind: "combo", favorites, size }),
-    };
-  };
-
-  // all 2-leg & 3-leg candidates over sliding windows (distinct leg sets)
-  const seenSig = new Set<string>();
-  const candidates2: LineItem[] = [];
-  const candidates3: LineItem[] = [];
-  for (let i = 0; i + 2 <= byStrength.length; i++) {
-    for (const [tag, size, bucket] of [
-      ["COMBO-2", 2, candidates2],
-      ["COMBO-3", 3, candidates3],
-    ] as const) {
-      const legs = byStrength.slice(i, i + size);
-      if (legs.length < size) continue;
-      const c = makeCombo(legs, tag);
-      if (!c) continue;
-      const sig = `${tag}:${c.descEn}`;
-      if (seenSig.has(sig)) continue;
-      seenSig.add(sig);
-      bucket.push(c);
+    if (matched) {
+      const item = mix2ItemOf(mixPool[i], matched);
+      if (item) {
+        combo2.push(item);
+        usedMix.add(mixPool[i].m.eventKey);
+        usedMix.add(matched.m.eventKey);
+      }
     }
-  }
-  const inWindow = (c: LineItem, lo: number, hi: number) => c.odds >= lo && c.odds <= hi;
-  const distTo = (c: LineItem, lo: number, hi: number) =>
-    c.odds < lo ? lo - c.odds : c.odds > hi ? c.odds - hi : 0;
-  // v4.5 — per-tag primary window: 2.05x–2.40x for 2-leg, 2.90x–3.80x for 3-leg
-  const comboWindow = (c: LineItem): [number, number] =>
-    c.leg === "COMBO-3" ? [COMBO3_MIN_ODDS, COMBO3_MAX_ODDS] : [COMBO2_MIN_ODDS, COMBO2_MAX_ODDS];
-
-  // primary window fill — keep the strongest (lowest-odds) anchor slips first
-  for (const c of [...candidates2].sort((a, b) => a.odds - b.odds)) {
-    if (combo2.length >= 2) break;
-    const [lo, hi] = comboWindow(c);
-    if (inWindow(c, lo, hi)) combo2.push(c);
-  }
-  for (const c of [...candidates3].sort((a, b) => a.odds - b.odds)) {
-    if (combo3.length >= 2) break;
-    const [lo, hi] = comboWindow(c);
-    if (inWindow(c, lo, hi)) combo3.push(c);
-  }
-  // guarantee — fill up to 4 total from the per-tag fallback band
-  if (combo2.length + combo3.length < COMBO_GUARANTEE) {
-    const pool = [...candidates2, ...candidates3]
-      .filter((c) => !combo2.includes(c) && !combo3.includes(c))
-      .filter((c) => {
-        const [flo, fhi] = c.leg === "COMBO-3" ? COMBO_FALLBACK3 : COMBO_FALLBACK2;
-        return inWindow(c, flo, fhi);
-      })
-      .sort((a, b) => {
-        const [alo, ahi] = comboWindow(a);
-        const [blo, bhi] = comboWindow(b);
-        return distTo(a, alo, ahi) - distTo(b, blo, bhi);
-      });
-    for (const c of pool) {
-      if (combo2.length + combo3.length >= COMBO_GUARANTEE) break;
-      (candidates2.includes(c) && combo2.length < 3 ? combo2 : combo3).push(c);
-    }
+    if (combo2.length >= 4) break; // the day's four strongest mix slips
   }
 
-  // ── v5.0 · 🔗 SERVICE KINGS ACCUMULATOR (2-fold ~2.15x / 3-fold ~3.40x) ───
-  // Auto-combines the 2-3 strongest TENNIS BANKER matches of the same day.
-  // Every base rides its own BANKER market price (MATCH WINNER or SET
-  // HANDICAP −1.5) with an explicit settlement contract (side + market).
+  // 🏦 TAB 3 — 3-FOLD ACCA over the day's strongest service-king legs
+  // (BANKER-regime matches first, then the strongest mix legs — the same
+  // official 1-click markets). The honest product of the three REAL prices
+  // must land inside the printed 2.70x–3.40x contract; otherwise no slip.
   const bankerRanked = analyzed
     .filter(
       (m) =>
-        !m.veto.vetoed &&
         m.state !== "post" &&
+        !m.veto.vetoed &&
         m.regime?.code === "BANKER" &&
         !!m.regime.price &&
         !m.regime.adaptive // adaptive (SILVER) bankers never anchor parlays
     )
-    .sort((a, b) => b.favWinProb - a.favWinProb);
-
-  const makeAccumulator = (legs: AnalyzedMatch[], legTag: string): LineItem | null => {
-    if (legs.length < 2) return null;
-    let prob = 1;
-    let odds = 1;
-    const favorites: {
-      name: string;
-      eventKey: string;
-      side: "A" | "B";
-      market: "WINNER" | "HANDICAP" | "HANDICAP15";
-    }[] = [];
-    const legRows: MixLeg[] = [];
-    for (const l of legs) {
-      const fav = l.favorite === "A" ? l.playerA.name : l.playerB.name;
-      const dog = l.favorite === "A" ? l.playerB.name : l.playerA.name;
-      const regime = l.regime!;
-      const isWinMarket = regime.legCodes?.main === "BNK-WIN";
-      const legOdds = Math.max(1.3, Math.min(1.7, regime.price ?? 1.45));
-      const legProb = regime.prob ?? l.favWinProb;
-      prob *= legProb;
-      odds *= legOdds;
-      favorites.push({
-        name: fav,
-        eventKey: l.eventKey,
-        side: l.favorite,
-        market: isWinMarket ? "WINNER" : "HANDICAP15",
-      });
-      legRows.push({
-        favName: fav,
-        dogName: dog,
-        favShort: l.favorite === "A" ? l.playerA.shortName : l.playerB.shortName,
-        dogShort: l.favorite === "A" ? l.playerB.shortName : l.playerA.shortName,
-        tournament: l.tournament,
-        round: l.round,
-        tour: l.tour,
-        surface: l.surface,
-        startTime: l.startTime,
-        marketEn: isWinMarket
-          ? `MATCH WINNER — ${fav.toUpperCase()}`
-          : `SET HANDICAP — ${fav.toUpperCase()} −1.5 SETS`,
-        marketFa: isWinMarket
-          ? `برد مسابقه: ${fav}`
-          : `هندیکپ ست: ${fav} ۲-۰`,
-        odds: legOdds,
-        eventKey: l.eventKey,
-      });
-    }
-    const size = legs.length;
-    const marketEn = legRows.map((r) => r.marketEn).join(" + ");
-    return {
-      ...baseItem(legs[0]),
-      line: "ACCUMULATOR",
-      leg: legTag,
-      desc: `آکومولاتور سلاطین سرویس ${size === 3 ? "۳" : "۲"} تایی — ${legRows.map((r) => r.favName).join(" × ")}`,
-      descEn: `SERVICE KINGS ${size}-FOLD — ${marketEn}`,
-      odds: Math.round(odds * 100) / 100,
-      prob,
-      stake: STANDARD_MATCH_STAKE,
-      timing: legs[0].timing,
-      marketEn,
-      marketFa: `آکومولاتور ${size} تایی سلاطین سرویس — ${legRows.map((r) => r.favName).join("، ")}`,
-      legs: legRows,
-      meta: JSON.stringify({ kind: "combo", favorites, size }),
-    };
-  };
-
-  const acc2 = makeAccumulator(bankerRanked.slice(0, 2), "ACC-2");
-  const acc3 = makeAccumulator(bankerRanked.slice(0, 3), "ACC-3");
-  // v5.5 — the 5-regime law: the ACCUMULATOR row must never stay empty. When
-  // the natural BANKER pool is thinner than 2 legs, the proven safe-anchor
-  // ladder (P_win ≥ 0.74 ∧ S_fav ≥ 0.66) backfills the remaining bases so
-  // the day-level parlay card exists on every full card.
-  let accPool = bankerRanked;
-  if (!acc2) {
-    const backfill = analyzed.filter(
-      (m) =>
-        !bankerRanked.includes(m) &&
-        !m.veto.vetoed &&
-        m.state !== "post" &&
-        anchorEligible(m)
-    );
-    if (backfill.length > 0) {
-      accPool = [...bankerRanked, ...backfill].sort(
-        (a, b) => (b.mc?.bankerProb ?? b.favWinProb) - (a.mc?.bankerProb ?? a.favWinProb)
-      );
-    }
-  }
-  const acc2b = acc2 ?? makeAccumulator(accPool.slice(0, 2), "ACC-2");
-  const acc3b = acc3 ?? makeAccumulator(accPool.slice(0, 3), "ACC-3");
-  if (acc2b) accumulator.push(acc2b);
-  if (acc3b) accumulator.push(acc3b);
-
-  // ── v5.5 · Tab-3 SNIPER — packaged main + capital-protection cover ───────
-  // Master prompt §2 (anti-bleed law): the high-odds sniper line (-15.97u in
-  // 7 days on 1u/2u naked longshots) now fires ONLY when the exotic main —
-  // «SET BETTING — FAVORITE WINS 2-1» (primary) or «TOTAL SETS — OVER 2.5
-  // SETS» (fallback) — still carries a ≥ 14% copula expected-value edge over
-  // the ρ = 0 bookmaker baseline, AND is packaged WITH a capital-protection
-  // cover leg (FAV +1.5 SETS / MATCH WINNER — FAVORITE). The 100-unit match
-  // budget is dutched between main + cover (stakeMain + stakeCover = 100) so
-  // NO ledger row can ever carry a 1u or 2u stake again. The underdog
-  // comeback / dog-2-0 longshots of v5.0 are delisted by construction.
-  const sniper: LineItem[] = [];
-  const SNIPER_MIN_EV = 0.14;
-  interface SnipeMain {
-    key: string;
-    desc: string;
-    descEn: string;
-    marketEn: string;
-    model: number;
-    naive: number;
-    priceLo: number;
-    priceHi: number;
-    coverKind: "favPlus15" | "favWin";
-    coverProb: number;
-    coverMarketEn: string;
-    coverMarketFa: string;
-    coverPrice: number;
-    ev: number;
-    price: number;
-  }
-  const sniperPairs: { main: LineItem; cover: LineItem }[] = [];
-  for (const m of approved) {
-    const mc = m.monteCarlo;
-    if (!mc) continue;
-    const fav = m.favorite;
-    const favIsA = fav === "A";
-    const favName = favIsA ? m.playerA.name : m.playerB.name;
-    const dogName = favIsA ? m.playerB.name : m.playerA.name;
-    // ρ = 0 independent baseline — the naive bookmaker pricing model
-    const indep = bo3Outcomes(m.markov.setWinA);
-    const pFavWinMc = favIsA ? mc.outcomes.p20 + mc.outcomes.p21 : mc.outcomes.p12 + mc.outcomes.p02;
-    const pFavPlus15 = favIsA ? 1 - mc.outcomes.p02 : 1 - mc.outcomes.p20;
-    const buildMains: Omit<SnipeMain, "ev" | "price">[] = [
-      {
-        key: "fav21",
-        desc: `نتیجه دقیق ست‌ها: برد ۲-۱ فاوریت ${favName} (Set Betting: Favorite Wins 2-1)`,
-        descEn: `SET BETTING — ${favName.toUpperCase()} WINS 2-1`,
-        marketEn: "SET BETTING — FAVORITE WINS 2-1",
-        model: favIsA ? mc.outcomes.p21 : mc.outcomes.p12,
-        naive: favIsA ? indep.p21 : indep.p12,
-        priceLo: 3.2,
-        priceHi: 4.8,
-        coverKind: "favPlus15",
-        coverProb: Math.max(0.5, pFavPlus15),
-        coverMarketEn: `SET HANDICAP — ${favName.toUpperCase()} +1.5 SETS`,
-        coverMarketFa: `هندیکپ ست: ${favName} +۱.۵ ست — پوشش اصل سرمایه`,
-        coverPrice: clamp1(Math.max(1.08, fairPrice1(Math.max(0.5, pFavPlus15), 1.06)), 1.08, 1.32),
-      },
-      {
-        key: "set3",
-        desc: `مجموع ست‌های بازی: بالای ۲.۵ ست (Total Sets: Over 2.5 Sets)`,
-        descEn: `TOTAL SETS — OVER 2.5 SETS (${m.playerA.shortName} × ${m.playerB.shortName})`,
-        marketEn: "TOTAL SETS — OVER 2.5 SETS",
-        model: mc.outcomes.p21 + mc.outcomes.p12,
-        naive: indep.p21 + indep.p12,
-        priceLo: 2.3,
-        priceHi: 4.8,
-        coverKind: "favWin",
-        coverProb: Math.max(0.5, pFavWinMc),
-        coverMarketEn: `MATCH WINNER — ${favName.toUpperCase()}`,
-        coverMarketFa: `برد مسابقه: ${favName} — پوشش اصل سرمایه`,
-        coverPrice: clamp1(Math.max(1.08, fairPrice1(Math.max(0.5, pFavWinMc), 1.06)), 1.08, 1.45),
-      },
-    ];
-    // priority order — Favorite Wins 2-1 first (master prompt §2), then the
-    // total-sets fallback; the FIRST main that passes the +EV gate wins
-    const winMain = buildMains
-      .map((c) => {
-        if (c.model <= 0.02 || c.naive <= 0.02) return null;
-        const price = Math.round((1 / c.naive) * BOOK_MARGIN_SNIPER * 100) / 100;
-        const ev = c.model * price - 1;
-        if (ev < SNIPER_MIN_EV) return null; // copula +EV gate
-        if (price < c.priceLo || price > c.priceHi) return null;
-        return { ...c, ev, price } as SnipeMain;
-      })
-      .find((c): c is SnipeMain => !!c);
-    if (!winMain) continue;
-    const { stakeA: stakeMain, stakeB: stakeCover } = dutchStakes(winMain.price, winMain.coverPrice);
-    sniperPairs.push({
-      main: {
-        ...baseItem(m),
-        line: "SNIPER",
-        leg: "SNIPER-MAIN",
-        desc: `${winMain.desc} — +EV ${(winMain.ev * 100).toFixed(1)}%`,
-        descEn: winMain.descEn,
-        odds: winMain.price,
-        prob: winMain.model,
-        stake: stakeMain,
-        marketEn: winMain.marketEn,
-        marketFa: winMain.desc,
-        espnUrl: espnMatchUrl(m.eventKey),
-        regime: m.regime,
-        crown: m.crown,
-        pipeline: m.pipeline,
-        copula: m.copula,
-        monteCarlo: m.monteCarlo,
-        meta: JSON.stringify({
-          kind: "sniper",
-          snipeKind: winMain.key,
-          favName,
-          eventKey: m.eventKey,
-          ev: Math.round(winMain.ev * 1000) / 1000,
-        }),
-      },
-      cover: {
-        ...baseItem(m),
-        line: "SNIPER",
-        leg: "SNIPER-COVER",
-        desc: `${winMain.coverMarketFa} (پوشش تیپ ${winMain.key === "fav21" ? "برد ۲-۱ فاوریت" : "بالای ۲.۵ ست"})`,
-        descEn: `${winMain.coverMarketEn} — CAPITAL PROTECTION`,
-        odds: winMain.coverPrice,
-        prob: winMain.coverProb,
-        stake: stakeCover,
-        marketEn: `${winMain.coverMarketEn} · COVER`,
-        marketFa: winMain.coverMarketFa,
-        espnUrl: espnMatchUrl(m.eventKey),
-        regime: m.regime,
-        crown: m.crown,
-        pipeline: m.pipeline,
-        copula: m.copula,
-        monteCarlo: m.monteCarlo,
-        meta: JSON.stringify({
-          kind: "sniper",
-          snipeKind: winMain.coverKind,
-          favName,
-          dogName,
-          eventKey: m.eventKey,
-          coverFor: winMain.key,
-        }),
-      },
-    });
-  }
-  // most +EV first, ≤ 1 packaged position per match, ≤ SNIPER_GUARANTEE cards
-  sniperPairs.sort((a, b) => {
-    const evOf = (x: { main: LineItem }) => {
-      try {
-        return (JSON.parse(x.main.meta ?? "{}") as { ev?: number }).ev ?? 0;
-      } catch {
-        return 0;
+    .sort((a, b) => (b.mc?.bankerProb ?? b.favWinProb) - (a.mc?.bankerProb ?? a.favWinProb));
+  const accaSources: MixLegSource[] = [
+    ...bankerRanked.map((m) => ({ m, leg: buildMix2Leg(m) })).filter(
+      (x): x is MixLegSource => !!x.leg
+    ),
+    ...mixPool,
+  ];
+  const seenAcca = new Set<string>();
+  const accaCands = accaSources
+    .filter((x) => {
+      if (seenAcca.has(x.m.eventKey)) return false;
+      seenAcca.add(x.m.eventKey);
+      return true;
+    })
+    .sort((a, b) => b.leg.prob - a.leg.prob)
+    .slice(0, 10);
+  let acc3: LineItem | null = null;
+  let acc3Prob = -1;
+  for (let a = 0; a < accaCands.length; a++) {
+    for (let b = a + 1; b < accaCands.length; b++) {
+      for (let c = b + 1; c < accaCands.length; c++) {
+        const trio = [accaCands[a], accaCands[b], accaCands[c]];
+        const total =
+          Math.round(trio.reduce((s, x) => s * x.leg.odds, 1) * 100) / 100;
+        if (total < V7_WINDOWS.ACCA3[0] || total > V7_WINDOWS.ACCA3[1]) continue;
+        const joint = trio.reduce((s, x) => s * x.leg.prob, 1);
+        if (joint > acc3Prob) {
+          acc3Prob = joint;
+          acc3 = accaItemOf(trio, "ACC-3", total);
+        }
       }
-    };
-    return evOf(b) - evOf(a);
-  });
-  for (const pair of sniperPairs.slice(0, SNIPER_GUARANTEE)) {
-    sniper.push(pair.main, pair.cover);
+    }
   }
-  sniper.sort((a, b) => b.odds - a.odds);
+  if (acc3) accumulator.push(acc3);
+
   // v2.0 dedupe — no pick list may contain the same (match, line, leg) twice
   const dedupe = (items: LineItem[]) =>
     dedupeByKey(items, (i) => `${i.matchId}|${i.line}|${i.leg}`);
@@ -1982,6 +1577,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
   return {
     dual: dedupe(dual),
     banker: dedupe(banker),
+    single: dedupe(single),
     regCombo: dedupe(regCombo),
     cluster: dedupe(cluster),
     accumulator: dedupe(accumulator),

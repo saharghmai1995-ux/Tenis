@@ -8,6 +8,7 @@ export type ResultCode = "2-0" | "2-1" | "1-2" | "0-2";
 export type ProductionLine =
   | "DUAL"
   | "BANKER"
+  | "SINGLE"
   | "REGCOMBO"
   | "CLUSTER"
   | "ACCUMULATOR"
@@ -242,7 +243,8 @@ export interface MarketOdds {
   probB: number;
   oddsA: number;
   oddsB: number;
-  source: "polymarket";
+  /** v7.0 — the live feed is Polymarket Gamma + ESPN Core Odds */
+  source: "polymarket" | "espn-core";
   eventTitle: string;
   volume?: number;
 }
@@ -633,6 +635,8 @@ export interface BankAudit {
   comboProfit: number;
   clusterProfit: number;
   bankerProfit: number;
+  /** v7.0 — 🎯 DEEP SINGLE line, explicit audit equation term */
+  singleProfit: number;
   /** v5.6 — copula-combo+cover line, explicit audit equation term */
   regComboProfit: number;
   sniperProfit: number;
@@ -656,9 +660,12 @@ export interface FeedPayload {
   lines: {
     dual: LineItem[];
     banker: LineItem[];
+    /** v7.0 Tab 2 — 🎯 DEEP SINGLE (1.72x–2.15x · +6.5% EV edge) */
+    single: LineItem[];
     regCombo: LineItem[];
     cluster: LineItem[];
     accumulator: LineItem[];
+    /** v7.0 Tab 1 — 🔗 MIX-2 2-leg precision parlay (1.80x–2.25x) */
     combo2: LineItem[];
     combo3: LineItem[];
     sniper: LineItem[];

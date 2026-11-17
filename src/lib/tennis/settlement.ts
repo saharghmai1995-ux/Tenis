@@ -29,8 +29,8 @@ interface ComboFavorite {
   eventKey: string;
   /** v4.5 — explicit side stored at build time ("A" = playerA of that leg) */
   side?: "A" | "B";
-  /** v4.5/v5.0 — leg market: SET HANDICAP ±1.5 SETS or MATCH WINNER */
-  market?: "HANDICAP" | "WINNER" | "HANDICAP15";
+  /** v4.5/v5.0 — leg market: SET HANDICAP ±1.5 SETS, MATCH WINNER, or v7.0 OVER19.5 games */
+  market?: "HANDICAP" | "WINNER" | "HANDICAP15" | "OVER195";
 }
 
 interface PickMeta {
@@ -147,6 +147,39 @@ function settlePick(
   }
   const side = favSide(match.playerA, match.playerB, meta.favName);
   const profitOf = (won: boolean) => (won ? (pick.odds - 1) * pick.stake : -pick.stake);
+
+  // ─── v7.0 · 🎯 DEEP SINGLE — one 100-unit single market per match ────────
+  // Tab-2 settlement contract: SB-F20 (favorite swept 2-0) · GH-F35 (game
+  // margin ≥ 4) · TG-O215 / TG-O225 (total games) · RC-FWU215 (fav win &
+  // under 21.5 games). Win = +stake×(odds−1), loss = −stake exactly.
+  if (pick.line === "SINGLE") {
+    const favWonMatch =
+      side === "A"
+        ? result.setsA > result.setsB
+        : side === "B"
+          ? result.setsB > result.setsA
+          : false;
+    const favWon20 =
+      side === "A" ? result.code === "2-0" : side === "B" ? result.code === "0-2" : false;
+    const favMargin =
+      side === "A" ? result.gamesA - result.gamesB : side === "B" ? result.gamesB - result.gamesA : 0;
+    switch (pick.leg) {
+      case "SB-F20":
+        return { status: favWon20 ? "WON" : "LOST", profit: profitOf(favWon20) };
+      case "GH-F35":
+        return { status: favWonMatch && favMargin >= 4 ? "WON" : "LOST", profit: profitOf(favWonMatch && favMargin >= 4) };
+      case "TG-O215":
+        return { status: result.totalGames >= 22 ? "WON" : "LOST", profit: profitOf(result.totalGames >= 22) };
+      case "TG-O225":
+        return { status: result.totalGames >= 23 ? "WON" : "LOST", profit: profitOf(result.totalGames >= 23) };
+      case "TG-O235":
+        return { status: result.totalGames >= 24 ? "WON" : "LOST", profit: profitOf(result.totalGames >= 24) };
+      case "RC-FWU215":
+        return { status: favWonMatch && result.totalGames <= 21 ? "WON" : "LOST", profit: profitOf(favWonMatch && result.totalGames <= 21) };
+      default:
+        return { status: "VOID", profit: 0 };
+    }
+  }
 
   if (pick.line === "DUAL" || pick.line === "SHADOW") {
     const favWonMatch =
@@ -650,7 +683,9 @@ export async function runSettlement(windowDays = 7): Promise<{
             ? favSets >= 1
             : f.market === "HANDICAP15"
               ? favSets === 2 // SET HANDICAP −1.5 SETS = the favorite swept 2-0
-              : favSets > oppSets;
+              : f.market === "OVER195"
+                ? result.totalGames >= 20 // v7.0 — TOTAL GAMES OVER 19.5
+                : favSets > oppSets;
         if (!legWon) {
           allWon = false;
           break;

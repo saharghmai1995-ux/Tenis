@@ -102,32 +102,69 @@ function parseCron(expr: string): Cron {
 }
 
 function cronMatches(c: Cron, f: ReturnType<typeof tehranFields>): boolean {
+  // v7.0 fix — standard Vixie cron dom/dow semantics (the old `wildcard ||`
+  // branch made «0 0 22 * * 5» fire EVERY day because a wildcard dom matched
+  // everything before the OR). When one day field is restricted it alone
+  // decides; when BOTH are restricted Vixie cron ORs them.
+  const dayOk =
+    c.dom.wildcard && c.dow.wildcard
+      ? true
+      : c.dom.wildcard
+        ? c.dow.any.has(f.dow)
+        : c.dow.wildcard
+          ? c.dom.any.has(f.dom)
+          : c.dom.any.has(f.dom) || c.dow.any.has(f.dow);
   return (
     c.sec.any.has(f.s) &&
     c.min.any.has(f.min) &&
     c.hour.any.has(f.h) &&
     c.mon.any.has(f.mon) &&
-    (c.dom.wildcard || c.dow.wildcard
-      ? c.dom.any.has(f.dom) || c.dow.any.has(f.dow)
-      : c.dom.any.has(f.dom) && c.dow.any.has(f.dow))
+    dayOk
   );
 }
 
-/** next run strictly after `after` (ms epoch) for a Tehran-anchored cron */
+/** Tehran fixed offset (UTC+03:30 — no DST since 2022). */
+const TEHRAN_OFFSET_MS = 210 * 60_000;
+
+/** day-level dom/mon/dow gate (shared by cronMatches + nextCronRun) */
+function cronDayOk(
+  c: Cron,
+  day: { dom: number; mon: number; dow: number }
+): boolean {
+  const dayOk =
+    c.dom.wildcard && c.dow.wildcard
+      ? true
+      : c.dom.wildcard
+        ? c.dow.any.has(day.dow)
+        : c.dow.wildcard
+          ? c.dom.any.has(day.dom)
+          : c.dom.any.has(day.dom) || c.dow.any.has(day.dow);
+  return dayOk && c.mon.any.has(day.mon);
+}
+
+/** next run strictly after `after` (ms epoch) for a Tehran-anchored cron.
+ *  v7.0 — 10-day candidate scan so WEEKLY crons («* * 5» = Friday) compute
+ *  their true next run instead of falling back to the 60s polling drift. */
 export function nextCronRun(expr: string, after = Date.now()): number {
   const c = parseCron(expr);
-  // iterate the next 2 days at second resolution starting from `after + 1s`
-  let t = after + 1000;
-  const limit = after + 2 * 86_400_000;
-  while (t <= limit) {
-    if (cronMatches(c, tehranFields(t))) return t;
-    // jump smartly: skip to next minute boundary when seconds won't match soon
-    const f = tehranFields(t);
-    if (!c.hour.any.has(f.h) || !c.min.any.has(f.min)) {
-      t += (59 - f.s) * 1000 + 1000; // finish current minute
-      if (!c.hour.any.has(f.h)) t += (59 - f.min) * 60_000; // finish current hour
-    } else {
-      t += 1000;
+  const start = after + 1000;
+  const f0 = tehranFields(start);
+  const hours = [...c.hour.any].sort((a, b) => a - b);
+  const mins = [...c.min.any].sort((a, b) => a - b);
+  const secs = [...c.sec.any].sort((a, b) => a - b);
+  for (let d = 0; d < 10; d++) {
+    // Tehran midnight of the candidate day (Date.UTC rolls month overflow)
+    const midnightUtc = Date.UTC(f0.y, f0.mon - 1, f0.dom + d) - TEHRAN_OFFSET_MS;
+    const day = tehranFields(midnightUtc + 12 * 3_600_000);
+    if (!cronDayOk(c, { dom: day.dom, mon: day.mon, dow: day.dow })) continue;
+    for (const h of hours) {
+      for (const m of mins) {
+        for (const s of secs) {
+          const t = midnightUtc + (h * 3600 + m * 60 + s) * 1000;
+          if (t <= start) continue;
+          return t;
+        }
+      }
     }
   }
   return after + 60_000;
@@ -801,11 +838,15 @@ async function postNews(jobId: JobId): Promise<PostOutcome> {
   const radar = await fetchTennisRadar();
   const fresh = radar.news.find((i) => !store.hasNews(i.id)) ?? radar.news[0];
   if (!fresh) return { status: "SKIPPED", error: "no tennis news available" };
-  if (!store.hasNews(fresh.id)) store.markNews(fresh.id);
   const tr = await cap.translateNewsToPersian(fresh.headline, fresh.description);
   const png = await render(newsRequest(fresh, radar.live, radar.fitness));
   const caption = cap.captionNews(fresh, tr, radar.live, radar.fitness);
-  return deliver(jobId, "public", "NEWS", caption, png);
+  const out = await deliver(jobId, "public", "NEWS", caption, png);
+  // v7.0 fix — the story is marked seen ONLY after a confirmed delivery so a
+  // failed send retries the same headline on the next scheduled run instead
+  // of silently burning it.
+  if (out.status === "SENT" || out.status === "DRY-RUN") store.markNews(fresh.id);
+  return out;
 }
 
 async function postAcademy(jobId: JobId): Promise<PostOutcome> {
@@ -901,6 +942,13 @@ export function startScheduler(): void {
  *  bug captured the PUBLIC channel as VIP whenever publicChatId was numeric,
  *  because `publicChatId.includes(username)` can never match a numeric id). */
 async function discoverVipLoop(): Promise<void> {
+  // v7.0 hygiene — purge the stale kv residue of the OLD discovery bug (a
+  // vipChatId kv holding the PUBLIC channel id); env config always wins.
+  const staleVip = store.kvGet("vipChatId");
+  if (staleVip && String(staleVip) === String(CONFIG.publicChatId)) {
+    store.kvDelete("vipChatId");
+    console.log("[discover] purged stale vipChatId kv (was the PUBLIC channel id)");
+  }
   if (CONFIG.vipChatId) {
     // explicit director config wins — keep the title fresh, never the id
     try {

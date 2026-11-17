@@ -1,0 +1,1034 @@
+     1→// ─── Telegram Supervisor Agent — Scheduler & Job Handlers ──────────────────
+     2→// Asia/Tehran cron engine (fixed +03:30 since Iran abolished DST in 2022 —
+     3→// verified via Intl tz database at runtime). Every job: build 16-Bit poster →
+     4→// build FULL Persian caption → render → post (or dry-run log). All core
+     5→// logic is browser-independent; the engine feed is warmed server-side.
+     6→
+     7→import { CONFIG, JOB_SPECS } from "./config";
+     8→import { store } from "./store";
+     9→import { telegram, meCached, refreshMe } from "./telegram";
+    10→import { dataHub, LEG_DETAIL_EN, stakeLabelEn } from "./data";
+    11→import type { CardMatch } from "./data";
+    12→import { fetchTennisRadar, peekRadar, type TennisNewsItem, type LiveTennisMatch, type FitnessItem } from "./espn";
+    13→import type { PosterLiveRow, PosterFitnessRow } from "./types";
+    14→import { ACADEMY } from "./academy";
+    15→import * as cap from "./captions";
+    16→import { PROGRAM, targetEn } from "./program";
+    17→import { renderPoster } from "./poster/engine";
+    18→import { registerFonts } from "./poster/engine";
+    19→import type { JobId, JobRunState, JobSpec, PosterRequest, AgentStatus, PosterKind, ProgramEntry } from "./types";
+    20→import { mkdirSync, writeFileSync } from "node:fs";
+    21→import path from "node:path";
+    22→
+    23→const TZ = "Asia/Tehran";
+    24→const BOOT_AT = Date.now();
+    25→
+    26→// ─── Tehran helpers (Intl-driven, DST-proof) ───────────────────────────────
+    27→
+    28→const partsFmt = new Intl.DateTimeFormat("en-GB", {
+    29→  timeZone: TZ,
+    30→  year: "numeric",
+    31→  month: "2-digit",
+    32→  day: "2-digit",
+    33→  hour: "2-digit",
+    34→  minute: "2-digit",
+    35→  second: "2-digit",
+    36→  hour12: false,
+    37→});
+    38→const dowFmt = new Intl.DateTimeFormat("en-US", { timeZone: TZ, weekday: "short" });
+    39→
+    40→export function tehranFields(ms = Date.now()): {
+    41→  y: number; mon: number; dom: number; h: number; min: number; s: number; dow: number;
+    42→} {
+    43→  const parts = partsFmt.formatToParts(new Date(ms));
+    44→  const get = (t: string) => Number(parts.find((p) => p.type === t)?.value ?? 0);
+    45→  const wd = dowFmt.format(new Date(ms)).toUpperCase();
+    46→  return {
+    47→    y: get("year"),
+    48→    mon: get("month"),
+    49→    dom: get("day"),
+    50→    h: get("hour") % 24,
+    51→    min: get("minute"),
+    52→    s: get("second"),
+    53→    dow: { SUN: 0, MON: 1, TUE: 2, WED: 3, THU: 4, FRI: 5, SAT: 6 }[wd] ?? 0,
+    54→  };
+    55→}
+    56→
+    57→export function tehranDateKey(ms = Date.now()): string {
+    58→  const f = tehranFields(ms);
+    59→  return `${f.y}${String(f.mon).padStart(2, "0")}${String(f.dom).padStart(2, "0")}`;
+    60→}
+    61→
+    62→// ─── 6-field cron matcher ──────────────────────────────────────────────────
+    63→
+    64→type Field = { wildcard: boolean; any: Set<number>; step?: number };
+    65→
+    66→function parseField(raw: string, min: number, max: number): Field {
+    67→  const any = new Set<number>();
+    68→  let wildcard = false;
+    69→  let step: number | undefined;
+    70→  for (const chunk of raw.split(",")) {
+    71→    if (chunk === "*") {
+    72→      wildcard = true;
+    73→      for (let i = min; i <= max; i++) any.add(i);
+    74→    } else if (chunk.startsWith("*/")) {
+    75→      wildcard = true;
+    76→      step = Number(chunk.slice(2));
+    77→      for (let i = min; i <= max; i += step) any.add(i);
+    78→    } else if (chunk.includes("-")) {
+    79→      const [a, b] = chunk.split("-").map(Number);
+    80→      for (let i = a; i <= b; i++) any.add(i);
+    81→    } else {
+    82→      any.add(Number(chunk));
+    83→    }
+    84→  }
+    85→  return { wildcard, any, step };
+    86→}
+    87→
+    88→interface Cron {
+    89→  sec: Field; min: Field; hour: Field; dom: Field; mon: Field; dow: Field;
+    90→}
+    91→
+    92→function parseCron(expr: string): Cron {
+    93→  const [sec, min, hour, dom, mon, dow] = expr.trim().split(/\s+/);
+    94→  return {
+    95→    sec: parseField(sec, 0, 59),
+    96→    min: parseField(min, 0, 59),
+    97→    hour: parseField(hour, 0, 23),
+    98→    dom: parseField(dom, 1, 31),
+    99→    mon: parseField(mon, 1, 12),
+   100→    dow: parseField(dow, 0, 6),
+   101→  };
+   102→}
+   103→
+   104→function cronMatches(c: Cron, f: ReturnType<typeof tehranFields>): boolean {
+   105→  return (
+   106→    c.sec.any.has(f.s) &&
+   107→    c.min.any.has(f.min) &&
+   108→    c.hour.any.has(f.h) &&
+   109→    c.mon.any.has(f.mon) &&
+   110→    (c.dom.wildcard || c.dow.wildcard
+   111→      ? c.dom.any.has(f.dom) || c.dow.any.has(f.dow)
+   112→      : c.dom.any.has(f.dom) && c.dow.any.has(f.dow))
+   113→  );
+   114→}
+   115→
+   116→/** next run strictly after `after` (ms epoch) for a Tehran-anchored cron */
+   117→export function nextCronRun(expr: string, after = Date.now()): number {
+   118→  const c = parseCron(expr);
+   119→  // iterate the next 2 days at second resolution starting from `after + 1s`
+   120→  let t = after + 1000;
+   121→  const limit = after + 2 * 86_400_000;
+   122→  while (t <= limit) {
+   123→    if (cronMatches(c, tehranFields(t))) return t;
+   124→    // jump smartly: skip to next minute boundary when seconds won't match soon
+   125→    const f = tehranFields(t);
+   126→    if (!c.hour.any.has(f.h) || !c.min.any.has(f.min)) {
+   127→      t += (59 - f.s) * 1000 + 1000; // finish current minute
+   128→      if (!c.hour.any.has(f.h)) t += (59 - f.min) * 60_000; // finish current hour
+   129→    } else {
+   130→      t += 1000;
+   131→    }
+   132→  }
+   133→  return after + 60_000;
+   134→}
+   135→
+   136→// ─── runtime state ─────────────────────────────────────────────────────────
+   137→
+   138→const nextRunAt = new Map<JobId, number>();
+   139→let liveOverride: boolean | null = null;
+   140→
+   141→function isLive(): boolean {
+   142→  if (liveOverride !== null) return liveOverride;
+   143→  return CONFIG.live;
+   144→}
+   145→
+   146→/** resolved VIP chat id: env first, then auto-discovered channel */
+   147→export function vipChatId(): string {
+   148→  return CONFIG.vipChatId || store.kvGet("vipChatId") || "";
+   149→}
+   150→
+   151→export function setLive(on: boolean): void {
+   152→  liveOverride = on;
+   153→  store.kvSet("live", on ? "1" : "0");
+   154→}
+   155→
+   156→function restoreLive(): void {
+   157→  const v = store.kvGet("live");
+   158→  if (v !== null) liveOverride = v === "1";
+   159→}
+   160→
+   161→const OUTBOX = path.join(process.cwd(), "outbox");
+   162→
+   163→function saveOutbox(jobId: JobId, png: Buffer): void {
+   164→  try {
+   165→    mkdirSync(OUTBOX, { recursive: true });
+   166→    writeFileSync(path.join(OUTBOX, `last_${jobId}.png`), png);
+   167→  } catch {
+   168→    /* outbox is best-effort */
+   169→  }
+   170→}
+   171→
+   172→// ─── posting pipeline ──────────────────────────────────────────────────────
+   173→
+   174→interface PostOutcome {
+   175→  status: "SENT" | "DRY-RUN" | "SKIPPED" | "ERROR";
+   176→  error?: string;
+   177→  messageId?: number;
+   178→}
+   179→
+   180→async function deliver(
+   181→  jobId: JobId,
+   182→  target: string,
+   183→  kind: PosterKind,
+   184→  caption: string,
+   185→  png: Buffer
+   186→): Promise<PostOutcome> {
+   187→  saveOutbox(jobId, png);
+   188→  if (!isLive()) {
+   189→    store.logPost({
+   190→      at: new Date().toISOString(),
+   191→      jobId,
+   192→      target,
+   193→      posterKind: kind,
+   194→      mode: "DRY-RUN",
+   195→      caption,
+   196→      status: "DRY-RUN",
+   197→    });
+   198→    console.log(`[job:${jobId}] DRY-RUN ${kind} → ${target} (${Math.round(png.length / 1024)}KB)`);
+   199→    return { status: "DRY-RUN" };
+   200→  }
+   201→  const chatId = target === "vip" ? vipChatId() : CONFIG.publicChatId;
+   202→  if (!chatId) {
+   203→    store.logPost({
+   204→      at: new Date().toISOString(),
+   205→      jobId,
+   206→      target,
+   207→      posterKind: kind,
+   208→      mode: "LIVE",
+   209→      caption,
+   210→      status: "SKIPPED",
+   211→      error: "chat id not configured",
+   212→    });
+   213→    return { status: "SKIPPED", error: "chat id not configured" };
+   214→  }
+   215→  const res = await telegram.sendPhoto(chatId, png, caption);
+   216→  store.logPost({
+   217→    at: new Date().toISOString(),
+   218→    jobId,
+   219→    target,
+   220→    posterKind: kind,
+   221→    mode: "LIVE",
+   222→    messageId: res.messageId,
+   223→    caption,
+   224→    status: res.ok ? "SENT" : "ERROR",
+   225→    error: res.description,
+   226→  });
+   227→  console.log(
+   228→    `[job:${jobId}] ${res.ok ? "SENT" : "ERROR"} ${kind} → ${target}${res.messageId ? ` #${res.messageId}` : ""}${res.description ? ` (${res.description})` : ""}`
+   229→  );
+   230→  return { status: res.ok ? "SENT" : "ERROR", error: res.description, messageId: res.messageId };
+   231→}
+   232→
+   233→async function render(req: PosterRequest): Promise<Buffer> {
+   234→  const out = renderPoster(req);
+   235→  if (!out.ok) throw new Error(`render failed: ${out.error}`);
+   236→  return Buffer.from(out.pngBase64, "base64");
+   237→}
+   238→
+   239→function stageLabel(): string {
+   240→  const f = tehranFields();
+   241→  return `ST ${String(f.mon).padStart(2, "0")}-${String(f.dom).padStart(2, "0")}`;
+   242→}
+   243→
+   244→function kickoffLabel(card: CardMatch): string {
+   245→  if (!card.startTime) return "START TIME TBC";
+   246→  const ms = new Date(card.startTime).getTime();
+   247→  if (Number.isNaN(ms)) return "START TIME TBC";
+   248→  const f = tehranFields(ms);
+   249→  return `START ${String(f.h).padStart(2, "0")}:${String(f.min).padStart(2, "0")} TEHRAN`;
+   250→}
+   251→
+   252→const SURFACE_EN: Record<string, string> = {
+   253→  HARD: "HARD COURT",
+   254→  CLAY: "CLAY COURT",
+   255→  GRASS: "GRASS COURT",
+   256→};
+   257→
+   258→/** supervisor timing codes → compact English poster labels (Persian labels
+   259→    would be mangled by the Latin sanitizer, so we never print them raw). */
+   260→const TIMING_EN: Record<string, string> = {
+   261→  DONE: "SETTLED",
+   262→  WAIT: "WINDOW PENDING",
+   263→  OPEN: "ENTRY WINDOW OPEN",
+   264→  T30: "T-30M ENTRY WINDOW",
+   265→  LIVE: "IN-PLAY WINDOW",
+   266→  POST: "SETTLED",
+   267→};
+   268→
+   269→function timingEn(code?: string, label?: string): string {
+   270→  if (code && TIMING_EN[code.toUpperCase()]) return TIMING_EN[code.toUpperCase()];
+   271→  if (label) {
+   272→    const m = label.match(/(\d{1,4})/);
+   273→    if (m) return `WINDOW PENDING (${m[1]}M)`;
+   274→  }
+   275→  return "TIMING LOCKED";
+   276→}
+   277→
+   278→// ─── flashcard ONE-POST policy (director fix: هر بازی فقط یک‌بار ارسال شود) ─
+   279→// Each approved match is posted EXACTLY ONCE per Tehran day. The 90s loop
+   280→// exists only so a newly-appearing match gets its single card fast; a match
+   281→// that already has its card is NEVER re-posted — no 6-minute repeat loops,
+   282→// no angle rotations, no duplicate cards. When every pool match has its
+   283→// card the job SKIPS instead of posting anything.
+   284→
+   285→export const FLASH_MAX_PER_DAY = 1; // hard cap: one post per match per Tehran day
+   286→
+   287→export interface FlashAngle {
+   288→  label: string;
+   289→  labelFa: string;
+   290→  insightEn: string;
+   291→  insightFa: string;
+   292→}
+   293→
+   294→const FULL_CARD_LABEL_FA = "کارت کامل";
+   295→
+   296→export function angleFor(card: CardMatch, _rotation = 0): FlashAngle {
+   297→  const cov = Math.round((card.coverage ?? 0) * 100);
+   298→  return {
+   299→    label: "FULL CARD",
+   300→    labelFa: FULL_CARD_LABEL_FA,
+   301→    insightEn: `DUAL-WING STRUCTURE ONLINE - TYPE A + TYPE B TOGETHER COVER ${cov}% OF ALL POSSIBLE SCORE ROUTES.`,
+   302→    insightFa: `ساختار دوپایی فعال است: ترکیب تیپ A و تیپ B حدود ٪${cov} از همه مسیرهای نتیجه بازی را پوشش می‌دهد.`,
+   303→  };
+   304→}
+   305→
+   306→interface FlashHistEntry {
+   307→  c: number;
+   308→  at: number;
+   309→}
+   310→
+   311→function loadFlashHist(dateKey: string): Record<string, FlashHistEntry> {
+   312→  const raw = store.kvGet("flashHist");
+   313→  if (raw) {
+   314→    try {
+   315→      const parsed = JSON.parse(raw) as { dateKey: string; entries: Record<string, FlashHistEntry> };
+   316→      if (parsed.dateKey === dateKey) return parsed.entries ?? {};
+   317→    } catch {
+   318→      /* corrupted entry → fresh day */
+   319→    }
+   320→  }
+   321→  return {};
+   322→}
+   323→
+   324→function saveFlashHist(dateKey: string, entries: Record<string, FlashHistEntry>): void {
+   325→  store.kvSet("flashHist", JSON.stringify({ dateKey, entries }));
+   326→}
+   327→
+   328→/** ops endpoint: clear today's one-post history so failed/burned cards re-send */
+   329→export function resetFlashHistory(): { cleared: boolean; dateKey: string } {
+   330→  const dateKey = tehranDateKey();
+   331→  store.kvSet("flashHist", JSON.stringify({ dateKey, entries: {} }));
+   332→  store.kvSet("flashCursor", "0");
+   333→  console.log(`[scheduler] flash history reset for ${dateKey} — all pool matches re-eligible`);
+   334→  return { cleared: true, dateKey };
+   335→}
+   336→
+   337→// ─── poster request builders ───────────────────────────────────────────────
+   338→
+   339→function flashcardRequest(
+   340→  card: CardMatch,
+   341→  kind: PosterKind = "FLASHCARD",
+   342→  angle?: FlashAngle,
+   343→  salt?: number
+   344→): PosterRequest {
+   345→  const slips = [
+   346→    card.slipA && {
+   347→      key: card.slipA.key,
+   348→      label: "TYPE A",
+   349→      marketEn: card.slipA.marketEn,
+   350→      detail: card.slipA.detail,
+   351→      odds: card.slipA.odds,
+   352→      prob: card.slipA.prob,
+   353→      stake: card.slipA.stake,
+   354→      edge: card.slipA.edge,
+   355→    },
+   356→    card.slipB && {
+   357→      key: card.slipB.key,
+   358→      label: "TYPE B",
+   359→      marketEn: kind === "FREECARD" ? "FULL MARKET HIDDEN" : card.slipB.marketEn,
+   360→      detail:
+   361→        kind === "FREECARD"
+   362→          ? "UNLOCK THE SECOND WING INSIDE THE VIP ARENA. FULL DUTCHING PLAN POSTED DAILY."
+   363→          : card.slipB.detail,
+   364→      odds: kind === "FREECARD" ? 0 : card.slipB.odds,
+   365→      prob: card.slipB.prob,
+   366→      stake: kind === "FREECARD" ? undefined : card.slipB.stake,
+   367→      edge: kind === "FREECARD" ? undefined : card.slipB.edge,
+   368→      locked: kind === "FREECARD",
+   369→    },
+   370→  ].filter(Boolean) as PosterRequest["slips"];
+   371→  const favName = (card.favorite === "A" ? card.playerA : card.playerB).toUpperCase();
+   372→  // ── enrichment (director fix: fuller English cards) ──────────────────────
+   373→  // score prediction derived from the primary (Type A) market key
+   374→  const PRED_EN: Record<string, string> = {
+   375→    "SB-F20": `PREDICTION: ${favName} 2-0`,
+   376→    "SB-P1-20": `PREDICTION: ${card.playerA.toUpperCase()} 2-0`,
+   377→    "SB-P1-21": `PREDICTION: ${card.playerA.toUpperCase()} 2-1`,
+   378→    "TS-O25": "PREDICTION: DECIDING 3RD SET",
+   379→    "TG-O225": "PREDICTION: 23+ TOTAL GAMES",
+   380→    "GH-F45": `PREDICTION: ${favName} BY 5+ GAMES`,
+   381→  };
+   382→  const prediction = PRED_EN[card.slipA?.key ?? ""];
+   383→  const rankPart = (r?: number): string => (r !== undefined ? `#${r}` : "N/A");
+   384→  const rankGap =
+   385→    card.rankA !== undefined || card.rankB !== undefined
+   386→      ? `RANK GAP ${rankPart(card.rankA)} v ${rankPart(card.rankB)}`
+   387→      : undefined;
+   388→  const stakeSum = (card.slipA?.stake ?? 0) + (card.slipB?.stake ?? 0);
+   389→  const uOf = (n: number): string => (n === Math.floor(n) ? `${n}U` : `${n.toFixed(1)}U`);
+   390→  const totalStake = stakeSum > 0 ? `TOTAL RISK ${uOf(stakeSum)}` : undefined;
+   391→  const stakeDetail =
+   392→    stakeSum > 0
+   393→      ? `TIP A ${uOf(card.slipA?.stake ?? 0)} + TIP B ${uOf(card.slipB?.stake ?? 0)}`
+   394→      : undefined;
+   395→  return {
+   396→    kind,
+   397→    title: kind === "FREECARD" ? "FREE CARD" : "MATCH OF THE DAY",
+   398→    subtitle: card.tournament,
+   399→    theme: card.surface,
+   400→    players: {
+   401→      a: card.playerA,
+   402→      b: card.playerB,
+   403→      shortA: card.shortA,
+   404→      shortB: card.shortB,
+   405→      rankA: card.rankA,
+   406→      rankB: card.rankB,
+   407→      flagA: card.flagA,
+   408→      flagB: card.flagB,
+   409→      seedA: card.seedA,
+   410→      seedB: card.seedB,
+   411→    },
+   412→    tournament: card.tournament,
+   413→    round: card.round,
+   414→    surfaceLabel: `${SURFACE_EN[card.surface] ?? "COURT"} - FAV ${card.favorite} - BEST OF 3`,
+   415→    slips,
+   416→    intel: {
+   417→      tour: card.tour,
+   418→      city: card.city,
+   419→      timing: timingEn(card.timingCode, card.timingLabel),
+   420→      favName,
+   421→      favProb: card.favWinProb,
+   422→      coverage: card.coverage,
+   423→      archLabel: card.archLabelEn,
+   424→      favSide: card.favorite,
+   425→      angleLabel: angle?.label,
+   426→      insightEn: angle?.insightEn,
+   427→      prediction,
+   428→      rankGap,
+   429→      totalStake,
+   430→      stakeDetail,
+   431→    },
+   432→    seedSalt: salt,
+   433→    hash: card.hash,
+   434→    timeLabel: kickoffLabel(card),
+   435→    stage: stageLabel(),
+   436→    footerNote: kind === "FREECARD" ? "FULL CARD IN VIP" : "VIP ONLY - NOT FOR RESHARE - 18+",
+   437→  };
+   438→}
+   439→
+   440→function briefingRequest(
+   441→  cards: CardMatch[],
+   442→  vetoed: CardMatch[],
+   443→  quota: { poolSize: number; approved: number; adaptive: number }
+   444→): PosterRequest {
+   445→  const hhmm = (card: CardMatch): string => {
+   446→    if (!card.startTime) return "--:--";
+   447→    const ms = new Date(card.startTime).getTime();
+   448→    if (Number.isNaN(ms)) return "--:--";
+   449→    const f = tehranFields(ms);
+   450→    return `${String(f.h).padStart(2, "0")}:${String(f.min).padStart(2, "0")}`;
+   451→  };
+   452→  const rows: PosterRequest["rows"] = cards.slice(0, 8).map((c) => ({
+   453→    label: `${hhmm(c)} ${(c.shortA ?? c.playerA).slice(0, 16)} x ${(c.shortB ?? c.playerB).slice(0, 16)}`,
+   454→    value: `${(c.slipA?.key ?? "TBD").slice(0, 9)} ${(c.slipA?.odds ?? 0).toFixed(2)} ${stakeLabelEn(c.slipA?.stake ?? 1)}`,
+   455→    status: "INFO",
+   456→  }));
+   457→  const vetoRows: PosterRequest["rows"] = vetoed.slice(0, 5).map((v) => ({
+   458→    label: `${(v.shortA ?? v.playerA).slice(0, 16)} x ${(v.shortB ?? v.playerB).slice(0, 16)}`,
+   459→    value:
+   460→      v.vetoCode === "TOP100"
+   461→        ? "OUTSIDE TOP-100 DOMAIN"
+   462→        : v.vetoCode === "P02_RISK"
+   463→          ? "NO ELIGIBLE ARCHETYPE"
+   464→          : "MODEL VETO",
+   465→    status: "VETO",
+   466→  }));
+   467→  return {
+   468→    kind: "BRIEFING",
+   469→    title: "TODAY'S BATTLE ARENA",
+   470→    subtitle: `${tehranDateKey()} - ${cards.length} QUALIFIED PICKS`,
+   471→    theme: "HARD",
+   472→    rows: [...rows, ...vetoRows],
+   473→    bullets: [
+   474→      "STANDARD 100U MATCH BUDGET - NEVER CHASE A LOSS",
+   475→      "EQUAL-PROFIT DUTCHING - BOTH WINGS = 100U TOTAL",
+   476→      "LINE LOCKED AT T-30M - NO LATE MOVES",
+   477→      "SKIP ANY MATCH IF ODDS DROP BELOW 1.60",
+   478→    ],
+   479→    stats: [
+   480→      { label: "APPROVED", value: String(quota.approved), accent: true },
+   481→      { label: "VETOED", value: String(vetoed.length) },
+   482→      { label: "QUOTA", value: "12 MAX" },
+   483→      { label: "BANK RISK", value: "100U" },
+   484→    ],
+   485→    stage: stageLabel(),
+   486→    footerNote: "FULL CARD IN VIP - 18+ - 100U STANDARD STAKE",
+   487→  } as PosterRequest;
+   488→}
+   489→
+   490→function aggregateRequest(
+   491→  title: string,
+   492→  kind: PosterKind,
+   493→  stats: { coreWinRate: number; profit: number; picks: number; settled: number; streak: number },
+   494→  rows: { matchLabel: string; status: string; profit: number; result?: string }[]
+   495→): PosterRequest {
+   496→  return {
+   497→    kind,
+   498→    title,
+   499→    subtitle: `${tehranDateKey()} - OFFICIAL LEDGER`,
+   500→    theme: "RESULTS",
+   501→    stats: [
+   502→      { label: "WIN RATE - CORE", value: `${Math.round(stats.coreWinRate * 100)}%`, accent: true },
+   503→      { label: "NET UNITS", value: `${stats.profit >= 0 ? "+" : ""}${Math.round(stats.profit)}U` },
+   504→      { label: "PICKS", value: String(stats.picks) },
+   505→      { label: "SETTLED", value: String(stats.settled) },
+   506→      { label: "STREAK", value: `${stats.streak >= 0 ? "W" : "L"}${Math.abs(stats.streak)}` },
+   507→    ],
+   508→    rows: rows.slice(0, 9).map((r) => ({
+   509→      label: r.matchLabel.slice(0, 30),
+   510→      value: r.result ? `FT ${r.result} - ${r.profit >= 0 ? "+" : ""}${Math.round(r.profit)}U` : "PENDING",
+   511→      status: r.status === "WON" ? ("WIN" as const) : r.status === "LOST" ? ("LOSS" as const) : ("PENDING" as const),
+   512→    })),
+   513→    stage: stageLabel(),
+   514→    footerNote: "SHA-256 LOCKED RECORDS - 18+",
+   515→  } as PosterRequest;
+   516→}
+   517→
+   518→function newsRequest(
+   519→  item: TennisNewsItem,
+   520→  live: LiveTennisMatch[],
+   521→  fitness: FitnessItem[]
+   522→): PosterRequest {
+   523→  const liveRows: PosterLiveRow[] = live.slice(0, 4).map((m) => ({
+   524→    label: `${m.shortA ?? m.playerA} v ${m.shortB ?? m.playerB} - ${m.tournament}`.slice(0, 42),
+   525→    value:
+   526→      m.state === "in"
+   527→        ? `${m.scoreLine || "LIVE"} - ${m.detail}`.slice(0, 34)
+   528→        : m.state === "pre"
+   529→          ? `SCHEDULED - ${m.detail}`.slice(0, 34)
+   530→          : `${m.scoreLine || "FT"} - ${m.detail}`.slice(0, 34),
+   531→    state: m.state === "in" ? ("LIVE" as const) : m.state === "pre" ? ("UPCOMING" as const) : ("FINAL" as const),
+   532→  }));
+   533→  const fitRows: PosterFitnessRow[] = fitness.slice(0, 3).map((f) => ({
+   534→    label: f.headline.toUpperCase(),
+   535→    tag: f.tag,
+   536→  }));
+   537→  return {
+   538→    kind: "NEWS",
+   539→    title: "TENNIS NEWSWIRE",
+   540→    theme: "LIVE",
+   541→    news: {
+   542→      headline: item.headline.toUpperCase(),
+   543→      description: item.description.toUpperCase(),
+   544→      source: "ESPN",
+   545→      published: item.published
+   546→        ? new Date(item.published).toLocaleDateString("en-GB", { timeZone: TZ })
+   547→        : undefined,
+   548→      tag: item.tour,
+   549→      live: liveRows,
+   550→      fitness: fitRows,
+   551→    },
+   552→    stage: stageLabel(),
+   553→    footerNote: "MORE AT ESPN.COM/TENNIS",
+   554→  } as PosterRequest;
+   555→}
+   556→
+   557→function academyRequest(index: number): PosterRequest {
+   558→  const l = ACADEMY[(index - 1) % ACADEMY.length];
+   559→  return {
+   560→    kind: "ACADEMY",
+   561→    title: "BET ACADEMY",
+   562→    theme: "ACADEMY",
+   563→    lesson: {
+   564→      index: l.index,
+   565→      term: l.term,
+   566→      phonetic: l.phonetic,
+   567→      category: l.category,
+   568→      definition: l.definition,
+   569→      example: l.example,
+   570→    },
+   571→    stage: stageLabel(),
+   572→    footerNote: "NEW LESSON DAILY - 14 LESSON SERIES",
+   573→  } as PosterRequest;
+   574→}
+   575→
+   576→function bannerRequest(stats: {
+   577→  coreWinRate: number;
+   578→  profit: number;
+   579→  picks: number;
+   580→}): PosterRequest {
+   581→  return {
+   582→    kind: "BANNER",
+   583→    title: "VIP ARCADE ARENA",
+   584→    subtitle: "INSERT COIN - JOIN THE WINNING SIDE",
+   585→    theme: "MARKETING",
+   586→    stats: [
+   587→      { label: "WIN RATE - CORE", value: `${Math.round(stats.coreWinRate * 100)}%`, accent: true },
+   588→      { label: "NET UNITS", value: `${stats.profit >= 0 ? "+" : ""}${Math.round(stats.profit)}U` },
+   589→      { label: "PICKS ON RECORD", value: String(stats.picks) },
+   590→    ],
+   591→    stage: stageLabel(),
+   592→    footerNote: "JOIN @aineobet - RESPONSIBLE GAMBLING - 18+",
+   593→  } as PosterRequest;
+   594→}
+   595→
+   596→// ─── job handlers ──────────────────────────────────────────────────────────
+   597→
+   598→type Handler = () => Promise<PostOutcome>;
+   599→
+   600→async function ensureWarm(): Promise<void> {
+   601→  const last = store.kvGet("lastFeedWarmMs");
+   602→  const stale = !last || Date.now() - Number(last) > 10 * 60_000;
+   603→  if (stale) {
+   604→    const ok = await dataHub.warm();
+   605→    if (ok) store.kvSet("lastFeedWarmMs", String(Date.now()));
+   606→  }
+   607→}
+   608→
+   609→function vetoedRowsOf(cards: CardMatch[]): CardMatch[] {
+   610→  return cards.filter((c) => c.vetoed);
+   611→}
+   612→
+   613→const handlers: Record<JobId, Handler> = {
+   614→  async daily_program() {
+   615→    // The day's broadcast contract — rendered from PROGRAM (single source of
+   616→    // truth) and delivered to BOTH channels. No data dependency, never skips.
+   617→    const dow = tehranDow();
+   618→    const f = tehranFields();
+   619→    const dateFa = `${f.dom.toLocaleString("fa-IR")} ${new Intl.DateTimeFormat("fa-IR", { month: "long", timeZone: TZ }).format(new Date())}`;
+   620→    const rows = PROGRAM.map((p) => ({
+   621→      label: `${p.time} · ${p.en}`,
+   622→      value: targetEn(p.target),
+   623→      status: "INFO" as const,
+   624→    }));
+   625→    const req: PosterRequest = {
+   626→      kind: "DAILYPROGRAM",
+   627→      title: "DAILY BROADCAST PROGRAM",
+   628→      subtitle: `${WEEKDAYS_EN[dow]} - ALL TIMES TEHRAN`,
+   629→      theme: "RESULTS",
+   630→      stage: stageLabel(),
+   631→      rows,
+   632→      footerNote: "ONE CARD PER MATCH PER DAY - STAKE 100U",
+   633→    };
+   634→    const png = await render(req);
+   635→    const caption = cap.captionDailyProgram(dateFa, WEEKDAYS_FA[dow]);
+   636→    const out1 = await deliver("daily_program", "public", "DAILYPROGRAM", caption, png);
+   637→    if (vipChatId()) {
+   638→      const out2 = await deliver("daily_program", "vip", "DAILYPROGRAM", caption, png);
+   639→      return out1.status === "SENT" || out2.status === "SENT" ? out1 : out2;
+   640→    }
+   641→    return out1;
+   642→  },
+   643→
+   644→  async vip_briefing() {
+   645→    await ensureWarm();
+   646→    const approved = dataHub.approvedPool().slice(0, 8);
+   647→    const vetoed = vetoedRowsOf(dataHub.cards());
+   648→    if (approved.length === 0 && vetoed.length === 0) return { status: "SKIPPED", error: "no cards today" };
+   649→    const quota = { ...dataHub.quota(), adaptive: dataHub.cards().filter((c) => c.adaptive).length };
+   650→    // fitness radar feeds the morning discipline block too
+   651→    const radar = await fetchTennisRadar().catch(() => null);
+   652→    const png = await render(briefingRequest(approved, vetoed, quota));
+   653→    const caption = cap.captionBriefing(approved, vetoed, quota, radar?.fitness ?? []);
+   654→    return deliver("vip_briefing", "vip", "BRIEFING", caption, png);
+   655→  },
+   656→
+   657→  async flashcards() {
+   658→    await ensureWarm();
+   659→    const dateKey = tehranDateKey();
+   660→    store.kvSet("flashDateKey", dateKey);
+   661→    const pool = dataHub.approvedPool();
+   662→    if (pool.length === 0) return { status: "SKIPPED", error: "flash pool empty" };
+   663→    const hist = loadFlashHist(dateKey);
+   664→    // ONE-POST POLICY: a match is eligible only if it has NEVER been posted
+   665→    // today — exactly one card per game, then it never repeats this day.
+   666→    const eligible = pool.filter((c) => !hist[c.eventKey]);
+   667→    if (eligible.length === 0) {
+   668→      return {
+   669→        status: "SKIPPED",
+   670→        error: `one-post policy - all ${pool.length} match(es) already have their card today`,
+   671→      };
+   672→    }
+   673→    // soonest kick-off first → the most urgent match gets its single card first
+   674→    eligible.sort((a, b) => {
+   675→      const ta = a.startTime ? new Date(a.startTime).getTime() : Number.MAX_SAFE_INTEGER;
+   676→      const tb = b.startTime ? new Date(b.startTime).getTime() : Number.MAX_SAFE_INTEGER;
+   677→      if (ta !== tb) return ta - tb;
+   678→      return (b.coverage ?? 0) - (a.coverage ?? 0);
+   679→    });
+   680→    const card = eligible[0];
+   681→    // DELIVERY-FIRST POLICY (revival fix): the one-post mark is written only
+   682→    // AFTER a confirmed SENT (or in dry-run mode). A failed Telegram delivery
+   683→    // (network / auth / 404) does NOT burn the card — the next 90s tick
+   684→    // retries the same match until the card is actually on the channel.
+   685→    const angle = angleFor(card, 0);
+   686→    const png = await render(flashcardRequest(card, "FLASHCARD", angle, 1));
+   687→    const caption = cap.captionFlashcard(card, !!card.adaptive, angle);
+   688→    const outcome = await deliver("flashcards", "vip", "FLASHCARD", caption, png);
+   689→    if (outcome.status === "SENT" || outcome.status === "DRY-RUN") {
+   690→      hist[card.eventKey] = { c: 1, at: Date.now() };
+   691→      saveFlashHist(dateKey, hist);
+   692→      store.kvSet("flashCursor", String(Object.values(hist).reduce((s, e) => s + e.c, 0)));
+   693→    } else {
+   694→      console.warn(
+   695→        `[job:flashcards] delivery ${outcome.status} for ${card.eventKey} — card NOT marked, retry next tick (${outcome.error ?? "unknown"})`
+   696→      );
+   697→    }
+   698→    return outcome;
+   699→  },
+   700→
+   701→  async vip_aggregate() {
+   702→    await ensureWarm();
+   703→    const stats = dataHub.stats();
+   704→    if (!stats) return { status: "SKIPPED", error: "no stats" };
+   705→    const rows = dataHub.settledToday();
+   706→    const png = await render(
+   707→      aggregateRequest("DAILY LEDGER - VIP", "AGGREGATE", stats, rows)
+   708→    );
+   709→    const caption = cap.captionAggregate(stats, rows, false);
+   710→    return deliver("vip_aggregate", "vip", "AGGREGATE", caption, png);
+   711→  },
+   712→
+   713→  async weekly_report() {
+   714→    await ensureWarm();
+   715→    const stats = dataHub.stats();
+   716→    if (!stats) return { status: "SKIPPED", error: "no stats" };
+   717→    const rows = dataHub.settledRows(7);
+   718→    const png = await render(aggregateRequest("WEEKLY REPORT - 7 DAY LEDGER", "WEEKLY", stats, rows));
+   719→    const caption = cap.captionWeekly(stats, rows);
+   720→    const out1 = await deliver("weekly_report", "public", "WEEKLY", caption, png);
+   721→    if (vipChatId()) {
+   722→      const out2 = await deliver("weekly_report", "vip", "WEEKLY", caption, png);
+   723→      return out1.status === "SENT" || out2.status === "SENT" ? out1 : out2;
+   724→    }
+   725→    return out1;
+   726→  },
+   727→
+   728→  async tennis_news_am() {
+   729→    return postNews("tennis_news_am");
+   730→  },
+   731→  async tennis_news_pm() {
+   732→    return postNews("tennis_news_pm");
+   733→  },
+   734→
+   735→  async academy_am() {
+   736→    return postAcademy("academy_am");
+   737→  },
+   738→  async academy_pm() {
+   739→    return postAcademy("academy_pm");
+   740→  },
+   741→
+   742→  async free_card() {
+   743→    await ensureWarm();
+   744→    const pool = dataHub.approvedPool();
+   745→    const base = pool.length ? pool : dataHub.dbFallbackCards().filter((c) => c.slipA);
+   746→    if (base.length === 0) return { status: "SKIPPED", error: "no free card candidate" };
+   747→    // rotate among the top-3 coverage candidates day by day (no daily repeat)
+   748→    const cands = [...base].sort((a, b) => (b.coverage ?? 0) - (a.coverage ?? 0)).slice(0, 3);
+   749→    const dateKey = tehranDateKey();
+   750→    const card = cands[Number(dateKey.slice(-3)) % cands.length];
+   751→    const png = await render(flashcardRequest(card, "FREECARD"));
+   752→    const caption = cap.captionFreeCard(card);
+   753→    return deliver("free_card", "public", "FREECARD", caption, png);
+   754→  },
+   755→
+   756→  async marketing_banner() {
+   757→    await ensureWarm();
+   758→    const stats = dataHub.stats();
+   759→    if (!stats) return { status: "SKIPPED", error: "no stats" };
+   760→    const png = await render(bannerRequest(stats));
+   761→    const caption = cap.captionBanner(stats);
+   762→    return deliver("marketing_banner", "public", "BANNER", caption, png);
+   763→  },
+   764→
+   765→  async ft_results() {
+   766→    await ensureWarm();
+   767→    const stats = dataHub.stats();
+   768→    if (!stats) return { status: "SKIPPED", error: "no stats" };
+   769→    const rows = dataHub.settledToday();
+   770→    const f = dataHub.getFeed();
+   771→    const won = f ? f.ledger.rows.filter((r) => r.status === "WON").length : 0;
+   772→    const lost = f ? f.ledger.rows.filter((r) => r.status === "LOST").length : 0;
+   773→    const png = await render(aggregateRequest("FULL TIME RESULTS", "FTRESULTS", stats, rows));
+   774→    const caption = cap.captionFtResults(rows, { coreWinRate: stats.coreWinRate, won, lost });
+   775→    return deliver("ft_results", "public", "FTRESULTS", caption, png);
+   776→  },
+   777→
+   778→  async public_aggregate() {
+   779→    await ensureWarm();
+   780→    const stats = dataHub.stats();
+   781→    if (!stats) return { status: "SKIPPED", error: "no stats" };
+   782→    const rows = dataHub.settledToday();
+   783→    const png = await render(
+   784→      aggregateRequest("NIGHTLY LEDGER", "AGGREGATE", stats, rows)
+   785→    );
+   786→    const caption = cap.captionAggregate(stats, rows, true);
+   787→    return deliver("public_aggregate", "public", "AGGREGATE", caption, png);
+   788→  },
+   789→};
+   790→
+   791→const WEEKDAYS_FA = ["یکشنبه", "دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه", "شنبه"];
+   792→const WEEKDAYS_EN = ["SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"];
+   793→
+   794→/** Tehran weekday index (0=Sunday) for the program subtitle/caption. */
+   795→function tehranDow(ms = Date.now()): number {
+   796→  const dow = new Intl.DateTimeFormat("en-US", { timeZone: TZ, weekday: "short" }).format(new Date(ms));
+   797→  return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(dow);
+   798→}
+   799→
+   800→async function postNews(jobId: JobId): Promise<PostOutcome> {
+   801→  const radar = await fetchTennisRadar();
+   802→  const fresh = radar.news.find((i) => !store.hasNews(i.id)) ?? radar.news[0];
+   803→  if (!fresh) return { status: "SKIPPED", error: "no tennis news available" };
+   804→  if (!store.hasNews(fresh.id)) store.markNews(fresh.id);
+   805→  const tr = await cap.translateNewsToPersian(fresh.headline, fresh.description);
+   806→  const png = await render(newsRequest(fresh, radar.live, radar.fitness));
+   807→  const caption = cap.captionNews(fresh, tr, radar.live, radar.fitness);
+   808→  return deliver(jobId, "public", "NEWS", caption, png);
+   809→}
+   810→
+   811→async function postAcademy(jobId: JobId): Promise<PostOutcome> {
+   812→  const next = Number(store.kvGet("academyNext") ?? "1");
+   813→  const index = ((next - 1) % ACADEMY.length) + 1;
+   814→  store.kvSet("academyNext", String(index + 1));
+   815→  const png = await render(academyRequest(index));
+   816→  const caption = cap.captionAcademy(index);
+   817→  return deliver(jobId, "public", "ACADEMY", caption, png);
+   818→}
+   819→
+   820→// ─── scheduler core ────────────────────────────────────────────────────────
+   821→
+   822→let running = new Set<JobId>();
+   823→
+   824→async function runJob(jobId: JobId, reason: "cron" | "manual" = "cron"): Promise<PostOutcome> {
+   825→  if (running.has(jobId)) return { status: "SKIPPED", error: "already running" };
+   826→  running.add(jobId);
+   827→  try {
+   828→    const out = await handlers[jobId]();
+   829→    store.recordRun(jobId, out.status, { error: out.error, messageId: out.messageId });
+   830→    return out;
+   831→  } catch (e) {
+   832→    const error = e instanceof Error ? e.message : String(e);
+   833→    console.error(`[job:${jobId}] ${reason} error:`, error);
+   834→    store.recordRun(jobId, "ERROR", { error });
+   835→    return { status: "ERROR", error };
+   836→  } finally {
+   837→    running.delete(jobId);
+   838→  }
+   839→}
+   840→
+   841→function scheduleAll(): void {
+   842→  for (const job of JOB_SPECS) {
+   843→    if (job.cron) {
+   844→      nextRunAt.set(job.id, nextCronRun(job.cron));
+   845→    } else if (job.everySeconds) {
+   846→      nextRunAt.set(job.id, Date.now() + (job.everySeconds * 1000));
+   847→    }
+   848→  }
+   849→}
+   850→
+   851→function tick(): void {
+   852→  const now = Date.now();
+   853→  for (const job of JOB_SPECS) {
+   854→    const next = nextRunAt.get(job.id);
+   855→    if (next === undefined || now < next) continue;
+   856→    if (job.cron) {
+   857→      nextRunAt.set(job.id, nextCronRun(job.cron, now));
+   858→    } else if (job.everySeconds) {
+   859→      nextRunAt.set(job.id, now + job.everySeconds * 1000);
+   860→    }
+   861→    void runJob(job.id);
+   862→  }
+   863→}
+   864→
+   865→export function startScheduler(): void {
+   866→  registerFonts();
+   867→  restoreLive();
+   868→  void refreshMe().catch(() => null);
+   869→  scheduleAll();
+   870→  // warm immediately so the first flashcard is never cold
+   871→  void dataHub.warm().then((ok) => {
+   872→    if (ok) store.kvSet("lastFeedWarmMs", String(Date.now()));
+   873→  });
+   874→  setInterval(tick, 1000);
+   875→  // engine keep-warm loop — the core must never go cold
+   876→  setInterval(() => {
+   877→    void ensureWarm();
+   878→  }, 5 * 60_000);
+   879→  // tennis radar keep-warm (news/live/fitness cache stays hot)
+   880→  setInterval(() => {
+   881→    void fetchTennisRadar().catch(() => null);
+   882→  }, 4 * 60_000);
+   883→  // VIP channel auto-discovery — the moment the bot becomes admin of (or
+   884→  // receives any update from) the VIP channel, its numeric id is captured.
+   885→  setInterval(() => {
+   886→    void discoverVipLoop();
+   887→  }, 30_000);
+   888→  console.log(
+   889→    `[scheduler] started - ${JOB_SPECS.length} jobs - live=${isLive()} - tz=${TZ}`
+   890→  );
+   891→  for (const job of JOB_SPECS) {
+   892→    const next = nextRunAt.get(job.id);
+   893→    console.log(`[scheduler] ${job.id.padEnd(18)} next=${next ? new Date(next).toISOString() : "-"}`);
+   894→  }
+   895→  void discoverVipLoop();
+   896→}
+   897→
+   898→/** capture the VIP channel id from any chat the bot can see.
+   899→ *  .env PRIORITY LAW: when TELEGRAM_VIP_CHAT_ID is explicitly configured it
+   900→ *  is the single source of truth — discovery NEVER overwrites it (the old
+   901→ *  bug captured the PUBLIC channel as VIP whenever publicChatId was numeric,
+   902→ *  because `publicChatId.includes(username)` can never match a numeric id). */
+   903→async function discoverVipLoop(): Promise<void> {
+   904→  if (CONFIG.vipChatId) {
+   905→    // explicit director config wins — keep the title fresh, never the id
+   906→    try {
+   907→      for (const ch of await telegram.discoverChats()) {
+   908→        if (String(ch.id) === CONFIG.vipChatId && ch.title) {
+   909→          store.kvSet("vipChatTitle", ch.title);
+   910→        }
+   911→      }
+   912→    } catch {
+   913→      /* best-effort */
+   914→    }
+   915→    return;
+   916→  }
+   917→  try {
+   918→    const chats = await telegram.discoverChats();
+   919→    for (const ch of chats) {
+   920→      const isPublic =
+   921→        (!!ch.username && CONFIG.publicChatId.includes(ch.username)) ||
+   922→        String(ch.id) === CONFIG.publicChatId;
+   923→      const isChannelish = ch.type === "channel" || ch.type === "supergroup";
+   924→      if (isChannelish && ch.id) {
+   925→        store.kvSet(`chatSeen:${ch.id}`, JSON.stringify(ch));
+   926→      }
+   927→      if (isChannelish && !isPublic && ch.id) {
+   928→        const idStr = String(ch.id);
+   929→        if (vipChatId() !== idStr) {
+   930→          store.kvSet("vipChatId", idStr);
+   931→          store.kvSet("vipChatTitle", ch.title ?? "");
+   932→          console.log(`[discover] VIP chat captured: ${idStr} (${ch.title ?? ch.type})`);
+   933→        }
+   934→      }
+   935→    }
+   936→  } catch {
+   937→    /* discovery is best-effort */
+   938→  }
+   939→}
+   940→
+   941→export async function runManually(jobId: JobId): Promise<PostOutcome> {
+   942→  return runJob(jobId, "manual");
+   943→}
+   944→
+   945→/** single scheduler pass — exposed for the /tick HTTP endpoint */
+   946→export function tickOnce(): void {
+   947→  tick();
+   948→}
+   949→
+   950→export function status(): AgentStatus {
+   951→  const jobs = JOB_SPECS.map((j) => {
+   952→    const st = store.getJobState(j.id);
+   953→    return {
+   954→      ...(j as JobSpec),
+   955→      lastRun: st?.lastRun ?? undefined,
+   956→      lastStatus: (st?.lastStatus as JobRunState["lastStatus"]) ?? undefined,
+   957→      lastError: st?.lastError ?? undefined,
+   958→      lastMessageId: st?.lastMessageId ?? undefined,
+   959→      nextRun: nextRunAt.has(j.id)
+   960→        ? new Date(nextRunAt.get(j.id)!).toISOString()
+   961→        : undefined,
+   962→      runs: st?.runs ?? 0,
+   963→    } as JobSpec & JobRunState;
+   964→  });
+   965→  // program table joined with live job state (dashboard Daily Program panel)
+   966→  const jobsById = new Map(jobs.map((j) => [j.id, j]));
+   967→  const nowF = tehranFields();
+   968→  const nowMin = nowF.h * 60 + nowF.min;
+   969→  const program: ProgramEntry[] = PROGRAM.map((p) => {
+   970→    const j = jobsById.get(p.jobId);
+   971→    const elapsed =
+   972→      p.min >= 0 && p.min <= 22 * 60 ? nowMin >= p.min : p.time === ":15" ? nowF.min >= 15 : true;
+   973→    return {
+   974→      time: p.time,
+   975→      fa: p.fa,
+   976→      en: p.en,
+   977→      target: p.target,
+   978→      targetEn: targetEn(p.target),
+   979→      jobId: p.jobId,
+   980→      lastStatus: j?.lastStatus,
+   981→      lastRun: j?.lastRun,
+   982→      nextRun: j?.nextRun,
+   983→      elapsed,
+   984→    };
+   985→  });
+   986→  const f = dataHub.getFeed();
+   987→  const radar = peekRadar();
+   988→  const flashDateKey = tehranDateKey();
+   989→  const flashEntries = loadFlashHist(flashDateKey);
+   990→  const flashPool = dataHub.approvedPool();
+   991→  const postsToday = Object.values(flashEntries).reduce((s, e) => s + e.c, 0);
+   992→  // one-post policy: "cooldownActive" = every pool match already has its card
+   993→  const cooldownActive =
+   994→    flashPool.length > 0 && flashPool.every((c) => !!flashEntries[c.eventKey]);
+   995→  return {
+   996→    ok: true,
+   997→    bot: { username: meCached()?.username ?? "Neotenisbot", live: isLive() },
+   998→    chats: { public: CONFIG.publicChatId, vip: vipChatId() || undefined, vipTitle: store.kvGet("vipChatTitle") || undefined },
+   999→    uptimeSeconds: Math.round((Date.now() - BOOT_AT) / 1000),
+  1000→    jobs,
+  1001→    program,
+  1002→    tehranTime: `${String(nowF.h).padStart(2, "0")}:${String(nowF.min).padStart(2, "0")}`,
+  1003→    recentPosts: store.recentPosts(20),
+  1004→    flashQueue: {
+  1005→      cursor: postsToday,
+  1006→      total: flashPool.length,
+  1007→      dateKey: flashDateKey,
+  1008→      postsToday,
+  1009→      cooldownActive,
+  1010→      cooldownMinutes: 0,
+  1011→    },
+  1012→    academy: {
+  1013→      nextLesson: Number(store.kvGet("academyNext") ?? "1"),
+  1014→      total: ACADEMY.length,
+  1015→    },
+  1016→    dataFeed: {
+  1017→      lastWarmOk: dataHub.lastOk,
+  1018→      lastWarmAt: dataHub.lastAt,
+  1019→      matches: f?.matches.length ?? 0,
+  1020→      approved: dataHub.approvedPool().length,
+  1021→    },
+  1022→    radar: {
+  1023→      news: radar?.news.length ?? 0,
+  1024→      live: radar?.live.length ?? 0,
+  1025→      liveNow: radar?.live.filter((m) => m.state === "in").length ?? 0,
+  1026→      fitness: radar?.fitness.length ?? 0,
+  1027→    },
+  1028→  };
+  1029→}
+  1030→
+  1031→// tree-shaking honesty imports
+  1032→void LEG_DETAIL_EN;
+  1033→void CONFIG.live;
+  1034→

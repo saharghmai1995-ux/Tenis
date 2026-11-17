@@ -1,0 +1,1305 @@
+     1→     1→// ─── NeoTennis Markov Quant v4.0 — Official Atomic ATP/WTA Markets ─────────
+     2→     2→// Per Kovalchik (2016): model accuracy collapses outside the Top-100.
+     3→     3→//
+     4→     4→// v4.0 mandate — EVERY leg on Tabs 1/2/3 is exactly ONE standard single-button
+     5→     5→// market that exists on all real tennis bookmakers (no combined «+»/«یا»
+     6→     6→// phrases, no slang). The canonical table lives in
+     7→     7→// OFFICIAL_TENNIS_ATOMIC_ARCHETYPES below:
+     8→     8→//
+     9→     9→//   ARCH1 · Set Mastery        (S_fav ≥ 0.64)
+    10→    10→//           A: Set Betting — Favorite 2-0          (~1.95–2.20)
+    11→    11→//           B: Total Sets — Over 2.5 Sets          (~2.50–2.85)
+    12→    12→//           Prob_A = P(2-0) · Prob_B = P(2-1) + P(1-2)  → 3 of 4 Bo3 outcomes
+    13→    13→//           covered with two standard buttons.
+    14→    14→//   ARCH2 · Exact Set Split    (0.54 ≤ S_A < 0.64)
+    15→    15→//           A: Set Betting — Player 1 (2-0)        (~2.25–2.50)
+    16→    16→//           B: Set Betting — Player 1 (2-1)        (~3.20–3.60)
+    17→    17→//           Prob_A = P(2-0) · Prob_B = P(2-1) — both sit side by side in the
+    18→    18→//           Set Betting grid and cover 100% of player-1's win paths.
+    19→    19→//   ARCH3 · Serve-Bot Games    (Hold_fav ≥ 84%)
+    20→    20→//           A: Total Games — Over 22.5             (~1.90–2.05)
+    21→    21→//           B: Game Handicap — Fav −4.5 Games      (~2.80–3.20)
+    22→    22→//           Tight/long match → A pays; favorite breaks away 6-2/6-3 → B pays.
+    23→    23→//
+    24→    24→// v3.0 mechanism kept intact — GUARANTEED COVERAGE QUOTA: at least 65% of
+    25→    25→// today's main-tour singles card (minimum 12 matches) leaves the gate with
+    26→    26→// one of the 3 archetypes; matches whose natural gate failed are re-examined
+    27→    27→// in ascending simultaneous-loss order and the least-risk archetype is
+    28→    28→// granted adaptively (flagged `adaptive`, risk always shown honestly).
+    29→    29→
+    30→    30→import type {
+    31→    31→  AnalyzedMatch,
+    32→    32→  ArchetypeEval,
+    33→    33→  ArchetypeInfo,
+    34→    34→  Slip,
+    35→    35→  VetoInfo,
+    36→    36→} from "./types";
+    37→    37→
+    38→    38→const TOP100_LIMIT = 100;
+    39→    39→
+    40→    40→// coverage gates — the exact uncovered (simultaneous-loss) mass of each
+    41→    41→// archetype must stay below the doc thresholds for a NATURAL approval
+    42→    42→const ARCH1_MAX_PAIR_LOSS = 0.085; // coverage ≥ 91.5%
+    43→    43→const ARCH2_MAX_PAIR_LOSS = 0.095; // risk < 9.5%
+    44→    44→const ARCH3_MAX_PAIR_LOSS = 0.095; // risk < 9.5%
+    45→    45→
+    46→    46→// v4.0 archetype windows (master-prompt table, exactly as specified)
+    47→    47→const ARCH1_MIN_S = 0.64;
+    48→    48→const ARCH2_MIN_S = 0.54;
+    49→    49→const ARCH2_MAX_S = 0.64;
+    50→    50→const ARCH3_MIN_HOLD_FAV = 0.84;
+    51→    51→const ARCH3_MIN_HOLD_DOG = 0.82;
+    52→    52→
+    53→    53→const ARCH_LABELS: Record<string, { fa: string; en: string }> = {
+    54→    54→  ARCH1: { fa: "الگوی رسمی ۱ — تسلط ست‌ها", en: "Set Mastery" },
+    55→    55→  ARCH2: { fa: "الگوی رسمی ۲ — تفکیک دقیق ست‌ها", en: "Exact Set Split" },
+    56→    56→  ARCH3: { fa: "الگوی رسمی ۳ — گیم‌های سرویس‌زنان", en: "Serve-Bot Games" },
+    57→    57→};
+    58→    58→
+    59→    59→// ─── v4.0 · OFFICIAL_TENNIS_ATOMIC_ARCHETYPES ──────────────────────────────
+    60→    60→// The canonical single-button market table (code, official English name,
+    61→    61→// Persian bet text template, odds window and the market price the ledger
+    62→    62→// simulates taking). Also drives the one-time record re-pricing sync.
+    63→    63→export interface AtomicLegSpec {
+    64→    64→  leg: string;
+    65→    65→  marketEn: string;
+    66→    66→  oddsWindow: [number, number];
+    67→    67→  price: number;
+    68→    68→}
+    69→    69→
+    70→    70→export interface AtomicArchetypeSpec {
+    71→    71→  code: "ARCH1" | "ARCH2" | "ARCH3";
+    72→    72→  labelFa: string;
+    73→    73→  labelEn: string;
+    74→    74→  windowFa: string;
+    75→    75→  legA: AtomicLegSpec;
+    76→    76→  legB: AtomicLegSpec;
+    77→    77→}
+    78→    78→
+    79→    79→export const OFFICIAL_TENNIS_ATOMIC_ARCHETYPES: Record<
+    80→    80→  "ARCH1" | "ARCH2" | "ARCH3",
+    81→    81→  AtomicArchetypeSpec
+    82→    82→> = {
+    83→    83→  ARCH1: {
+    84→    84→    code: "ARCH1",
+    85→    85→    labelFa: ARCH_LABELS.ARCH1.fa,
+    86→    86→    labelEn: ARCH_LABELS.ARCH1.en,
+    87→    87→    windowFa: "برتری فاوریت — S_fav ≥ 64%",
+    88→    88→    legA: {
+    89→    89→      leg: "SB-F20",
+    90→    90→      marketEn: "SET BETTING — FAVORITE 2-0",
+    91→    91→      oddsWindow: [1.95, 2.2],
+    92→    92→      price: 1.97,
+    93→    93→    },
+    94→    94→    legB: {
+    95→    95→      leg: "TS-O25",
+    96→    96→      marketEn: "TOTAL SETS — OVER 2.5 SETS",
+    97→    97→      oddsWindow: [2.5, 2.85],
+    98→    98→      price: 2.68,
+    99→    99→    },
+   100→   100→  },
+   101→   101→  ARCH2: {
+   102→   102→    code: "ARCH2",
+   103→   103→    labelFa: ARCH_LABELS.ARCH2.fa,
+   104→   104→    labelEn: ARCH_LABELS.ARCH2.en,
+   105→   105→    windowFa: "بازی‌های نزدیک ستارگان — 54% ≤ S_A < 64%",
+   106→   106→    legA: {
+   107→   107→      leg: "SB-P1-20",
+   108→   108→      marketEn: "SET BETTING — PLAYER 1 (2-0)",
+   109→   109→      oddsWindow: [2.25, 2.5],
+   110→   110→      price: 2.38,
+   111→   111→    },
+   112→   112→    legB: {
+   113→   113→      leg: "SB-P1-21",
+   114→   114→      marketEn: "SET BETTING — PLAYER 1 (2-1)",
+   115→   115→      oddsWindow: [3.2, 3.6],
+   116→   116→      price: 3.4,
+   117→   117→    },
+   118→   118→  },
+   119→   119→  ARCH3: {
+   120→   120→    code: "ARCH3",
+   121→   121→    labelFa: ARCH_LABELS.ARCH3.fa,
+   122→   122→    labelEn: ARCH_LABELS.ARCH3.en,
+   123→   123→    windowFa: "سرویس‌زنان قدرتمند — Hold ≥ 84%",
+   124→   124→    legA: {
+   125→   125→      leg: "TG-O225",
+   126→   126→      marketEn: "TOTAL GAMES — OVER 22.5",
+   127→   127→      oddsWindow: [1.9, 2.05],
+   128→   128→      price: 1.98,
+   129→   129→    },
+   130→   130→    legB: {
+   131→   131→      leg: "GH-F45",
+   132→   132→      marketEn: "GAME HANDICAP — FAV −4.5 GAMES",
+   133→   133→      oddsWindow: [2.8, 3.2],
+   134→   134→      price: 3.0,
+   135→   135→    },
+   136→   136→  },
+   137→   137→};
+   138→   138→
+   139→   139→// Market-priced legs — the ledger simulates TAKING the tip at the real market
+   140→   140→// price while the model probability stays the edge metric.
+   141→   141→// v6.0 — the SIX atomic archetype legs (SB-F20, TS-O25, SB-P1-20, SB-P1-21,
+   142→   142→// TG-O225, GH-F45) + the new heavy-favorite game legs (TG-U205, TG-O205,
+   143→   143→// SB-F21) are DYNAMICALLY priced per match via computeReal1xBetTennisOdds;
+   144→   144→// they are NOT in this static map, so the re-pricing sync never flattens a
+   145→   145→// per-match real price back to a constant. Legacy v2/v3 leg codes keep their
+   146→   146→// old prices so the stored 7-day record is never re-priced against itself.
+   147→   147→export const DUAL_LEG_MARKET_ODDS: Record<string, number> = {
+   148→   148→  // ─── v5.0 · 5-Regime Router official single-button prices ──────────────
+   149→   149→  "MW-FAV": 1.48,   // BANKER — MATCH WINNER — FAVORITE (window 1.38-1.65)
+   150→   150→  "SH-F15": 1.62,   // BANKER — SET HANDICAP — FAVORITE -1.5 SETS
+   151→   151→  "RC-FWU215": 2.15, // COMBO-UNDER — FAVORITE WIN & UNDER 21.5 GAMES
+   152→   152→  "RC-O215": 2.95,   // COMBO-UNDER cover — TOTAL GAMES OVER 21.5
+   153→   153→  "RC-FWO205": 1.95, // COMBO-OVER — FAVORITE WIN & OVER 20.5 GAMES
+   154→   154→  "RC-U205": 3.05,   // COMBO-OVER cover — TOTAL GAMES UNDER 20.5
+   155→   155→  "CL-F20U195": 2.8, // CLUSTER S1 — favorite fast 2-0 (under 19.5 games)
+   156→   156→  "CL-F20G20": 3.9,  // CLUSTER S2 — favorite close 2-0 (20-22 games / TB)
+   157→   157→  "CL-F21": 3.6,     // CLUSTER S3 — favorite 2-1
+   158→   158→  // legacy v2.0/v3.0 legs (historical record integrity)
+   159→   159→  "A": 2.05,
+   160→   160→  "A-O195": 2.0,
+   161→   161→  "A-O225": 2.08,
+   162→   162→  "B": 2.7,
+   163→   163→  "B-ALT": 2.75,
+   164→   164→  "B-U225": 2.95,
+   165→   165→};
+   166→   166→
+   167→   167→/** legs whose price is computed per-match (never re-priced to a constant) */
+   168→   168→export const DYNAMIC_PRICED_LEGS = new Set([
+   169→   169→  "SB-F20", "TS-O25", "SB-P1-20", "SB-P1-21", "TG-O225", "GH-F45",
+   170→   170→  "TG-U205", "TG-O205", "SB-F21",
+   171→   171→]);
+   172→   172→
+   173→   173→// the two complementary wings of each archetype (leg → its pair leg)
+   174→   174→const LEG_PAIR: Record<string, string> = {
+   175→   175→  "SB-F20": "TS-O25",
+   176→   176→  "TS-O25": "SB-F20",
+   177→   177→  "SB-P1-20": "SB-P1-21",
+   178→   178→  "SB-P1-21": "SB-P1-20",
+   179→   179→  "TG-O225": "GH-F45",
+   180→   180→  "GH-F45": "TG-O225",
+   181→   181→  // v6.0 — heavy-favorite game-domain pair (Tip A handicap/under ⇄ Tip B over)
+   182→   182→  "TG-U205": "TG-O205",
+   183→   183→  "TG-O205": "TG-U205",
+   184→   184→  "SB-F21": "GH-F45",
+   185→   185→  "A": "B",
+   186→   186→  "B": "A",
+   187→   187→  "A-O195": "B-ALT",
+   188→   188→  "B-ALT": "A-O195",
+   189→   189→  "A-O225": "B-U225",
+   190→   190→  "B-U225": "A-O225",
+   191→   191→  // v5.0 — COMBO regime main ⇄ cover wings (equal-profit dutching)
+   192→   192→  "RC-FWU215": "RC-O215",
+   193→   193→  "RC-O215": "RC-FWU215",
+   194→   194→  "RC-FWO205": "RC-U205",
+   195→   195→  "RC-U205": "RC-FWO205",
+   196→   196→};
+   197→   197→
+   198→   198→// legs whose wing carries the تیپ A label (everything else is تیپ B)
+   199→   199→const LEG_IS_A = new Set([
+   200→   200→  "SB-F20", "SB-P1-20", "TG-O225", "A", "A-O195", "A-O225",
+   201→   201→  // v5.0 — BANKER single-button legs + COMBO mains
+   202→   202→  "MW-FAV", "SH-F15", "RC-FWU215", "RC-FWO205",
+   203→   203→]);
+   204→   204→
+   205→   205→// legacy legs keep the historical 50/50 split; v4.0 legs use the exact
+   206→   206→// dutching split derived from the two official market prices
+   207→   207→const LEGACY_LEGS = new Set(["A", "B", "A-O195", "B-ALT", "A-O225", "B-U225"]);
+   208→   208→
+   209→   209→export function legLabelOf(leg: string): string {
+   210→   210→  return LEG_IS_A.has(leg) ? "تیپ A" : "تیپ B";
+   211→   211→}
+   212→   212→
+   213→   213→/** v4.0 — equal-profit dutching stakes from the two leg prices (sum = 100). */
+   214→   214→export function dutchStakes(
+   215→   215→  oddsA: number,
+   216→   216→  oddsB: number
+   217→   217→): { stakeA: number; stakeB: number } {
+   218→   218→  const invA = 1 / Math.max(oddsA, 1.01);
+   219→   219→  const invB = 1 / Math.max(oddsB, 1.01);
+   220→   220→  const stakeA = Math.round(((100 * invA) / (invA + invB)) * 10) / 10;
+   221→   221→  const stakeB = Math.round((100 - stakeA) * 10) / 10;
+   222→   222→  return { stakeA, stakeB };
+   223→   223→}
+   224→   224→
+   225→   225→/** v4.0 — dutching stake (units) of a single DUAL wing inside its 100-unit match position.
+   226→   226→ *  v5.5 — the LEGACY 50/50 special case is REMOVED: every wing pair (including
+   227→   227→ *  the historical A/B legs) dutches the same 100-unit budget by market price. */
+   228→   228→export function dualStakeFor(leg: string): number {
+   229→   229→  const pair = LEG_PAIR[leg];
+   230→   230→  if (!pair) return STANDARD_MATCH_STAKE / 2;
+   231→   231→  const oddsLeg = DUAL_LEG_MARKET_ODDS[leg] ?? 2;
+   232→   232→  const oddsPair = DUAL_LEG_MARKET_ODDS[pair] ?? 2;
+   233→   233→  const { stakeA, stakeB } = dutchStakes(oddsLeg, oddsPair);
+   234→   234→  return LEG_IS_A.has(leg) ? stakeA : stakeB;
+   235→   235→}
+   236→   236→
+   237→   237→function marketOdds(leg: string): number {
+   238→   238→  return DUAL_LEG_MARKET_ODDS[leg] ?? 2.0;
+   239→   239→}
+   240→   240→
+   241→   241→export interface ArchetypeReport {
+   242→   242→  evals: ArchetypeEval[];
+   243→   243→  selected?: ArchetypeInfo;
+   244→   244→}
+   245→   245→
+   246→   246→/**
+   247→   247→ * Evaluates the 3 official atomic archetypes and selects the eligible one
+   248→   248→ * with the lowest exact simultaneous-loss probability. If none qualifies the
+   249→   249→ * match is vetoed to the shadow ledger (no forced approvals).
+   250→   250→ */
+   251→   251→export function evaluateArchetypes(m: AnalyzedMatch): ArchetypeReport {
+   252→   252→  const a = m.markov.arch;
+   253→   253→  const sFav = m.favorite === "A" ? m.markov.setWinA : 1 - m.markov.setWinA;
+   254→   254→  const holdFav = m.favorite === "A" ? m.markov.gA : m.markov.gB;
+   255→   255→  const holdDog = m.favorite === "A" ? m.markov.gB : m.markov.gA;
+   256→   256→
+   257→   257→  const mkEval = (
+   258→   258→    code: "ARCH1" | "ARCH2" | "ARCH3",
+   259→   259→    pairLoss: number,
+   260→   260→    windowOk: boolean,
+   261→   261→    windowWhy: string
+   262→   262→  ): ArchetypeEval => {
+   263→   263→    const max =
+   264→   264→      code === "ARCH1"
+   265→   265→        ? ARCH1_MAX_PAIR_LOSS
+   266→   266→        : code === "ARCH2"
+   267→   267→          ? ARCH2_MAX_PAIR_LOSS
+   268→   268→          : ARCH3_MAX_PAIR_LOSS;
+   269→   269→    const riskOk = pairLoss <= max;
+   270→   270→    const eligible = windowOk && riskOk;
+   271→   271→    return {
+   272→   272→      code,
+   273→   273→      labelFa: ARCH_LABELS[code].fa,
+   274→   274→      labelEn: ARCH_LABELS[code].en,
+   275→   275→      coverage: 1 - pairLoss,
+   276→   276→      pairLoss,
+   277→   277→      eligible,
+   278→   278→      whyNot: eligible
+   279→   279→        ? undefined
+   280→   280→        : !windowOk
+   281→   281→          ? `${windowWhy} (${code === "ARCH2" ? "پنجره الگو ۲: 54% ≤ S_A < 64%" : code === "ARCH1" ? "پنجره الگو ۱: S_fav ≥ 64%" : "پنجره الگو ۳: Hold ≥ 84%"})`
+   282→   282→          : `ریسک باخت همزمان ${(pairLoss * 100).toFixed(1)}% بالاتر از سقف ${(max * 100).toFixed(1)}%`,
+   283→   283→    };
+   284→   284→  };
+   285→   285→
+   286→   286→  const arch1 = mkEval(
+   287→   287→    "ARCH1",
+   288→   288→    a.pairLoss1,
+   289→   289→    sFav >= ARCH1_MIN_S,
+   290→   290→    `S_fav = ${(sFav * 100).toFixed(1)}% زیر آستانه تسلط 64%`
+   291→   291→  );
+   292→   292→  const arch2 = mkEval(
+   293→   293→    "ARCH2",
+   294→   294→    a.pairLoss2,
+   295→   295→    m.markov.setWinA >= ARCH2_MIN_S && m.markov.setWinA < ARCH2_MAX_S,
+   296→   296→    m.markov.setWinA < ARCH2_MIN_S
+   297→   297→      ? `S_A = ${(m.markov.setWinA * 100).toFixed(1)}% زیر کف پنجره رقابتی 54%`
+   298→   298→      : `S_A = ${(m.markov.setWinA * 100).toFixed(1)}% بالاتر از سقف پنجره رقابتی 64%`
+   299→   299→  );
+   300→   300→  const arch3 = mkEval(
+   301→   301→    "ARCH3",
+   302→   302→    a.pairLoss3,
+   303→   303→    holdFav >= ARCH3_MIN_HOLD_FAV && holdDog >= ARCH3_MIN_HOLD_DOG,
+   304→   304→    `Hold فاوریت ${(holdFav * 100).toFixed(1)}% / حریف ${(holdDog * 100).toFixed(1)}% — زیر آستانه دوئل سرویس (84%/82%)`
+   305→   305→  );
+   306→   306→
+   307→   307→  const evals = [arch1, arch2, arch3];
+   308→   308→  const eligible = evals.filter((e) => e.eligible);
+   309→   309→  if (eligible.length === 0) return { evals };
+   310→   310→
+   311→   311→  // most robust coverage wins the tie
+   312→   312→  eligible.sort((x, y) => x.pairLoss - y.pairLoss);
+   313→   313→  const win = eligible[0];
+   314→   314→  return {
+   315→   315→    evals,
+   316→   316→    selected: {
+   317→   317→      code: win.code,
+   318→   318→      labelFa: win.labelFa,
+   319→   319→      labelEn: win.labelEn,
+   320→   320→      coverage: win.coverage,
+   321→   321→      pairLoss: win.pairLoss,
+   322→   322→    },
+   323→   323→  };
+   324→   324→}
+   325→   325→
+   326→   326→/** Hard veto gate: Top-100 domain check + 3-archetype approval check. */
+   327→   327→export function supervisorGate(m: AnalyzedMatch, selected?: ArchetypeInfo): VetoInfo {
+   328→   328→  const rankA = m.playerA.rank;
+   329→   329→  const rankB = m.playerB.rank;
+   330→   330→  const badRankA = !rankA || rankA > TOP100_LIMIT;
+   331→   331→  const badRankB = !rankB || rankB > TOP100_LIMIT;
+   332→   332→  if (badRankA || badRankB) {
+   333→   333→    return {
+   334→   334→      vetoed: true,
+   335→   335→      code: "TOP100",
+   336→   336→      reason: `فیلتر تاپ-۱۰۰ سوپروایزر — ${badRankA ? `${m.playerA.name}${rankA ? ` (#${rankA})` : " (بدون رتبه)"}` : ""}${badRankA && badRankB ? " و " : ""}${badRankB ? `${m.playerB.name}${rankB ? ` (#${rankB})` : " (بدون رتبه)"}` : ""} خارج از دامنه دقت مدل (Kovalchik 2016)`,
+   337→   337→    };
+   338→   338→  }
+   339→   339→
+   340→   340→  if (!selected) {
+   341→   341→    const sFav = m.favorite === "A" ? m.markov.setWinA : 1 - m.markov.setWinA;
+   342→   342→    const best = [...(m.archEvals ?? [])].sort((x, y) => x.pairLoss - y.pairLoss)[0];
+   343→   343→    const bestTxt = best
+   344→   344→      ? `کم‌ریسک‌ترین الگو (${best.labelFa}) ریسک ${(best.pairLoss * 100).toFixed(1)}% دارد`
+   345→   345→      : "هیچ الگویی ارزیابی نشد";
+   346→   346→    return {
+   347→   347→      vetoed: true,
+   348→   348→      code: "P02_RISK",
+   349→   349→      reason: `هیچ الگوی مکملی صلاحیت ندارد — S_fav = ${(sFav * 100).toFixed(1)}% خارج از پنجره الگوها و ${bestTxt}؛ انتقال به دفتر سایه`,
+   350→   350→    };
+   351→   351→  }
+   352→   352→
+   353→   353→  return { vetoed: false, code: "NONE" };
+   354→   354→}
+   355→   355→
+   356→   356→export function isDualEligible(m: AnalyzedMatch): boolean {
+   357→   357→  return !m.veto.vetoed && !!m.archetype;
+   358→   358→}
+   359→   359→
+   360→   360→/**
+   361→   361→ * v6.0 — Monte-Carlo P(total games > 20.5) from the simulated games histogram.
+   362→   362→ * Feeds the heavy-favorite line switch (Bug-1 fix, Tab 1).
+   363→   363→ */
+   364→   364→function mcOverGames(m: AnalyzedMatch, line: number): number | undefined {
+   365→   365→  const mc = m.monteCarlo;
+   366→   366→  if (!mc || !mc.gamesDist || mc.runs <= 0) return undefined;
+   367→   367→  let hits = 0;
+   368→   368→  for (let g = Math.ceil(line); g < mc.gamesDist.length; g++) hits += mc.gamesDist[g];
+   369→   369→  return hits / mc.runs;
+   370→   370→}
+   371→   371→
+   372→   372→// ─── v4.0 · Official Atomic Slips ──────────────────────────────────────────
+   373→   373→// Every slip is EXACTLY ONE standard single-button bookmaker market with its
+   374→   374→// official English name (printed on the flashcard) and exact Persian text.
+   375→   375→// v6.0 — EVERY price is computeReal1xBetTennisOdds of THIS match's own
+   376→   376→// Markov/Monte-Carlo probability. The hardcoded 1.97x/2.68x constants of the
+   377→   377→// old table are NEVER printed again (Bug-1 fix), and heavy favorites are
+   378→   378→// auto-switched into dutchable game-domain lines.
+   379→   379→export function buildSlips(m: AnalyzedMatch): { A?: Slip; B?: Slip } {
+   380→   380→  if (m.veto.vetoed || !m.archetype) return {};
+   381→   381→  const fav = m.favorite;
+   382→   382→  const favName = fav === "A" ? m.playerA.name : m.playerB.name;
+   383→   383→  const a = m.markov.arch;
+   384→   384→
+   385→   385→  switch (m.archetype.code) {
+   386→   386→    case "ARCH1": {
+   387→   387→      const p20Fav = fav === "A" ? m.markov.p20 : m.markov.p02;
+   388→   388→      const over25 = m.markov.p21 + m.markov.p12;
+   389→   389→      // ── v6.0 HEAVY-FAVORITE LAW (master-prompt §2) ────────────────────────
+   390→   390→      // When the 2-0 sweep probability exceeds 58%, its REAL 1xBet price
+   391→   391→      // drops below ~1.45x — undutchable against an Over-2.5 wing (~3.0x).
+   392→   392→      // The pair switches to the GAMES-DOMAIN lines that keep BOTH wings
+   393→   393→      // inside the dutchable 1.80–3.20 band:
+   394→   394→      //   Tip A → GAME HANDICAP — FAVORITE −4.5 GAMES  (or UNDER 20.5 GAMES)
+   395→   395→      //   Tip B → TOTAL GAMES — OVER 20.5 GAMES        (or FAVORITE WINS 2-1)
+   396→   396→      if (p20Fav > 0.58) {
+   397→   397→        const pFav45 = a.fav20Margin5;
+   398→   398→        const mcOver205 = mcOverGames(m, 20.5);
+   399→   399→        const pOver205 = mcOver205 ?? a.over225;
+   400→   400→        const pUnder205 = mcOver205 !== undefined ? 1 - mcOver205 : undefined;
+   401→   401→        const pFav21 = fav === "A" ? m.markov.p21 : m.markov.p12;
+   402→   402→        // Tip A: handicap −4.5 when its real price stays dutchable (≥1.8x ⇔
+   403→   403→        // prob ≤ ~52.7%); otherwise the UNDER 20.5 games line.
+   404→   404→        const useHandicap = pFav45 > 0.04 && pFav45 <= 0.527;
+   405→   405→        const useUnder = !useHandicap && pUnder205 !== undefined && pUnder205 >= 0.3 && pUnder205 <= 0.527;
+   406→   406→        if (useHandicap || useUnder) {
+   407→   407→          const slipA: Slip = useHandicap
+   408→   408→            ? {
+   409→   409→                leg: "GH-F45",
+   410→   410→                text: `هندیکپ گیم فاوریت: برد ${favName} با اختلاف بیش از ۴.۵ گیم`,
+   411→   411→                textEn: `${favName.toUpperCase()} −4.5 GAMES`,
+   412→   412→                odds: computeReal1xBetTennisOdds(pFav45, ONEXBET_OVERROUND_PROP),
+   413→   413→                prob: pFav45,
+   414→   414→                targetWindow: [1.8, 2.6],
+   415→   415→                marketEn: "GAME HANDICAP — FAVORITE -4.5 GAMES",
+   416→   416→                marketFa: `هندیکپ گیم فاوریت: ${favName} −۴.۵ گیم (برد با اختلاف ≥ ۵ گیم)`,
+   417→   417→              }
+   418→   418→            : {
+   419→   419→                leg: "TG-U205",
+   420→   420→                text: `مجموع گیم‌های بازی: زیر ۲۰.۵ گیم (برد سریع فاوریت)`,
+   421→   421→                textEn: "TOTAL GAMES — UNDER 20.5 GAMES",
+   422→   422→                odds: computeReal1xBetTennisOdds(pUnder205!, ONEXBET_OVERROUND_PROP),
+   423→   423→                prob: pUnder205!,
+   424→   424→                targetWindow: [1.8, 2.4],
+   425→   425→                marketEn: "TOTAL GAMES — UNDER 20.5 GAMES",
+   426→   426→                marketFa: "مجموع گیم‌های مسابقه: زیر ۲۰.۵ گیم (دو ست کوتاه پیاپی)",
+   427→   427→              };
+   428→   428→          // Tip B: the complementary GAMES-domain wing (OVER 20.5) whenever
+   429→   429→          // its real price lands inside the dutchable band; otherwise the
+   430→   430→          // FAVORITE WINS 2-1 set-betting wing.
+   431→   431→          const pB = pOver205;
+   432→   432→          const slipB: Slip =
+   433→   433→            pB > 0.28 && pB < 0.527
+   434→   434→              ? {
+   435→   435→                  leg: "TG-O205",
+   436→   436→                  text: "مجموع گیم‌های بازی: بالای ۲۰.۵ گیم (بازی رقابتی‌تر از انتظار)",
+   437→   437→                  textEn: "TOTAL GAMES — OVER 20.5 GAMES",
+   438→   438→                  odds: computeReal1xBetTennisOdds(pB, ONEXBET_OVERROUND_PROP),
+   439→   439→                  prob: pB,
+   440→   440→                  targetWindow: [1.8, 2.6],
+   441→   441→                  marketEn: "TOTAL GAMES — OVER 20.5 GAMES",
+   442→   442→                  marketFa: "مجموع گیم‌های مسابقه: بالای ۲۰.۵ گیم",
+   443→   443→                }
+   444→   444→              : {
+   445→   445→                  leg: "SB-F21",
+   446→   446→                  text: `نتیجه دقیق ست‌ها: برد ۲-۱ ${favName} (فاوریت در سه ست)`,
+   447→   447→                  textEn: `${favName.toUpperCase()} WINS 2-1`,
+   448→   448→                  odds: computeReal1xBetTennisOdds(pFav21, ONEXBET_OVERROUND_MAIN),
+   449→   449→                  prob: pFav21,
+   450→   450→                  targetWindow: [2.45, 3.2],
+   451→   451→                  marketEn: "SET BETTING — FAVORITE WINS 2-1",
+   452→   452→                  marketFa: `نتیجه دقیق ست‌ها: برد ۲-۱ ${favName} (فاوریت در سه ست)`,
+   453→   453→                };
+   454→   454→          return { A: slipA, B: slipB };
+   455→   455→        }
+   456→   456→      }
+   457→   457→      // ── standard ARCH1 pair — now with REAL per-match 1xBet prices ────────
+   458→   458→      const spec = OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH1;
+   459→   459→      return {
+   460→   460→        A: {
+   461→   461→          leg: spec.legA.leg,
+   462→   462→          text: `نتیجه دقیق ست‌ها: برد ۲-۰ ${favName}`,
+   463→   463→          textEn: `${favName.toUpperCase()} WINS 2-0`,
+   464→   464→          odds: computeReal1xBetTennisOdds(p20Fav, ONEXBET_OVERROUND_MAIN),
+   465→   465→          prob: p20Fav,
+   466→   466→          targetWindow: spec.legA.oddsWindow,
+   467→   467→          marketEn: spec.legA.marketEn,
+   468→   468→          marketFa: `نتیجه دقیق ست‌ها: برد ۲-۰ ${favName} (برد فاوریت در دو ست متوالی)`,
+   469→   469→        },
+   470→   470→        B: {
+   471→   471→          leg: spec.legB.leg,
+   472→   472→          text: `مجموع ست‌های بازی: بالای ۲.۵ ست (رفتن بازی به ست سوم)`,
+   473→   473→          textEn: "OVER 2.5 SETS",
+   474→   474→          odds: computeReal1xBetTennisOdds(over25, ONEXBET_OVERROUND_MAIN),
+   475→   475→          prob: over25,
+   476→   476→          targetWindow: spec.legB.oddsWindow,
+   477→   477→          marketEn: spec.legB.marketEn,
+   478→   478→          marketFa: `مجموع ست‌های مسابقه: بالای ۲.۵ ست (رفتن بازی به ست سوم)`,
+   479→   479→        },
+   480→   480→      };
+   481→   481→    }
+   482→   482→    case "ARCH2": {
+   483→   483→      // A — Set Betting Player 1 (2-0) · B — Set Betting Player 1 (2-1)
+   484→   484→      // both legs side by side in the bookmaker Set Betting grid; together
+   485→   485→      // they cover 100% of player-1's win paths at high odds.
+   486→   486→      // v6.0 — REAL per-match 1xBet prices (no static 2.38/3.4 constants).
+   487→   487→      const spec = OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH2;
+   488→   488→      const p1Name = m.playerA.name; // ARCH2 window guarantees S_A ≥ 0.54 → player 1 is the favorite
+   489→   489→      return {
+   490→   490→        A: {
+   491→   491→          leg: spec.legA.leg,
+   492→   492→          text: `نتیجه دقیق ست‌ها: برد ۲-۰ ${p1Name} (بازیکن اول)`,
+   493→   493→          textEn: `${p1Name.toUpperCase()} WINS 2-0`,
+   494→   494→          odds: computeReal1xBetTennisOdds(m.markov.p20, ONEXBET_OVERROUND_MAIN),
+   495→   495→          prob: m.markov.p20,
+   496→   496→          targetWindow: spec.legA.oddsWindow,
+   497→   497→          marketEn: spec.legA.marketEn,
+   498→   498→          marketFa: `نتیجه دقیق ست‌ها: برد ۲-۰ ${p1Name} (بازیکن اول مسابقه)`,
+   499→   499→        },
+   500→   500→        B: {
+   501→   501→          leg: spec.legB.leg,
+   502→   502→          text: `نتیجه دقیق ست‌ها: برد ۲-۱ ${p1Name} (بازیکن اول)`,
+   503→   503→          textEn: `${p1Name.toUpperCase()} WINS 2-1`,
+   504→   504→          odds: computeReal1xBetTennisOdds(m.markov.p21, ONEXBET_OVERROUND_MAIN),
+   505→   505→          prob: m.markov.p21,
+   506→   506→          targetWindow: spec.legB.oddsWindow,
+   507→   507→          marketEn: spec.legB.marketEn,
+   508→   508→          marketFa: `نتیجه دقیق ست‌ها: برد ۲-۱ ${p1Name} (بازیکن اول مسابقه در سه ست)`,
+   509→   509→        },
+   510→   510→      };
+   511→   511→    }
+   512→   512→    case "ARCH3": {
+   513→   513→      // A — Total Games Over 22.5 · B — Game Handicap favorite −4.5 games
+   514→   514→      // v6.0 — REAL per-match 1xBet prices (no static 1.98/3.0 constants).
+   515→   515→      const spec = OFFICIAL_TENNIS_ATOMIC_ARCHETYPES.ARCH3;
+   516→   516→      return {
+   517→   517→        A: {
+   518→   518→          leg: spec.legA.leg,
+   519→   519→          text: `مجموع گیم‌های بازی: بالای ۲۲.۵ گیم`,
+   520→   520→          textEn: "OVER 22.5 TOTAL GAMES",
+   521→   521→          odds: computeReal1xBetTennisOdds(a.over225, ONEXBET_OVERROUND_PROP),
+   522→   522→          prob: a.over225,
+   523→   523→          targetWindow: spec.legA.oddsWindow,
+   524→   524→          marketEn: spec.legA.marketEn,
+   525→   525→          marketFa: `مجموع گیم‌های مسابقه: بالای ۲۲.۵ گیم (گره خوردن و طولانی شدن بازی)`,
+   526→   526→        },
+   527→   527→        B: {
+   528→   528→          leg: spec.legB.leg,
+   529→   529→          text: `هندیکپ گیم فاوریت: برد ${favName} با اختلاف بیش از ۴.۵ گیم`,
+   530→   530→          textEn: `${favName.toUpperCase()} −4.5 GAMES`,
+   531→   531→          odds: computeReal1xBetTennisOdds(a.fav20Margin5, ONEXBET_OVERROUND_PROP),
+   532→   532→          prob: a.fav20Margin5,
+   533→   533→          targetWindow: spec.legB.oddsWindow,
+   534→   534→          marketEn: spec.legB.marketEn,
+   535→   535→          marketFa: `هندیکپ گیم فاوریت: ${favName} −۴.۵ گیم (برد سریع با اختلاف ≥ ۵ گیم مثل ۶-۲، ۶-۳)`,
+   536→   536→        },
+   537→   537→      };
+   538→   538→    }
+   539→   539→  }
+   540→   540→}
+   541→   541→
+   542→   542→export function round2(x: number): number {
+   543→   543→  return Math.round(x * 100) / 100;
+   544→   544→}
+   545→   545→
+   546→   546→// ─── v3.0 quota telemetry (shared type) ────────────────────────────────────
+   547→   547→// The v2.0 audit found ALL 40 matches of the day vetoed (0 approved / 40
+   548→   548→// vetoed) because missing scoreboard ranks starved the Top-100 gate. The
+   549→   549→// rank fix (resolvePlayerRankAndApprove in the engine) removes the starvation
+   550→   550→// cause; the v5.0 quota guarantees the OUTPUT side: at least 65% of today's
+   551→   551→// main-tour singles card — minimum 12 matches — leaves the gate with one of
+   552→   552→// the 5 regimes, so production tabs can never go empty.
+   553→   553→
+   554→   554→export interface QuotaTelemetry {
+   555→   555→  poolSize: number;
+   556→   556→  approved: number;
+   557→   557→  natural: number;
+   558→   558→  adaptive: number;
+   559→   559→  ratio: number;
+   560→   560→}
+   561→   561→
+   562→   562→// ─── v5.5 · STANDARD MATCH STAKE — the 100-unit law ────────────────────────
+   563→   563→// Master-prompt v5.5 mandate: EVERY card and EVERY ledger row — golden dual
+   564→   564→// pairs, safe bankers, copula combos, exact clusters, service-king
+   565→   565→// accumulators, mix parlays, high-odds snipers AND silver-crown adaptive
+   566→   566→// grants — rides EXACTLY the same 100-unit match budget. The 1u / 2u / 50u /
+   567→   567→// 60u stakes of the earlier versions are removed from the codebase by
+   568→   568→// construction (silver cards no longer halve the stake either).
+   569→   569→export const STANDARD_MATCH_STAKE = 100;
+   570→   570→
+   571→   571→// ═══════════════════════════════════════════════════════════════════════════
+   572→   572→// ─── v5.5 · 5-REGIME NON-LINEAR TENNIS ROUTER + DISTRIBUTION ALLOCATOR ─────
+   573→   573→// Every match is routed to EXACTLY ONE optimal regime by the non-linear
+   574→   574→// Sharpe ratio computed from the 10k Monte-Carlo + Gaussian-copula pipeline:
+   575→   575→//
+   576→   576→//   🏦 BANKER      S_fav ≥ 0.70 & Hold_fav ≥ 78% → MATCH WINNER / SET
+   577→   577→//                  HANDICAP ±1.5 · odds 1.38–1.65x · stake 100u (feeds ACCUM)
+   578→   578→//   🧩 COMBO       copula corr(fav-win × games) > 55% → Fav Win & U21.5/O20.5
+   579→   579→//                  + official cover leg · odds 1.85–2.40x · coverage > 84%
+   580→   580→//   🎯 CLUSTER     low Shannon entropy & top-3 scenarios > 55% → dutching
+   581→   581→//                  100u on 3 exact scenarios · 2.80–4.20x · net +35–55%
+   582→   582→//   ⚖️ DUAL-HEDGE  P(0-2) ≤ 8.8% → the champion golden pair (SB 2-0 +
+   583→   583→//                  Over 2.5 Sets) · win rate 88.2%
+   584→   584→//   🔗 ACCUMULATOR day-level: 2–3 best BANKER matches · stake 100u
+   585→   585→//
+   586→   586→// v5.5 distribution law (master prompt §2): the approved pool of TODAY and of
+   587→   587→// the settled 7-day history must populate ALL 5 regimes — the engine's
+   588→   588→// allocateFiveRegimes() tops up under-filled regimes via forceRegimeRoute()
+   589→   589→// so no ledger row stays at «0 (0) | +0.0».
+   590→   590→// ═══════════════════════════════════════════════════════════════════════════
+   591→   591→
+   592→   592→import { monteCarloScore } from "./copula";
+   593→   593→import type { CrownInfo, MonteCarloResult, RegimeCode, RegimeDecision } from "./types";
+   594→   594→
+   595→   595→export const REGIME_META: Record<RegimeCode | "VETOED", { icon: string; labelFa: string; labelEn: string }> = {
+   596→   596→  BANKER: { icon: "🏦", labelFa: "بانکر امن سرویس", labelEn: "TENNIS BANKER" },
+   597→   597→  COMBO: { icon: "🧩", labelFa: "کمبوی رسمی نتیجه و گیم", labelEn: "TENNIS COMBO" },
+   598→   598→  CLUSTER: { icon: "🎯", labelFa: "خوشه نتیجه دقیق ست و گیم", labelEn: "EXACT SET & GAME CLUSTER" },
+   599→   599→  "DUAL-HEDGE": { icon: "⚖️", labelFa: "زوج‌تیپ طلایی ست‌شماری", labelEn: "DUAL-HEDGE GOLDEN PAIR" },
+   600→   600→  ACCUMULATOR: { icon: "🔗", labelFa: "آکومولاتور سلاطین سرویس", labelEn: "SERVICE KINGS ACCUMULATOR" },
+   601→   601→  VETOED: { icon: "🛡️", labelFa: "وتو سوپروایزر", labelEn: "SUPERVISOR VETO" },
+   602→   602→};
+   603→   603→
+   604→   604→// regime gates — v5.5 calibration: the master-prompt banker window reads
+   605→   605→// «for favorites with S_A ≥ 0.70» and the 5-regime distribution law requires
+   606→   606→// every regime to receive its share of the approved pool, so the windows are
+   607→   607→// calibrated to ROUTE (not starve) the approved matches across all 5 regimes.
+   608→   608→const BANKER_MIN_S = 0.7;
+   609→   609→const BANKER_MIN_HOLD = 0.78;
+   610→   610→const BANKER_MAX_PAIR_LOSS = 0.22; // favorite win prob ≥ 78%
+   611→   611→const COMBO_MIN_CORR = 0.55; // copula joint mass — dominant-favorite variant
+   612→   612→const COMBO_MIN_SHARE_SRV = 0.55; // share of fav wins over 20.5 — serve battles
+   613→   613→const COMBO_MIN_COVERAGE = 0.84; // dominant-favorite combo coverage
+   614→   614→const COMBO_MIN_COVERAGE_SRV = 0.8;
+   615→   615→const CLUSTER_MAX_ENTROPY = 1.3; // nats (ln 4 ≈ 1.386 → low-entropy matches)
+   616→   616→const CLUSTER_MIN_MASS = 0.55;
+   617→   617→const DUAL_MAX_P02 = 0.088; // the champion pattern gate (88.2% win rate era)
+   618→   618→
+   619→   619→// ─── v6.0 · 1xBET REAL-MARGIN PRICING (Bug-2 fix: DIVIDE by the overround!) ┐
+   620→   620→// The pre-v6.0 code priced every regime leg as (1/prob) × 1.07 — MULTIPLYING
+   621→   621→// by the book margin — which printed odds 12–18% HIGHER than the real 1xBet
+   622→   622→// board. The real board applies the overround by DEFLATING the fair odds:
+   623→   623→//   realOdds = 1 / (trueProb × overround)
+   624→   624→// On top of that, the old clampPrice(...) squeezed every price into artificial
+   625→   625→// windows (e.g. a 70.8% Over-21.5 wing with a REAL 1xBet price of 1.34x was
+   626→   626→// locked at 2.70x). Both distortions are removed by construction: every leg
+   627→   627→// now prints the exact 1xBet real price of its own Markov probability.
+   628→   628→export const ONEXBET_OVERROUND_MAIN = 1.052;   // ۵.۲٪ کارمزد خط اصلی برد/ست
+   629→   629→export const ONEXBET_OVERROUND_PROP = 1.065;   // ۶.۵٪ کارمزد مجموع گیم و کمبو
+   630→   630→export const ONEXBET_OVERROUND_EXOTIC = 1.075; // ۷.۵٪ کارمزد سناریوهای دقیق
+   631→   631→
+   632→   632→/**
+   633→   633→ * v6.0 — the exact 1xBet real-board price of a true probability (Bug-2 fix).
+   634→   634→ * DIVIDES by the overround (never multiplies), 2-decimal board precision.
+   635→   635→ */
+   636→   636→export function computeReal1xBetTennisOdds(
+   637→   637→  trueProb: number,
+   638→   638→  overround: number = ONEXBET_OVERROUND_MAIN
+   639→   639→): number {
+   640→   640→  const safeProb = Math.max(0.06, Math.min(0.9, trueProb));
+   641→   641→  const raw1xBetOdds = 1 / (safeProb * overround);
+   642→   642→  return Number(Math.max(1.14, Math.min(12.0, raw1xBetOdds)).toFixed(2));
+   643→   643→}
+   644→   644→
+   645→   645→const fairPrice = (prob: number, overround: number) =>
+   646→   646→  prob > 0.01 ? computeReal1xBetTennisOdds(prob, overround) : 12.0;
+   647→   647→
+   648→   648→/** Per-unit betting Sharpe of a single-leg position: EV / σ of the P&L. */
+   649→   649→export function bettingSharpe(prob: number, odds: number): number {
+   650→   650→  const ev = prob * odds - 1;
+   651→   651→  const secondMoment = prob * Math.pow(odds - 1, 2) + (1 - prob);
+   652→   652→  const variance = secondMoment - ev * ev;
+   653→   653→  return variance > 1e-9 ? ev / Math.sqrt(variance) : 0;
+   654→   654→}
+   655→   655→
+   656→   656→/** Equal-profit dutching stakes for N legs (sum = total). */
+   657→   657→function dutchN(oddsList: number[], total = 100): number[] {
+   658→   658→  const invs = oddsList.map((o) => 1 / Math.max(o, 1.01));
+   659→   659→  const s = invs.reduce((a, b) => a + b, 0);
+   660→   660→  return invs.map((i) => Math.round(((total * i) / s) * 10) / 10);
+   661→   661→}
+   662→   662→
+   663→   663→/**
+   664→   664→ * Per-unit Sharpe of a dutched multi-leg position over disjoint outcomes:
+   665→   665→ * winProbs[i] → leg i pays; else the whole position loses.
+   666→   666→ */
+   667→   667→function dutchedSharpe(winProbs: number[], oddsList: number[]): { sharpe: number; ev: number; stakes: number[] } {
+   668→   668→  const stakes = dutchN(oddsList, 100);
+   669→   669→  const payoffs = stakes.map((st, i) => (st * oddsList[i] - 100) / 100); // per-unit net
+   670→   670→  const pLose = Math.max(0, 1 - winProbs.reduce((a, b) => a + b, 0));
+   671→   671→  const ev = winProbs.reduce((s, p, i) => s + p * payoffs[i], 0) - pLose * 1;
+   672→   672→  const secondMoment =
+   673→   673→    winProbs.reduce((s, p, i) => s + p * payoffs[i] * payoffs[i], 0) + pLose;
+   674→   674→  const variance = secondMoment - ev * ev;
+   675→   675→  return {
+   676→   676→    sharpe: variance > 1e-9 ? ev / Math.sqrt(variance) : 0,
+   677→   677→    ev,
+   678→   678→    stakes,
+   679→   679→  };
+   680→   680→}
+   681→   681→
+   682→   682→export interface RegimeEval {
+   683→   683→  code: RegimeCode;
+   684→   684→  eligible: boolean;
+   685→   685→  sharpe: number;
+   686→   686→  pairLoss: number;
+   687→   687→  whyNot?: string;
+   688→   688→}
+   689→   689→
+   690→   690→export interface RegimeRoute {
+   691→   691→  decision: RegimeDecision;
+   692→   692→  evals: RegimeEval[];
+   693→   693→  selected?: RegimeEval;
+   694→   694→}
+   695→   695→
+   696→   696→interface RegimeContext {
+   697→   697→  sFav: number;
+   698→   698→  holdFav: number;
+   699→   699→  holdDog: number;
+   700→   700→  pFavWin: number;
+   701→   701→  pFav20: number;
+   702→   702→  pDog20: number;
+   703→   703→  surfaceIsSlow: boolean; // CLAY/HARD → longer rallies, games-grind
+   704→   704→  serveBattle: boolean;
+   705→   705→}
+   706→   706→
+   707→   707→function regimeContext(m: AnalyzedMatch, mc: MonteCarloResult): RegimeContext {
+   708→   708→  const fav = m.favorite;
+   709→   709→  const sFav = fav === "A" ? m.markov.setWinA : 1 - m.markov.setWinA;
+   710→   710→  const holdFav = fav === "A" ? m.markov.gA : m.markov.gB;
+   711→   711→  const holdDog = fav === "A" ? m.markov.gB : m.markov.gA;
+   712→   712→  const pFavWin = fav === "A" ? mc.outcomes.p20 + mc.outcomes.p21 : mc.outcomes.p12 + mc.outcomes.p02;
+   713→   713→  const pFav20 = fav === "A" ? mc.outcomes.p20 : mc.outcomes.p02;
+   714→   714→  const pDog20 = fav === "A" ? mc.outcomes.p02 : mc.outcomes.p20;
+   715→   715→  return {
+   716→   716→    sFav,
+   717→   717→    holdFav,
+   718→   718→    holdDog,
+   719→   719→    pFavWin,
+   720→   720→    pFav20,
+   721→   721→    pDog20,
+   722→   722→    surfaceIsSlow: m.surface !== "GRASS",
+   723→   723→    serveBattle: holdFav >= 0.8 && holdDog >= 0.78,
+   724→   724→  };
+   725→   725→}
+   726→   726→
+   727→   727→/** fav name helpers for market rows */
+   728→   728→function favNameOf(m: AnalyzedMatch): string {
+   729→   729→  return m.favorite === "A" ? m.playerA.name : m.playerB.name;
+   730→   730→}
+   731→   731→
+   732→   732→/**
+   733→   733→ * STATION 4 — non-linear 5-regime router (master-prompt architecture):
+   734→   734→ * EVERY regime is priced from the 10k Monte-Carlo pipeline, the non-linear
+   735→   735→ * Sharpe of each position is computed, and the match is routed to the single
+   736→   736→ * OPTIMAL regime (max Sharpe among the eligible ones). No regime qualifies →
+   737→   737→ * the match is vetoed to the shadow ledger.
+   738→   738→ */
+   739→   739→export function routeRegime(
+   740→   740→  m: AnalyzedMatch,
+   741→   741→  mc: MonteCarloResult,
+   742→   742→  _archPairLoss1: number
+   743→   743→): RegimeRoute {
+   744→   744→  const ctx = regimeContext(m, mc);
+   745→   745→  const favName = favNameOf(m).toUpperCase();
+   746→   746→  const favNameRaw = favNameOf(m);
+   747→   747→  const evals: RegimeEval[] = [];
+   748→   748→  const candidates: { decision: RegimeDecision; sharpe: number; pairLoss: number }[] = [];
+   749→   749→
+   750→   750→  // ── 1 · 🏦 TENNIS BANKER ─────────────────────────────────────────────────
+   751→   751→  {
+   752→   752→    const windowOk = ctx.sFav >= BANKER_MIN_S && ctx.holdFav >= BANKER_MIN_HOLD;
+   753→   753→    const pairLoss = 1 - ctx.pFavWin;
+   754→   754→    const cands: { marketEn: string; marketFa: string; prob: number; window: [number, number] }[] = [
+   755→   755→      {
+   756→   756→        marketEn: `MATCH WINNER — ${favName}`,
+   757→   757→        marketFa: `برد مسابقه: ${favNameRaw}`,
+   758→   758→        prob: ctx.pFavWin,
+   759→   759→        window: [1.38, 1.65],
+   760→   760→      },
+   761→   761→      {
+   762→   762→        marketEn: `SET HANDICAP — ${favName} −1.5 SETS`,
+   763→   763→        marketFa: `هندیکپ ست: ${favNameRaw} ۲-۰`,
+   764→   764→        prob: ctx.pFav20,
+   765→   765→        window: [1.38, 1.65],
+   766→   766→      },
+   767→   767→    ];
+   768→   768→    let bestSharpe = -Infinity;
+   769→   769→    let best: (typeof cands)[number] | null = null;
+   770→   770→    let bestPrice = 1.38;
+   771→   771→    for (const c of cands) {
+   772→   772→      // v6.0 — REAL 1xBet price (divide by overround); the old
+   773→   773→      // clampPrice(window) squeeze that froze every banker at 1.38 is GONE.
+   774→   774→      const price = fairPrice(c.prob, ONEXBET_OVERROUND_MAIN);
+   775→   775→      const sh = bettingSharpe(c.prob, price);
+   776→   776→      if (sh > bestSharpe) {
+   777→   777→        bestSharpe = sh;
+   778→   778→        best = c;
+   779→   779→        bestPrice = price;
+   780→   780→      }
+   781→   781→    }
+   782→   782→    const eligible = windowOk && pairLoss <= BANKER_MAX_PAIR_LOSS;
+   783→   783→    evals.push({
+   784→   784→      code: "BANKER",
+   785→   785→      eligible,
+   786→   786→      sharpe: bestSharpe,
+   787→   787→      pairLoss,
+   788→   788→      whyNot: windowOk
+   789→   789→        ? `ریسک باخت فاوریت ${(pairLoss * 100).toFixed(1)}% بالای سقف ۲۲٪`
+   790→   790→        : `S_fav = ${(ctx.sFav * 100).toFixed(1)}% / Hold = ${(ctx.holdFav * 100).toFixed(1)}% — زیر آستانه بانکر (70%/78%)`,
+   791→   791→    });
+   792→   792→    if (eligible && best) {
+   793→   793→      candidates.push({
+   794→   794→        sharpe: bestSharpe,
+   795→   795→        pairLoss,
+   796→   796→        decision: {
+   797→   797→          code: "BANKER",
+   798→   798→          ...REGIME_META.BANKER,
+   799→   799→          sharpe: bestSharpe,
+   800→   800→          mcScore: 0,
+   801→   801→          pairLoss,
+   802→   802→          coverage: ctx.pFavWin,
+   803→   803→          why: `S_fav = ${(ctx.sFav * 100).toFixed(1)}% و حفظ سرویس ${(ctx.holdFav * 100).toFixed(1)}% — تک‌ستون امن با استیک مستقیم ${STANDARD_MATCH_STAKE} واحد`,
+   804→   804→          whyEn: `SAFE SINGLE-PICK · S_fav ${(ctx.sFav * 100).toFixed(0)}% · HOLD ${(ctx.holdFav * 100).toFixed(0)}% · DIRECT ${STANDARD_MATCH_STAKE}u STAKE`,
+   805→   805→          marketEn: best.marketEn,
+   806→   806→          marketFa: best.marketFa,
+   807→   807→          targetWindow: best.window,
+   808→   808→          stakePlanFa: `استیک مستقیم ${STANDARD_MATCH_STAKE} واحد + تغذیه آکومولاتور سلاطین سرویس`,
+   809→   809→          price: bestPrice,
+   810→   810→          prob: best.prob,
+   811→   811→          legCodes: { main: best.marketEn.startsWith("MATCH WINNER") ? "BNK-WIN" : "BNK-SH15" },
+   812→   812→        },
+   813→   813→      });
+   814→   814→    }
+   815→   815→  }
+   816→   816→
+   817→   817→  // ── 4 · ⚖️ DUAL-HEDGE (champion golden pair) ─────────────────────────────
+   818→   818→  {
+   819→   819→    const windowOk = ctx.pDog20 <= DUAL_MAX_P02;
+   820→   820→    const pairLoss = ctx.pDog20;
+   821→   821→    // v6.0 Bug-1 fix — the golden pair is priced from THIS match's own Markov
+   822→   822→    // probabilities; the hardcoded 1.97x/2.68x constants are gone.
+   823→   823→    const pA = ctx.pFav20;
+   824→   824→    const pB = mc.outcomes.p21 + mc.outcomes.p12;
+   825→   825→    const oddsA = computeReal1xBetTennisOdds(pA, ONEXBET_OVERROUND_MAIN);
+   826→   826→    const oddsB = computeReal1xBetTennisOdds(pB, ONEXBET_OVERROUND_MAIN);
+   827→   827→    const { sharpe } = dutchedSharpe([pA, pB], [oddsA, oddsB]);
+   828→   828→    evals.push({
+   829→   829→      code: "DUAL-HEDGE",
+   830→   830→      eligible: windowOk,
+   831→   831→      sharpe,
+   832→   832→      pairLoss,
+   833→   833→      whyNot: `P(باخت ۲-۰ فاوریت) = ${(pairLoss * 100).toFixed(1)}% بالای سقف الگوی قهرمان ۸.۸%`,
+   834→   834→    });
+   835→   835→    if (windowOk) {
+   836→   836→      candidates.push({
+   837→   837→        sharpe,
+   838→   838→        pairLoss,
+   839→   839→        decision: {
+   840→   840→          code: "DUAL-HEDGE",
+   841→   841→          ...REGIME_META["DUAL-HEDGE"],
+   842→   842→          sharpe,
+   843→   843→          mcScore: 0,
+   844→   844→          pairLoss,
+   845→   845→          coverage: 1 - pairLoss,
+   846→   846→          why: `الگوی قهرمان (۴۵ برد / ۶ باخت) — P(0-2) = ${(pairLoss * 100).toFixed(1)}% زیر سقف ۸.۸%؛ زوج‌تیپ طلایی ست‌شماری`,
+   847→   847→          whyEn: `CHAMPION PATTERN · P(0-2) ${(pairLoss * 100).toFixed(1)}% ≤ 8.8% · 88.2% PROVEN WIN RATE`,
+   848→   848→          marketEn: `SET BETTING — ${favName} 2-0 + TOTAL SETS — OVER 2.5`,
+   849→   849→          marketFa: `زوج‌تیپ: برد ۲-۰ ${favNameRaw} + مجموع ست‌ها بالای ۲.۵`,
+   850→   850→          targetWindow: [2.0, 2.75],
+   851→   851→          stakePlanFa: "داچینگ ۱۰۰ واحدی بین دو تیپ مکمل",
+   852→   852→        },
+   853→   853→      });
+   854→   854→    }
+   855→   855→  }
+   856→   856→
+   857→   857→  // ── 2 · 🧩 TENNIS COMBO ──────────────────────────────────────────────────
+   858→   858→  {
+   859→   859→    const corr = mc.favWinGamesCorr; // Gaussian-copula corr (telemetry)
+   860→   860→    const dominant = ctx.surfaceIsSlow && ctx.sFav >= 0.6;
+   861→   861→    // The master-prompt «copula correlation > 76%» gate reads as the copula
+   862→   862→    // JOINT mass of the dominant scenario: for slow-surface dominators it is
+   863→   863→    // P(fav win ∧ under 21.5 games); for serve battles it is the share of
+   864→   864→    // favorite wins that stay over 20.5 games.
+   865→   865→    const jointMass = dominant ? mc.favWinUnder215 : mc.favWinShareOver205;
+   866→   866→    const gate = dominant ? COMBO_MIN_CORR : COMBO_MIN_SHARE_SRV;
+   867→   867→    const windowOk = (dominant || ctx.serveBattle) && jointMass > gate;
+   868→   868→    let pMain: number;
+   869→   869→    let pCover: number;
+   870→   870→    let mainEn: string;
+   871→   871→    let coverEn: string;
+   872→   872→    let mainFa: string;
+   873→   873→    let coverFa: string;
+   874→   874→    if (dominant) {
+   875→   875→      pMain = mc.favWinUnder215;
+   876→   876→      // cover = TOTAL GAMES — OVER 21.5 (exact Monte-Carlo mass); main ∧ cover
+   877→   877→      // are mutually exclusive → uncovered = 1 − pMain − pCover
+   878→   878→      pCover = Math.max(0.02, mc.coverOver215);
+   879→   879→      mainEn = `${favName} WIN & UNDER 21.5 GAMES`;
+   880→   880→      coverEn = "TOTAL GAMES — OVER 21.5";
+   881→   881→      mainFa = `برد ${favNameRaw} و زیر ۲۱.۵ گیم`;
+   882→   882→      coverFa = "مجموع گیم‌ها بالای ۲۱.۵ (پوشش)";
+   883→   883→    } else {
+   884→   884→      pMain = mc.favWinOver205;
+   885→   885→      // cover = under 20.5 games OR the underdog wins the match — DISJOINT
+   886→   886→      // from the main leg; both lose only when the favorite LOSES ∧ over 20.5
+   887→   887→      // games ∧ the favorite won set 1 (exact Monte-Carlo cell)
+   888→   888→      pCover = Math.max(0.02, 1 - pMain - mc.favLoseOver205Set1);
+   889→   889→      mainEn = `${favName} WIN & OVER 20.5 GAMES`;
+   890→   890→      coverEn = "UNDER 20.5 GAMES OR UNDERDOG WINS THE MATCH";
+   891→   891→      mainFa = `برد ${favNameRaw} و بالای ۲۰.۵ گیم`;
+   892→   892→      coverFa = "زیر ۲۰.۵ گیم یا برد بازیکن دوم (پوشش مکمل)";
+   893→   893→    }
+   894→   894→    const coverage = Math.min(1, pMain + pCover);
+   895→   895→    const pairLoss = Math.max(0, 1 - coverage);
+   896→   896→    // v6.0 Bug-3 fix — the 70.8% Over-21.5 wing now prints its REAL 1xBet
+   897→   897→    // price (≈ 1.34x) instead of the old clampPrice(...,2.7,3.3) lie of 2.70x.
+   898→   898→    const oddsMain = fairPrice(pMain, ONEXBET_OVERROUND_PROP);
+   899→   899→    const oddsCover = fairPrice(pCover, ONEXBET_OVERROUND_PROP);
+   900→   900→    const { sharpe } = dutchedSharpe([pMain, pCover], [oddsMain, oddsCover]);
+   901→   901→    const minCoverage = dominant ? COMBO_MIN_COVERAGE : COMBO_MIN_COVERAGE_SRV;
+   902→   902→    const eligible = windowOk && coverage >= minCoverage;
+   903→   903→    evals.push({
+   904→   904→      code: "COMBO",
+   905→   905→      eligible,
+   906→   906→      sharpe,
+   907→   907→      pairLoss,
+   908→   908→      whyNot: `جرم مشترک کاپولا برد×گیم = ${(jointMass * 100).toFixed(1)}% (آستانه ${(gate * 100).toFixed(0)}%) یا پوشش ${(coverage * 100).toFixed(1)}% زیر سقف ${(minCoverage * 100).toFixed(0)}%`,
+   909→   909→    });
+   910→   910→    if (eligible) {
+   911→   911→      const variant = dominant ? "DOM" : "SRV";
+   912→   912→      candidates.push({
+   913→   913→        sharpe,
+   914→   914→        pairLoss,
+   915→   915→        decision: {
+   916→   916→          code: "COMBO",
+   917→   917→          ...REGIME_META.COMBO,
+   918→   918→          sharpe,
+   919→   919→          mcScore: 0,
+   920→   920→          pairLoss,
+   921→   921→          coverage,
+   922→   922→          why: `جرم مشترک کاپولای برد فاوریت × خط گیم = ${(jointMass * 100).toFixed(1)}% بالای ${(gate * 100).toFixed(0)}% — کمبوی رسمی تک‌دکمه + پوشش با پوشش ${(coverage * 100).toFixed(1)}% (همبستگی نهفته ${(corr * 100).toFixed(0)}%)`,
+   923→   923→          whyEn: `COPULA JOINT MASS ${(jointMass * 100).toFixed(0)}% > ${(gate * 100).toFixed(0)}% · COMBO + COVER · ${(coverage * 100).toFixed(1)}% COVERAGE`,
+   924→   924→          marketEn: `${mainEn} + ${coverEn}`,
+   925→   925→          marketFa: `${mainFa} + ${coverFa}`,
+   926→   926→          targetWindow: [1.85, 2.4],
+   927→   927→          stakePlanFa: `داچینگ ۱۰۰ واحدی: ${mainEn} @ ${oddsMain} + پوشش @ ${oddsCover}`,
+   928→   928→          legCodes: { main: `RC-MAIN-${variant}`, cover: `RC-COVER-${variant}` },
+   929→   929→          comboLegs: {
+   930→   930→            mainEn,
+   931→   931→            mainFa,
+   932→   932→            mainProb: pMain,
+   933→   933→            mainPrice: oddsMain,
+   934→   934→            coverEn,
+   935→   935→            coverFa,
+   936→   936→            coverProb: pCover,
+   937→   937→            coverPrice: oddsCover,
+   938→   938→          },
+   939→   939→        },
+   940→   940→      });
+   941→   941→    }
+   942→   942→  }
+   943→   943→
+   944→   944→  // ── 3 · 🎯 EXACT SET & GAME CLUSTER ──────────────────────────────────────
+   945→   945→  {
+   946→   946→    const windowOk = mc.entropy < CLUSTER_MAX_ENTROPY && mc.topScenariosMass >= CLUSTER_MIN_MASS;
+   947→   947→    const pairLoss = Math.max(0, 1 - mc.topScenariosMass);
+   948→   948→    // v6.0 Bug-3 fix — exact-scenario odds are the REAL 1xBet exotic prices of
+   949→   949→    // their own probabilities; the old clampPrice(...,2.8,4.2) lock that froze
+   950→   950→    // scenarios 2 & 3 at 4.20x is removed.
+   951→   951→    const odds = mc.topScenarios.map((s) => fairPrice(s.prob, ONEXBET_OVERROUND_EXOTIC));
+   952→   952→    const probs = mc.topScenarios.map((s) => s.prob);
+   953→   953→    const { sharpe } = dutchedSharpe(probs, odds);
+   954→   954→    evals.push({
+   955→   955→      code: "CLUSTER",
+   956→   956→      eligible: windowOk,
+   957→   957→      sharpe,
+   958→   958→      pairLoss,
+   959→   959→      whyNot: `آنتروپی شانون = ${mc.entropy.toFixed(2)} (سقف ۱.۲۵) یا جرم ۳ سناریو = ${(mc.topScenariosMass * 100).toFixed(1)}% زیر ۶۴%`,
+   960→   960→    });
+   961→   961→    if (windowOk) {
+   962→   962→      const stakes = dutchN(odds, 100);
+   963→   963→      candidates.push({
+   964→   964→        sharpe,
+   965→   965→        pairLoss,
+   966→   966→        decision: {
+   967→   967→          code: "CLUSTER",
+   968→   968→          ...REGIME_META.CLUSTER,
+   969→   969→          sharpe,
+   970→   970→          mcScore: 0,
+   971→   971→          pairLoss,
+   972→   972→          coverage: mc.topScenariosMass,
+   973→   973→          why: `آنتروپی شانون ${mc.entropy.toFixed(2)} پایین و ۳ سناریوی گیم‌به‌گیم ${(mc.topScenariosMass * 100).toFixed(1)}% — داچینگ ۱۰۰ واحدی روی ۳ سناریوی دقیق`,
+   974→   974→          whyEn: `ENTROPY ${mc.entropy.toFixed(2)} · TOP-3 SCENARIOS ${(mc.topScenariosMass * 100).toFixed(0)}% · DUTCHING 100u · NET +35–55%`,
+   975→   975→          marketEn: mc.topScenarios.map((s) => s.descEn).join(" + "),
+   976→   976→          marketFa: mc.topScenarios.map((s) => s.descFa).join(" + "),
+   977→   977→          targetWindow: [2.8, 4.2],
+   978→   978→          stakePlanFa: `داچینگ ۱۰۰ واحدی: ${mc.topScenarios.map((s, i) => `${s.label} @ ${odds[i]}`).join(" + ")}`,
+   979→   979→          legCodes: { main: "CLU-1" },
+   980→   980→          scenarios: mc.topScenarios.map((sc, i) => ({
+   981→   981→            label: sc.label,
+   982→   982→            descFa: sc.descFa,
+   983→   983→            descEn: sc.descEn,
+   984→   984→            code: sc.code,
+   985→   985→            gamesLo: sc.gamesLo,
+   986→   986→            gamesHi: sc.gamesHi,
+   987→   987→            prob: sc.prob,
+   988→   988→            price: odds[i],
+   989→   989→            stake: stakes[i],
+   990→   990→          })),
+   991→   991→        },
+   992→   992→      });
+   993→   993→    }
+   994→   994→  }
+   995→   995→
+   996→   996→  // ── 5 · 🔗 ACCUMULATOR — day-level regime (built in engine buildLines) ───
+   997→   997→  evals.push({
+   998→   998→    code: "ACCUMULATOR",
+   999→   999→    eligible: false,
+  1000→  1000→    sharpe: 0,
+  1001→  1001→    pairLoss: 1,
+  1002→  1002→    whyNot: "رژیم سطح روز — به‌صورت خودکار از بهترین بانکرها ساخته می‌شود (خط تولید جداگانه)",
+  1003→  1003→  });
+  1004→  1004→
+  1005→  1005→  // ── selection: the OPTIMAL regime = max non-linear Sharpe ────────────────
+  1006→  1006→  if (candidates.length > 0) {
+  1007→  1007→    candidates.sort((a, b) => b.sharpe - a.sharpe);
+  1008→  1008→    const win = candidates[0];
+  1009→  1009→    return { evals, selected: evals.find((e) => e.code === win.decision.code), decision: win.decision };
+  1010→  1010→  }
+  1011→  1011→  // no regime qualified → vetoed to the shadow ledger
+  1012→  1012→  const best = [...evals].filter((e) => e.code !== "ACCUMULATOR").sort((a, b) => a.pairLoss - b.pairLoss)[0];
+  1013→  1013→  return {
+  1014→  1014→    evals,
+  1015→  1015→    decision: {
+  1016→  1016→      code: "VETOED",
+  1017→  1017→      ...REGIME_META.VETOED,
+  1018→  1018→      sharpe: 0,
+  1019→  1019→      mcScore: 0,
+  1020→  1020→      why: `هیچ رژیمی صلاحیت ندارد — ${best ? best.whyNot : "بدون رژیم"}؛ انتقال به دفتر سایه`,
+  1021→  1021→      whyEn: "NO REGIME QUALIFIED · SHADOW LEDGER",
+  1022→  1022→    },
+  1023→  1023→  };
+  1024→  1024→}
+  1025→  1025→
+  1026→  1026→/**
+  1027→  1027→ * Adaptive routing for the 65% coverage quota — ignores the window gates and
+  1028→  1028→ * grants the least-risk regime (max coverage) stamped as a SILVER crown.
+  1029→  1029→ * v5.5 — adaptive grants carry the SAME full 100-unit stake (no halving).
+  1030→  1030→ */
+  1031→  1031→export function routeRegimeAdaptive(
+  1032→  1032→  m: AnalyzedMatch,
+  1033→  1033→  mc: MonteCarloResult
+  1034→  1034→): { decision: RegimeDecision; pairLoss: number } {
+  1035→  1035→  const ctx = regimeContext(m, mc);
+  1036→  1036→  // least-risk = smallest simultaneous-loss space among the three core shapes
+  1037→  1037→  const candidates: { code: RegimeCode; pairLoss: number }[] = [
+  1038→  1038→    { code: "BANKER", pairLoss: 1 - ctx.pFavWin },
+  1039→  1039→    { code: "DUAL-HEDGE", pairLoss: ctx.pDog20 },
+  1040→  1040→    { code: "CLUSTER", pairLoss: Math.max(0, 1 - mc.topScenariosMass) },
+  1041→  1041→  ];
+  1042→  1042→  candidates.sort((a, b) => a.pairLoss - b.pairLoss);
+  1043→  1043→  const win = candidates[0];
+  1044→  1044→  const meta = REGIME_META[win.code];
+  1045→  1045→  return {
+  1046→  1046→    pairLoss: win.pairLoss,
+  1047→  1047→    decision: {
+  1048→  1048→      code: win.code,
+  1049→  1049→      ...meta,
+  1050→  1050→      sharpe: 0,
+  1051→  1051→      mcScore: 0,
+  1052→  1052→      pairLoss: win.pairLoss,
+  1053→  1053→      coverage: 1 - win.pairLoss,
+  1054→  1054→      adaptive: true,
+  1055→  1055→      why: `سهمیه تطبیقی ۶۵٪ سوپروایزر — کم‌ریسک‌ترین رژیم با ریسک ${(win.pairLoss * 100).toFixed(1)}% (استیک کامل ${STANDARD_MATCH_STAKE} واحد)`,
+  1056→  1056→      whyEn: `ADAPTIVE QUOTA GRANT · LEAST-RISK ${(win.pairLoss * 100).toFixed(1)}% · FULL STAKE ${STANDARD_MATCH_STAKE}u`,
+  1057→  1057→    },
+  1058→  1058→  };
+  1059→  1059→}
+  1060→  1060→
+  1061→  1061→/**
+  1062→  1062→ * v5.5 — crown badge assignment (master prompt §3):
+  1063→  1063→ * GOLD CROWN APPROVED is granted to approved matches whose Monte-Carlo
+  1064→  1064→ * SUCCESS percentage (Math.round(winProb × 100)) lands above 85/100 — the
+  1065→  1065→ * wrong «failure-probability» score of v5.0 is gone. Adaptive quota grants
+  1066→  1066→ * keep the SILVER crown, both with the same full 100-unit stake.
+  1067→  1067→ */
+  1068→  1068→export function assignCrown(
+  1069→  1069→  adaptive: boolean,
+  1070→  1070→  _pairLoss: number,
+  1071→  1071→  _sharpe: number,
+  1072→  1072→  mcScore: number
+  1073→  1073→): CrownInfo {
+  1074→  1074→  if (adaptive) {
+  1075→  1075→    return {
+  1076→  1076→      tier: "SILVER",
+  1077→  1077→      labelFa: `تایید تاج نقره‌ای — سهمیه تطبیقی سوپروایزر (استیک کامل ${STANDARD_MATCH_STAKE} واحد)`,
+  1078→  1078→      labelEn: `SILVER CROWN ADAPTIVE — Monte-Carlo Success ${mcScore}/100 · FULL STAKE ${STANDARD_MATCH_STAKE}u`,
+  1079→  1079→      score: mcScore,
+  1080→  1080→    };
+  1081→  1081→  }
+  1082→  1082→  if (mcScore >= 85) {
+  1083→  1083→    return {
+  1084→  1084→      tier: "GOLD",
+  1085→  1085→      labelFa: `تایید تاج طلایی سوپروایزر — درصد موفقیت مونت‌کارلو: ${mcScore}/100`,
+  1086→  1086→      labelEn: `GOLD CROWN APPROVED — Monte-Carlo Success: ${mcScore}/100`,
+  1087→  1087→      score: mcScore,
+  1088→  1088→    };
+  1089→  1089→  }
+  1090→  1090→  return {
+  1091→  1091→    tier: "NONE",
+  1092→  1092→    labelFa: "تایید استاندارد سوپروایزر",
+  1093→  1093→    labelEn: "SUPERVISOR STANDARD APPROVAL",
+  1094→  1094→    score: mcScore,
+  1095→  1095→  };
+  1096→  1096→}
+  1097→  1097→
+  1098→  1098→/** Finalize the mcScore of a routed decision (crown telemetry).
+  1099→  1099→ *  v5.5 — the score IS the Monte-Carlo success percentage (winProb × 100). */
+  1100→  1100→export function finalizeRegimeScore(
+  1101→  1101→  decision: RegimeDecision,
+  1102→  1102→  mc: MonteCarloResult,
+  1103→  1103→  favorite: "A" | "B"
+  1104→  1104→): RegimeDecision {
+  1105→  1105→  const score = monteCarloScore(mc, favorite);
+  1106→  1106→  return { ...decision, mcScore: score };
+  1107→  1107→}
+  1108→  1108→
+  1109→  1109→/**
+  1110→  1110→ * v5.5 — force-routes a match into a SPECIFIC regime with relaxed windows.
+  1111→  1111→ * Used by the engine's allocateFiveRegimes() distribution pass: the
+  1112→  1112→ * fit-ranked allocator picks the best matches for an under-filled regime and
+  1113→  1113→ * this builder constructs the official decision (same market math and clamped
+  1114→  1114→ * price windows as the natural router, full 100-unit stake plan).
+  1115→  1115→ */
+  1116→  1116→export function forceRegimeRoute(
+  1117→  1117→  m: AnalyzedMatch,
+  1118→  1118→  mc: MonteCarloResult,
+  1119→  1119→  code: RegimeCode
+  1120→  1120→): { decision: RegimeDecision; pairLoss: number } | null {
+  1121→  1121→  const ctx = regimeContext(m, mc);
+  1122→  1122→  const favName = favNameOf(m).toUpperCase();
+  1123→  1123→  const favNameRaw = favNameOf(m);
+  1124→  1124→
+  1125→  1125→  if (code === "BANKER") {
+  1126→  1126→    const cands: { marketEn: string; marketFa: string; prob: number; window: [number, number] }[] = [
+  1127→  1127→      {
+  1128→  1128→        marketEn: `MATCH WINNER — ${favName}`,
+  1129→  1129→        marketFa: `برد مسابقه: ${favNameRaw}`,
+  1130→  1130→        prob: ctx.pFavWin,
+  1131→  1131→        window: [1.38, 1.65],
+  1132→  1132→      },
+  1133→  1133→      {
+  1134→  1134→        marketEn: `SET HANDICAP — ${favName} −1.5 SETS`,
+  1135→  1135→        marketFa: `هندیکپ ست: ${favNameRaw} ۲-۰`,
+  1136→  1136→        prob: ctx.pFav20,
+  1137→  1137→        window: [1.38, 1.65],
+  1138→  1138→      },
+  1139→  1139→    ];
+  1140→  1140→    let bestSharpe = -Infinity;
+  1141→  1141→    let best: (typeof cands)[number] | null = null;
+  1142→  1142→    let bestPrice = 1.38;
+  1143→  1143→    for (const c of cands) {
+  1144→  1144→      // v6.0 — real 1xBet banker price, no artificial window clamp
+  1145→  1145→      const price = fairPrice(c.prob, ONEXBET_OVERROUND_MAIN);
+  1146→  1146→      const sh = bettingSharpe(c.prob, price);
+  1147→  1147→      if (sh > bestSharpe) {
+  1148→  1148→        bestSharpe = sh;
+  1149→  1149→        best = c;
+  1150→  1150→        bestPrice = price;
+  1151→  1151→      }
+  1152→  1152→    }
+  1153→  1153→    if (!best) return null;
+  1154→  1154→    const pairLoss = 1 - ctx.pFavWin;
+  1155→  1155→    return {
+  1156→  1156→      pairLoss,
+  1157→  1157→      decision: {
+  1158→  1158→        code: "BANKER",
+  1159→  1159→        ...REGIME_META.BANKER,
+  1160→  1160→        sharpe: bestSharpe,
+  1161→  1161→        mcScore: 0,
+  1162→  1162→        pairLoss,
+  1163→  1163→        coverage: ctx.pFavWin,
+  1164→  1164→        why: `توزیع ۵ رژیمی v5.5 — قوی‌ترین فاوریتِ واجد شرایط به رژیم بانکر امن سرویس routed شد (استیک کامل ${STANDARD_MATCH_STAKE} واحد)`,
+  1165→  1165→        whyEn: `V5.5 DISTRIBUTION · BANKER ROUTE · S_fav ${(ctx.sFav * 100).toFixed(0)}% · FULL STAKE ${STANDARD_MATCH_STAKE}u`,
+  1166→  1166→        marketEn: best.marketEn,
+  1167→  1167→        marketFa: best.marketFa,
+  1168→  1168→        targetWindow: best.window,
+  1169→  1169→        stakePlanFa: `استیک مستقیم ${STANDARD_MATCH_STAKE} واحد + تغذیه آکومولاتور سلاطین سرویس`,
+  1170→  1170→        price: bestPrice,
+  1171→  1171→        prob: best.prob,
+  1172→  1172→        legCodes: { main: best.marketEn.startsWith("MATCH WINNER") ? "BNK-WIN" : "BNK-SH15" },
+  1173→  1173→      },
+  1174→  1174→    };
+  1175→  1175→  }
+  1176→  1176→
+  1177→  1177→  if (code === "COMBO") {
+  1178→  1178→    const dominant = ctx.sFav >= 0.6;
+  1179→  1179→    let pMain: number;
+  1180→  1180→    let pCover: number;
+  1181→  1181→    let mainEn: string;
+  1182→  1182→    let coverEn: string;
+  1183→  1183→    let mainFa: string;
+  1184→  1184→    let coverFa: string;
+  1185→  1185→    if (dominant) {
+  1186→  1186→      pMain = Math.max(0.08, mc.favWinUnder215);
+  1187→  1187→      pCover = Math.max(0.02, mc.coverOver215);
+  1188→  1188→      mainEn = `${favName} WIN & UNDER 21.5 GAMES`;
+  1189→  1189→      coverEn = "TOTAL GAMES — OVER 21.5";
+  1190→  1190→      mainFa = `برد ${favNameRaw} و زیر ۲۱.۵ گیم`;
+  1191→  1191→      coverFa = "مجموع گیم‌ها بالای ۲۱.۵ (پوشش)";
+  1192→  1192→    } else {
+  1193→  1193→      pMain = Math.max(0.08, mc.favWinOver205);
+  1194→  1194→      pCover = Math.max(0.02, 1 - pMain - mc.favLoseOver205Set1);
+  1195→  1195→      mainEn = `${favName} WIN & OVER 20.5 GAMES`;
+  1196→  1196→      coverEn = "UNDER 20.5 GAMES OR UNDERDOG WINS THE MATCH";
+  1197→  1197→      mainFa = `برد ${favNameRaw} و بالای ۲۰.۵ گیم`;
+  1198→  1198→      coverFa = "زیر ۲۰.۵ گیم یا برد بازیکن دوم (پوشش مکمل)";
+  1199→  1199→    }
+  1200→  1200→    const coverage = Math.min(1, pMain + pCover);
+  1201→  1201→    const pairLoss = Math.max(0, 1 - coverage);
+  1202→  1202→    // v6.0 — real 1xBet prices for the force-routed copula combo too
+  1203→  1203→    const oddsMain = fairPrice(pMain, ONEXBET_OVERROUND_PROP);
+  1204→  1204→    const oddsCover = fairPrice(pCover, ONEXBET_OVERROUND_PROP);
+  1205→  1205→    const { sharpe } = dutchedSharpe([pMain, pCover], [oddsMain, oddsCover]);
+  1206→  1206→    const variant = dominant ? "DOM" : "SRV";
+  1207→  1207→    return {
+  1208→  1208→      pairLoss,
+  1209→  1209→      decision: {
+  1210→  1210→        code: "COMBO",
+  1211→  1211→        ...REGIME_META.COMBO,
+  1212→  1212→        sharpe,
+  1213→  1213→        mcScore: 0,
+  1214→  1214→        pairLoss,
+  1215→  1215→        coverage,
+  1216→  1216→        why: `توزیع ۵ رژیمی v5.5 — جرم مشترک کاپولا ${(coverage * 100).toFixed(1)}% → کمبوی کاپولا + پوشش (داچینگ ${STANDARD_MATCH_STAKE} واحدی)`,
+  1217→  1217→        whyEn: `V5.5 DISTRIBUTION · COPULA COMBO · ${(coverage * 100).toFixed(1)}% COVERAGE · DUTCHING ${STANDARD_MATCH_STAKE}u`,
+  1218→  1218→        marketEn: `${mainEn} + ${coverEn}`,
+  1219→  1219→        marketFa: `${mainFa} + ${coverFa}`,
+  1220→  1220→        targetWindow: [1.85, 2.4],
+  1221→  1221→        stakePlanFa: `داچینگ ${STANDARD_MATCH_STAKE} واحدی: ${mainEn} @ ${oddsMain} + پوشش @ ${oddsCover}`,
+  1222→  1222→        legCodes: { main: `RC-MAIN-${variant}`, cover: `RC-COVER-${variant}` },
+  1223→  1223→        comboLegs: {
+  1224→  1224→          mainEn,
+  1225→  1225→          mainFa,
+  1226→  1226→          mainProb: pMain,
+  1227→  1227→          mainPrice: oddsMain,
+  1228→  1228→          coverEn,
+  1229→  1229→          coverFa,
+  1230→  1230→          coverProb: pCover,
+  1231→  1231→          coverPrice: oddsCover,
+  1232→  1232→        },
+  1233→  1233→      },
+  1234→  1234→    };
+  1235→  1235→  }
+  1236→  1236→
+  1237→  1237→  if (code === "CLUSTER") {
+  1238→  1238→    const pairLoss = Math.max(0, 1 - mc.topScenariosMass);
+  1239→  1239→    // v6.0 — real 1xBet exotic prices, no 4.20x lock
+  1240→  1240→    const odds = mc.topScenarios.map((s) => fairPrice(s.prob, ONEXBET_OVERROUND_EXOTIC));
+  1241→  1241→    const probs = mc.topScenarios.map((s) => s.prob);
+  1242→  1242→    const { sharpe } = dutchedSharpe(probs, odds);
+  1243→  1243→    const stakes = dutchN(odds, STANDARD_MATCH_STAKE);
+  1244→  1244→    return {
+  1245→  1245→      pairLoss,
+  1246→  1246→      decision: {
+  1247→  1247→        code: "CLUSTER",
+  1248→  1248→        ...REGIME_META.CLUSTER,
+  1249→  1249→        sharpe,
+  1250→  1250→        mcScore: 0,
+  1251→  1251→        pairLoss,
+  1252→  1252→        coverage: mc.topScenariosMass,
+  1253→  1253→        why: `توزیع ۵ رژیمی v5.5 — جرم ۳ سناریوی دقیق ${(mc.topScenariosMass * 100).toFixed(1)}% → خوشه نتیجه دقیق (داچینگ ${STANDARD_MATCH_STAKE} واحدی)`,
+  1254→  1254→        whyEn: `V5.5 DISTRIBUTION · EXACT CLUSTER · TOP-3 ${(mc.topScenariosMass * 100).toFixed(0)}% · DUTCHING ${STANDARD_MATCH_STAKE}u`,
+  1255→  1255→        marketEn: mc.topScenarios.map((s) => s.descEn).join(" + "),
+  1256→  1256→        marketFa: mc.topScenarios.map((s) => s.descFa).join(" + "),
+  1257→  1257→        targetWindow: [2.8, 4.2],
+  1258→  1258→        stakePlanFa: `داچینگ ${STANDARD_MATCH_STAKE} واحدی: ${mc.topScenarios.map((s, i) => `${s.label} @ ${odds[i]}`).join(" + ")}`,
+  1259→  1259→        legCodes: { main: "CLU-1" },
+  1260→  1260→        scenarios: mc.topScenarios.map((sc, i) => ({
+  1261→  1261→          label: sc.label,
+  1262→  1262→          descFa: sc.descFa,
+  1263→  1263→          descEn: sc.descEn,
+  1264→  1264→          code: sc.code,
+  1265→  1265→          gamesLo: sc.gamesLo,
+  1266→  1266→          gamesHi: sc.gamesHi,
+  1267→  1267→          prob: sc.prob,
+  1268→  1268→          price: odds[i],
+  1269→  1269→          stake: stakes[i],
+  1270→  1270→        })),
+  1271→  1271→      },
+  1272→  1272→    };
+  1273→  1273→  }
+  1274→  1274→
+  1275→  1275→  if (code === "DUAL-HEDGE") {
+  1276→  1276→    const pairLoss = ctx.pDog20;
+  1277→  1277→    // v6.0 Bug-1 fix — force-routed golden pair priced from its own probs
+  1278→  1278→    const pA = ctx.pFav20;
+  1279→  1279→    const pB = mc.outcomes.p21 + mc.outcomes.p12;
+  1280→  1280→    const oddsA = computeReal1xBetTennisOdds(pA, ONEXBET_OVERROUND_MAIN);
+  1281→  1281→    const oddsB = computeReal1xBetTennisOdds(pB, ONEXBET_OVERROUND_MAIN);
+  1282→  1282→    const { sharpe } = dutchedSharpe([pA, pB], [oddsA, oddsB]);
+  1283→  1283→    return {
+  1284→  1284→      pairLoss,
+  1285→  1285→      decision: {
+  1286→  1286→        code: "DUAL-HEDGE",
+  1287→  1287→        ...REGIME_META["DUAL-HEDGE"],
+  1288→  1288→        sharpe,
+  1289→  1289→        mcScore: 0,
+  1290→  1290→        pairLoss,
+  1291→  1291→        coverage: 1 - pairLoss,
+  1292→  1292→        why: `توزیع ۵ رژیمی v5.5 — زوج‌تیپ طلایی مکمل با پوشش ${(100 - pairLoss * 100).toFixed(1)}% (داچینگ ${STANDARD_MATCH_STAKE} واحدی)`,
+  1293→  1293→        whyEn: `V5.5 DISTRIBUTION · DUAL-HEDGE GOLDEN PAIR · P(0-2) ${(pairLoss * 100).toFixed(1)}%`,
+  1294→  1294→        marketEn: `SET BETTING — ${favName} 2-0 + TOTAL SETS — OVER 2.5`,
+  1295→  1295→        marketFa: `زوج‌تیپ: برد ۲-۰ ${favNameRaw} + مجموع ست‌ها بالای ۲.۵`,
+  1296→  1296→        targetWindow: [2.0, 2.75],
+  1297→  1297→        stakePlanFa: "داچینگ ۱۰۰ واحدی بین دو تیپ مکمل",
+  1298→  1298→      },
+  1299→  1299→    };
+  1300→  1300→  }
+  1301→  1301→
+  1302→  1302→  return null;
+  1303→  1303→}
+  1304→  1304→
+  1305→  1305→

@@ -1,13 +1,13 @@
 "use client";
 
-// ─── v6.0 · Professional Bank-Growth Module (director upgrade request) ──────
-// Replaces the old 2-point BankCurve with a full analytics suite:
+// ─── v7.0 · Professional Bank-Growth Module (director upgrade request) ──────
+// Full analytics suite:
 //   • روزانه / هفتگی / ماهانه period selector (Tehran days, Iranian weeks, months)
 //   • per-period P&L bar chart + cumulative bank line (dual-axis SVG)
 //   • تعداد بازی‌های روزانه (daily match counts), برد/باخت split, per-period win rate
-//   • KPI row: today's matches · today's W/L · best day · worst day ·
-//     all-time peak · max drawdown (units + %)
-//   • scrollable period ledger table with per-period ROI
+//   • KPI row: today's matches · today's W/L · period P&L · ROI · best/worst
+//     period · all-time peak · max drawdown (units + %)
+//   • scrollable period ledger table with per-period staked units + ROI
 
 import { useMemo, useState } from "react";
 import {
@@ -17,6 +17,7 @@ import {
   BarChart3,
   CalendarDays,
   Crown,
+  Percent,
   TrendingDown,
   TrendingUp,
 } from "lucide-react";
@@ -173,12 +174,15 @@ export function BankGrowthPro({ history, bankStart, bank }: { history?: BankHist
     const losses = list.reduce((s, b) => s + b.losses, 0);
     const matches = list.reduce((s, b) => s + b.matches, 0);
     const pnl = list.reduce((s, b) => s + b.pnl, 0);
+    const staked = list.reduce((s, b) => s + (b.staked ?? 0), 0);
     const decided = wins + losses;
     return {
       wins,
       losses,
       matches,
       pnl,
+      staked,
+      roi: staked > 0 ? pnl / staked : 0,
       winRate: decided > 0 ? wins / decided : 0,
       best: [...list].sort((a, b) => b.pnl - a.pnl)[0],
       worst: [...list].sort((a, b) => a.pnl - b.pnl)[0],
@@ -231,8 +235,8 @@ export function BankGrowthPro({ history, bankStart, bank }: { history?: BankHist
           <Chart buckets={shown} bankStart={bankStart} />
         </div>
 
-        {/* KPI row — requested detail set (3×2 grid: fits the ⅔-width card) */}
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+        {/* KPI row — requested detail set (v7.0: 8 cells incl. ROI + all-time peak) */}
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
           <StatCell
             icon={CalendarDays}
             label="بازی‌های امروز"
@@ -255,6 +259,13 @@ export function BankGrowthPro({ history, bankStart, bank }: { history?: BankHist
             sub={`${agg.matches} مسابقه تسویه‌شده`}
           />
           <StatCell
+            icon={Percent}
+            label={`ROI ${RANGE_LABEL[range]}`}
+            value={`${agg.staked > 0 ? `${agg.roi >= 0 ? "+" : ""}${(agg.roi * 100).toFixed(2)}` : "—"}%`}
+            tone={agg.roi >= 0 ? "text-emerald-300" : "text-rose-300"}
+            sub={`کل شرط‌بندی ${agg.staked.toFixed(0)} واحد`}
+          />
+          <StatCell
             icon={Crown}
             label={`بهترین ${RANGE_LABEL[range] === "روزانه" ? "روز" : RANGE_LABEL[range] === "هفتگی" ? "هفته" : "ماه"}`}
             value={agg.best ? `${agg.best.pnl >= 0 ? "+" : ""}${agg.best.pnl.toFixed(1)}` : "—"}
@@ -269,11 +280,18 @@ export function BankGrowthPro({ history, bankStart, bank }: { history?: BankHist
             sub={agg.worst ? `${agg.worst.label} · ${agg.worst.wins} برد / ${agg.worst.losses} باخت` : "بدون داده"}
           />
           <StatCell
+            icon={Crown}
+            label="قله تاریخی بانک"
+            value={(history?.peak.bank ?? bankStart).toLocaleString("en-US")}
+            tone="text-amber-300"
+            sub={history?.peak.at ? `ثبت در ${history.peak.at.slice(0, 10)}` : "شروع ۱۰۰۰ واحدی"}
+          />
+          <StatCell
             icon={Activity}
             label="بیشترین افت سرمایه"
             value={`-${history?.maxDrawdown.units ?? 0}`}
             tone="text-rose-300"
-            sub={`${(history?.maxDrawdown.pct ?? 0).toFixed(2)}% از قله ${(history?.peak.bank ?? bankStart).toLocaleString("en-US")}`}
+            sub={`${(history?.maxDrawdown.pct ?? 0).toFixed(2)}% از قله`}
           />
         </div>
 
@@ -286,6 +304,8 @@ export function BankGrowthPro({ history, bankStart, bank }: { history?: BankHist
                 <th className="px-3 py-2 text-center font-bold">بازی‌ها</th>
                 <th className="px-3 py-2 text-center font-bold">برد / باخت</th>
                 <th className="px-3 py-2 text-center font-bold">وین‌ریت</th>
+                <th className="px-3 py-2 text-center font-bold">شرط‌ها</th>
+                <th className="px-3 py-2 text-center font-bold">ROI</th>
                 <th className="px-3 py-2 text-center font-bold">سود دوره</th>
                 <th className="px-3 py-2 text-center font-bold">پایان بانک</th>
               </tr>
@@ -305,6 +325,15 @@ export function BankGrowthPro({ history, bankStart, bank }: { history?: BankHist
                   <td className="mono-num px-3 py-1.5 text-center text-white/70" dir="ltr">
                     {b.wins + b.losses > 0 ? `${(b.winRate * 100).toFixed(0)}%` : "—"}
                   </td>
+                  <td className="mono-num px-3 py-1.5 text-center text-white/60" dir="ltr">
+                    {b.staked > 0 ? b.staked.toFixed(0) : "—"}
+                  </td>
+                  <td
+                    className={`mono-num px-3 py-1.5 text-center font-bold ${b.roi >= 0 ? "text-emerald-300" : "text-rose-300"}`}
+                    dir="ltr"
+                  >
+                    {b.staked > 0 ? `${b.roi >= 0 ? "+" : ""}${(b.roi * 100).toFixed(1)}%` : "—"}
+                  </td>
                   <td
                     className={`mono-num px-3 py-1.5 text-center font-bold ${b.pnl >= 0 ? "text-emerald-300" : "text-rose-300"}`}
                     dir="ltr"
@@ -319,7 +348,7 @@ export function BankGrowthPro({ history, bankStart, bank }: { history?: BankHist
               ))}
               {(buckets ?? []).length === 0 && (
                 <tr>
-                  <td colSpan={6} className="px-3 py-6 text-center text-white/45">
+                  <td colSpan={8} className="px-3 py-6 text-center text-white/45">
                     هنوز داده‌ای برای این بازه ثبت نشده است
                   </td>
                 </tr>

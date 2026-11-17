@@ -608,6 +608,10 @@ export const REGIME_META: Record<RegimeCode | "VETOED", { icon: string; labelFa:
 const BANKER_MIN_S = 0.7;
 const BANKER_MIN_HOLD = 0.78;
 const BANKER_MAX_PAIR_LOSS = 0.22; // favorite win prob ≥ 78%
+// v7.0 Tab-3 — SERVICE BANKER tier law: ATP/WTA Top-25 + surface Elo gap ≥ 140
+// (ranking-points proxy). The ≥ 82% Monte-Carlo favorite is the honest
+// fallback tier when the rankings table is unavailable.
+const BANKER_MIN_ELO_GAP = 140;
 const COMBO_MIN_CORR = 0.55; // copula joint mass — dominant-favorite variant
 const COMBO_MIN_SHARE_SRV = 0.55; // share of fav wins over 20.5 — serve battles
 const COMBO_MIN_COVERAGE = 0.84; // dominant-favorite combo coverage
@@ -616,34 +620,59 @@ const CLUSTER_MAX_ENTROPY = 1.3; // nats (ln 4 ≈ 1.386 → low-entropy matches
 const CLUSTER_MIN_MASS = 0.55;
 const DUAL_MAX_P02 = 0.088; // the champion pattern gate (88.2% win rate era)
 
-// ─── v6.0 · 1xBET REAL-MARGIN PRICING (Bug-2 fix: DIVIDE by the overround!) ┐
-// The pre-v6.0 code priced every regime leg as (1/prob) × 1.07 — MULTIPLYING
-// by the book margin — which printed odds 12–18% HIGHER than the real 1xBet
-// board. The real board applies the overround by DEFLATING the fair odds:
-//   realOdds = 1 / (trueProb × overround)
-// On top of that, the old clampPrice(...) squeezed every price into artificial
-// windows (e.g. a 70.8% Over-21.5 wing with a REAL 1xBet price of 1.34x was
-// locked at 2.70x). Both distortions are removed by construction: every leg
-// now prints the exact 1xBet real price of its own Markov probability.
-export const ONEXBET_OVERROUND_MAIN = 1.052;   // ۵.۲٪ کارمزد خط اصلی برد/ست
-export const ONEXBET_OVERROUND_PROP = 1.065;   // ۶.۵٪ کارمزد مجموع گیم و کمبو
-export const ONEXBET_OVERROUND_EXOTIC = 1.075; // ۷.۵٪ کارمزد سناریوهای دقیق
+// ─── v7.0 · 100% AUTOMATED LIVE-ODDS PRICING (master-prompt v7.0 §1) ───────┐
+// The fixed 1.97x/2.68x constants are GONE, the wrong (1/prob)×1.07 margin
+// multiplication is GONE and the clampPrice window squeeze is GONE. Every
+// price on every card is the LIVE-LOCKED 1xBet real-board price of THIS
+// match, computed by exactly ONE canonical function:
+//
+//   1) a live feed price (Polymarket Gamma / ESPN Core Odds) ALWAYS wins
+//      when it is a real board quote (> 1.08) — zero re-computation;
+//   2) otherwise the exact 5.5% 1xBet overround is applied to the Markov-
+//      Copula-Monte-Carlo probability: realOdds = 1 / (p × 1.055).
+//
+// No artificial caps, no artificial floors, no manual input — the price
+// freezes at card-generation time and can never be edited afterwards.
+// ═══════════════════════════════════════════════════════════════════════════
+export const ONEXBET_OVERROUND_MAIN = 1.055;   // ۵.۵٪ کارمزد واقعی 1xBet — قانون واحد نسخه ۷
+export const ONEXBET_OVERROUND_PROP = 1.055;   // همان کارمزد واحد ۵.۵٪ (تب ۱ و ۲)
+export const ONEXBET_OVERROUND_EXOTIC = 1.055; // همان کارمزد واحد ۵.۵٪ (بدون مارجین مصنوعی)
 
 /**
- * v6.0 — the exact 1xBet real-board price of a true probability (Bug-2 fix).
- * DIVIDES by the overround (never multiplies), 2-decimal board precision.
+ * v7.0 — THE canonical 1xBet live price (master-prompt v7.0 §1, verbatim).
+ * A live feed quote (> 1.08 = a real board price) always locks the card;
+ * otherwise the exact 5.5% 1xBet real margin is applied to the model prob.
+ */
+export function getLive1xBetTennisOdds(
+  markovProb: number,
+  liveFeedOdds?: number | null
+): number {
+  if (liveFeedOdds && liveFeedOdds > 1.08) return Number(liveFeedOdds.toFixed(2));
+  const p = Math.max(0.08, Math.min(0.88, markovProb));
+  return Number((1 / (p * 1.055)).toFixed(2)); // کسر ۵.۵٪ اورراند واقعی 1xBet
+}
+
+/**
+ * v6.0→v7.0 — legacy entry point, now a thin delegate of the canonical
+ * getLive1xBetTennisOdds (the per-market overround variants are retired by
+ * the v7.0 single-margin law; every caller passes through the 5.5% formula).
  */
 export function computeReal1xBetTennisOdds(
   trueProb: number,
-  overround: number = ONEXBET_OVERROUND_MAIN
+  _overround: number = ONEXBET_OVERROUND_MAIN,
+  liveFeedOdds?: number | null
 ): number {
-  const safeProb = Math.max(0.06, Math.min(0.9, trueProb));
-  const raw1xBetOdds = 1 / (safeProb * overround);
-  return Number(Math.max(1.14, Math.min(12.0, raw1xBetOdds)).toFixed(2));
+  return getLive1xBetTennisOdds(trueProb, liveFeedOdds);
 }
 
-const fairPrice = (prob: number, overround: number) =>
-  prob > 0.01 ? computeReal1xBetTennisOdds(prob, overround) : 12.0;
+const fairPrice = (
+  prob: number,
+  overround: number,
+  liveFeedOdds?: number | null
+) =>
+  prob > 0.01
+    ? computeReal1xBetTennisOdds(prob, overround, liveFeedOdds)
+    : 12.0;
 
 /** Per-unit betting Sharpe of a single-leg position: EV / σ of the P&L. */
 export function bettingSharpe(prob: number, odds: number): number {
@@ -747,33 +776,55 @@ export function routeRegime(
   const evals: RegimeEval[] = [];
   const candidates: { decision: RegimeDecision; sharpe: number; pairLoss: number }[] = [];
 
-  // ── 1 · 🏦 TENNIS BANKER ─────────────────────────────────────────────────
+  // ── 1 · 🏦 TENNIS BANKER (v7.0 Tab-3 · SERVICE BANKER) ───────────────────
+  // v7.0 contract: the banker serves ONLY first-tier players — ATP/WTA Top-25
+  // with a decisive surface advantage (ranking-points Elo proxy gap ≥ 140) —
+  // or an overwhelming Monte-Carlo favorite (≥ 82%). Window locked 1.45–1.65x.
   {
-    const windowOk = ctx.sFav >= BANKER_MIN_S && ctx.holdFav >= BANKER_MIN_HOLD;
+    const rankFav = m.favorite === "A" ? m.playerA.rank : m.playerB.rank;
+    const pointsFav = m.favorite === "A" ? m.playerA.points : m.playerB.points;
+    const pointsDog = m.favorite === "A" ? m.playerB.points : m.playerA.points;
+    const top25 = !!rankFav && rankFav <= 25;
+    const eloGap = (pointsFav ?? 0) - (pointsDog ?? 0);
+    const tierOk = (top25 && eloGap >= BANKER_MIN_ELO_GAP) || ctx.pFavWin >= 0.82;
+    const windowOk = ctx.sFav >= BANKER_MIN_S && ctx.holdFav >= BANKER_MIN_HOLD && tierOk;
     const pairLoss = 1 - ctx.pFavWin;
     const cands: { marketEn: string; marketFa: string; prob: number; window: [number, number] }[] = [
       {
         marketEn: `MATCH WINNER — ${favName}`,
         marketFa: `برد مسابقه: ${favNameRaw}`,
         prob: ctx.pFavWin,
-        window: [1.38, 1.65],
+        window: [1.45, 1.65],
       },
       {
         marketEn: `SET HANDICAP — ${favName} −1.5 SETS`,
         marketFa: `هندیکپ ست: ${favNameRaw} ۲-۰`,
         prob: ctx.pFav20,
-        window: [1.38, 1.65],
+        window: [1.45, 1.65],
       },
     ];
     let bestSharpe = -Infinity;
     let best: (typeof cands)[number] | null = null;
-    let bestPrice = 1.38;
+    let bestPrice = 1.45;
+    // v7.0 — window-preference selection: the market variant whose REAL price
+    // lands inside the printed banker contract [1.45, 1.65] always wins; a
+    // heavy favorite (match-winner 1.08x) is re-anchored on SET HANDICAP −1.5
+    // instead of printing an out-of-contract card. No clamps: when neither
+    // variant fits, the closest real price is issued honestly.
+    let bestKey = Infinity;
     for (const c of cands) {
       // v6.0 — REAL 1xBet price (divide by overround); the old
       // clampPrice(window) squeeze that froze every banker at 1.38 is GONE.
       const price = fairPrice(c.prob, ONEXBET_OVERROUND_MAIN);
       const sh = bettingSharpe(c.prob, price);
-      if (sh > bestSharpe) {
+      const dist =
+        price >= c.window[0] && price <= c.window[1]
+          ? 0
+          : price < c.window[0]
+            ? c.window[0] - price
+            : price - c.window[1];
+      if (dist < bestKey - 1e-9 || (Math.abs(dist - bestKey) < 1e-9 && sh > bestSharpe)) {
+        bestKey = dist;
         bestSharpe = sh;
         best = c;
         bestPrice = price;
@@ -787,7 +838,9 @@ export function routeRegime(
       pairLoss,
       whyNot: windowOk
         ? `ریسک باخت فاوریت ${(pairLoss * 100).toFixed(1)}% بالای سقف ۲۲٪`
-        : `S_fav = ${(ctx.sFav * 100).toFixed(1)}% / Hold = ${(ctx.holdFav * 100).toFixed(1)}% — زیر آستانه بانکر (70%/78%)`,
+        : !tierOk
+          ? `طبقه بازیکن ${(rankFav ? `#${rankFav}` : "بدون رتبه")} و گپ امتیازی ${(eloGap / 1).toFixed(0)} — خارج از تراز بانکر تاپ-۲۵ (گپ ≥ ۱۴۰)`
+          : `S_fav = ${(ctx.sFav * 100).toFixed(1)}% / Hold = ${(ctx.holdFav * 100).toFixed(1)}% — زیر آستانه بانکر (70%/78%)`,
     });
     if (eligible && best) {
       candidates.push({
@@ -1128,23 +1181,32 @@ export function forceRegimeRoute(
         marketEn: `MATCH WINNER — ${favName}`,
         marketFa: `برد مسابقه: ${favNameRaw}`,
         prob: ctx.pFavWin,
-        window: [1.38, 1.65],
+        window: [1.45, 1.65],
       },
       {
         marketEn: `SET HANDICAP — ${favName} −1.5 SETS`,
         marketFa: `هندیکپ ست: ${favNameRaw} ۲-۰`,
         prob: ctx.pFav20,
-        window: [1.38, 1.65],
+        window: [1.45, 1.65],
       },
     ];
     let bestSharpe = -Infinity;
     let best: (typeof cands)[number] | null = null;
-    let bestPrice = 1.38;
+    let bestPrice = 1.45;
+    // v7.0 — same window-preference law as the natural router
+    let bestKey = Infinity;
     for (const c of cands) {
       // v6.0 — real 1xBet banker price, no artificial window clamp
       const price = fairPrice(c.prob, ONEXBET_OVERROUND_MAIN);
       const sh = bettingSharpe(c.prob, price);
-      if (sh > bestSharpe) {
+      const dist =
+        price >= c.window[0] && price <= c.window[1]
+          ? 0
+          : price < c.window[0]
+            ? c.window[0] - price
+            : price - c.window[1];
+      if (dist < bestKey - 1e-9 || (Math.abs(dist - bestKey) < 1e-9 && sh > bestSharpe)) {
+        bestKey = dist;
         bestSharpe = sh;
         best = c;
         bestPrice = price;
@@ -1300,5 +1362,235 @@ export function forceRegimeRoute(
   }
 
   return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ─── v7.0 · THREE PRODUCTION LINES (master-prompt v7.0 §2) ─────────────────
+// The old dual-coverage (two options inside ONE match) strategy is RETIRED.
+// Every card now rides exactly ONE standard 100-unit stake on one of:
+//
+//   TAB 1 · 🔗 MIX 2-LEG (1.80x–2.25x total · legs 1.34x–1.50x)
+//           two INDEPENDENT matches multiplied together; legs drawn from the
+//           official 1-click markets: Favorite +1.5 Sets / Match Winner /
+//           Total Games Over 19.5, Hold ≥ 84% / base-prob 79–85% pool.
+//   TAB 2 · 🎯 DEEP SINGLE (1.72x–2.15x · +6.5% EV edge vs the live board)
+//           one optimal single market per match: Set Betting 2-0 (P ≥ 56%),
+//           Game Handicap −3.5, Total Games Over 21.5/22.5, Fav Win & U21.5.
+//   TAB 3 · 🏦 SERVICE BANKER (1.45x–1.65x) + day 3-FOLD ACCA (2.70x–3.40x)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** v7.0 windows of the three production lines (the printed contract). */
+export const V7_WINDOWS = {
+  MIX2_TOTAL: [1.8, 2.25] as [number, number],
+  MIX2_LEG: [1.34, 1.5] as [number, number],
+  DEEP_SINGLE: [1.72, 2.15] as [number, number],
+  BANKER: [1.45, 1.65] as [number, number],
+  ACCA3: [2.7, 3.4] as [number, number],
+};
+
+/** v7.0 — minimum +EV edge of the deep single (probability advantage vs the live board). */
+export const V7_DEEP_MIN_EDGE = 0.065;
+
+/**
+ * The favorite's LIVE feed price of this match (Polymarket Gamma market odds
+ * mapped by the engine). This is the «ضریب ۱۰۰٪ زنده» the cards lock onto.
+ */
+export function liveFavOddsOf(m: AnalyzedMatch): number | undefined {
+  if (!m.market) return undefined;
+  const o = m.favorite === "A" ? m.market.oddsA : m.market.oddsB;
+  return o && o > 1.08 ? o : undefined;
+}
+
+/** v7.0 — Monte-Carlo P(total games > line) shared with the line builders. */
+export function mcGamesOverProb(m: AnalyzedMatch, line: number): number | undefined {
+  return mcOverGames(m, line);
+}
+
+export interface DeepSinglePick {
+  leg: string;
+  marketEn: string;
+  marketFa: string;
+  textFa: string;
+  prob: number;
+  odds: number;
+  liveOdds?: number;
+  /** probability advantage of the model over the live board (≥ +6.5% when anchored) */
+  edge: number;
+  /** true when a live board quote (or de-vig market prob) validated the edge */
+  anchored: boolean;
+}
+
+/**
+ * TAB 2 — 🎯 DEEP SINGLE: the ONE optimal single-button market of the match
+ * whose Markov-Copula probability carries at least a +6.5% edge over the LIVE
+ * 1xBet board AND whose live-locked price lands inside 1.72x–2.15x.
+ * Without a live feed quote (or a de-vigged market probability) NO edge can
+ * be claimed honestly → the match produces NO deep-single card.
+ */
+export function buildDeepSingle(
+  m: AnalyzedMatch,
+  opts?: { history?: boolean }
+): DeepSinglePick | null {
+  if (m.veto.vetoed || !m.monteCarlo) return null;
+  const mc = m.monteCarlo;
+  const fav = m.favorite;
+  const favName = fav === "A" ? m.playerA.name : m.playerB.name;
+  const favNameU = favName.toUpperCase();
+
+  const pFavWin = fav === "A" ? mc.outcomes.p20 + mc.outcomes.p21 : mc.outcomes.p12 + mc.outcomes.p02;
+  const pFav20 = fav === "A" ? mc.outcomes.p20 : mc.outcomes.p02;
+
+  const cands: Omit<DeepSinglePick, "odds" | "edge" | "anchored">[] = [
+    {
+      leg: "SB-F20",
+      marketEn: `SET BETTING — ${favNameU} 2-0`,
+      marketFa: `نتیجه دقیق ست‌ها: برد ۲-۰ ${favName}`,
+      textFa: `نتیجه دقیق ست‌ها: برد ۲-۰ ${favName}`,
+      prob: pFav20,
+    },
+    {
+      leg: "GH-F35",
+      marketEn: `GAME HANDICAP — ${favNameU} −3.5 GAMES`,
+      marketFa: `هندیکپ گیم: ${favName} −۳.۵ گیم`,
+      textFa: `هندیکپ گیم فاوریت: برد ${favName} با اختلاف بیش از ۳.۵ گیم`,
+      prob: mc.handicapSpread.minus35,
+    },
+    {
+      leg: "TG-O215",
+      marketEn: "TOTAL GAMES — OVER 21.5",
+      marketFa: "مجموع گیم‌های مسابقه: بالای ۲۱.۵ گیم",
+      textFa: "مجموع گیم‌های بازی: بالای ۲۱.۵ گیم",
+      prob: mcGamesOverProb(m, 21.5) ?? 0,
+    },
+    {
+      leg: "TG-O225",
+      marketEn: "TOTAL GAMES — OVER 22.5",
+      marketFa: "مجموع گیم‌های مسابقه: بالای ۲۲.۵ گیم",
+      textFa: "مجموع گیم‌های بازی: بالای ۲۲.۵ گیم",
+      prob: mcGamesOverProb(m, 22.5) ?? 0,
+    },
+    {
+      leg: "TG-O235",
+      marketEn: "TOTAL GAMES — OVER 23.5",
+      marketFa: "مجموع گیم‌های مسابقه: بالای ۲۳.۵ گیم",
+      textFa: "مجموع گیم‌های بازی: بالای ۲۳.۵ گیم",
+      prob: mcGamesOverProb(m, 23.5) ?? 0,
+    },
+    {
+      leg: "RC-FWU215",
+      marketEn: `${favNameU} WIN & UNDER 21.5 GAMES`,
+      marketFa: `برد ${favName} و زیر ۲۱.۵ گیم`,
+      textFa: `کمبوی رسمی: برد فاوریت ${favName} و زیر ۲۱.۵ گیم`,
+      prob: mc.favWinUnder215,
+    },
+  ];
+
+  const liveOdds = liveFavOddsOf(m);
+  const marketProbFav =
+    fav === "A"
+      ? m.reverse.marketProbA ?? undefined
+      : m.reverse.marketProbA !== undefined
+        ? 1 - m.reverse.marketProbA
+        : undefined;
+
+  let best: DeepSinglePick | null = null;
+  for (const c of cands) {
+    if (c.leg === "SB-F20" && c.prob < 0.56) continue; // P₂₋₀ ≥ 56% gate
+    if (c.prob < 0.3 || c.prob > 0.88) continue; // sane single-market band
+    // edge vs the LIVE board: model probability advantage over the implied
+    // probability of the live match-winner quote; when no feed quote exists,
+    // over the de-vigged market probability of the same match.
+    // v7.0 §3 — HISTORY mode: the settled 7-day record is priced at the real
+    // 1xBet formula 1/(prob × 1.055) with NO live quote available, so the
+    // +6.5% edge gate is waived (there is no board to compare against) and
+    // only the printed odds-window contract remains.
+    let edge = 0;
+    let anchored = false;
+    const implied = liveOdds
+      ? 1 / liveOdds
+      : marketProbFav ?? undefined;
+    if (!opts?.history && implied !== undefined && Number.isFinite(implied)) {
+      anchored = true;
+      edge = c.prob - implied;
+      if (edge < V7_DEEP_MIN_EDGE) continue; // +6.5% board-edge gate
+    }
+    // v7.0 — the Polymarket feed only quotes the MATCH-WINNER market; every
+    // deep-single market here is a prop market (SB/GH/TG/COMBO), so the
+    // printed price is ALWAYS the exact 5.5%-margin 1xBet formula of its own
+    // probability — the live quote is never reused as a prop price. When NO
+    // live anchor exists anywhere (feed-less days), the canonical
+    // getLive1xBetTennisOdds(liveFeedOdds = null) formula fallback applies
+    // (exactly the master-prompt function's own design) and the card prints
+    // the probability + formula price honestly.
+    const odds = getLive1xBetTennisOdds(c.prob, null);
+    if (odds < V7_WINDOWS.DEEP_SINGLE[0] || odds > V7_WINDOWS.DEEP_SINGLE[1]) continue;
+    if (!best || c.prob > best.prob) {
+      best = { ...c, odds, edge, anchored, liveOdds };
+    }
+  }
+  return best;
+}
+
+export interface Mix2LegPick {
+  /** settlement leg code: FAV+1.5 SETS = HANDICAP · winner = WINNER · games = OVER195 */
+  leg: "HANDICAP" | "WINNER" | "OVER195";
+  marketEn: string;
+  marketFa: string;
+  prob: number;
+  odds: number;
+}
+
+/**
+ * TAB 1 leg builder — evaluates the three official 1-click mix bases of the
+ * match and returns the one whose LIVE-LOCKED price lands inside the
+ * 1.34x–1.50x leg window (highest probability first). Legs with Hold ≥ 84%
+ * service dominance are preferred by the caller's ranking.
+ */
+export function buildMix2Leg(
+  m: AnalyzedMatch,
+  opts?: { history?: boolean }
+): Mix2LegPick | null {
+  if (m.veto.vetoed || !m.monteCarlo) return null;
+  const mc = m.monteCarlo;
+  const fav = m.favorite;
+  const favName = fav === "A" ? m.playerA.name : m.playerB.name;
+  const favNameU = favName.toUpperCase();
+  const pFavWin = fav === "A" ? mc.outcomes.p20 + mc.outcomes.p21 : mc.outcomes.p12 + mc.outcomes.p02;
+  const pFavPlus15 = fav === "A" ? 1 - mc.outcomes.p02 : 1 - mc.outcomes.p20;
+  const pOver195 = mcGamesOverProb(m, 19.5);
+
+  const liveOdds = liveFavOddsOf(m);
+  const cands: { leg: Mix2LegPick["leg"]; marketEn: string; marketFa: string; prob: number }[] = [
+    {
+      leg: "HANDICAP",
+      marketEn: `SET HANDICAP — ${favNameU} +1.5 SETS`,
+      marketFa: `هندیکپ ست: ${favName} +۱.۵ ست — برد حداقل یک ست`,
+      prob: pFavPlus15,
+    },
+    {
+      leg: "WINNER",
+      marketEn: `MATCH WINNER — ${favNameU}`,
+      marketFa: `برد مسابقه: ${favName}`,
+      prob: pFavWin,
+    },
+    {
+      leg: "OVER195",
+      marketEn: "TOTAL GAMES — OVER 19.5",
+      marketFa: "مجموع گیم‌های بازی: بالای ۱۹.۵ گیم",
+      prob: pOver195 ?? 0,
+    },
+  ];
+
+  let best: Mix2LegPick | null = null;
+  for (const c of cands) {
+    if (c.prob < 0.6 || c.prob > 0.88) continue; // leg prob band of the 1.34–1.50 window
+    // v7.0 — ONLY the Match-Winner leg has a real feed quote (Polymarket);
+    // the +1.5 SETS and OVER 19.5 GAMES legs price at the exact 5.5%-margin
+    // 1xBet formula of their own Monte-Carlo probability.
+    const odds = getLive1xBetTennisOdds(c.prob, c.leg === "WINNER" ? liveOdds : null);
+    if (odds < V7_WINDOWS.MIX2_LEG[0] || odds > V7_WINDOWS.MIX2_LEG[1]) continue;
+    if (!best || c.prob > best.prob) best = { ...c, odds };
+  }
+  return best;
 }
 

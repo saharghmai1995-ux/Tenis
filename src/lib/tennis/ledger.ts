@@ -330,7 +330,7 @@ export async function normalizeStakeUnits(): Promise<void> {
   try {
     await db.tennisPick.updateMany({
       where: {
-        line: { in: ["BANKER", "COMBO", "ACCUMULATOR", "SHADOW"] },
+        line: { in: ["BANKER", "SINGLE", "COMBO", "ACCUMULATOR", "SHADOW"] },
         stake: { not: STANDARD_MATCH_STAKE },
       },
       data: { stake: STANDARD_MATCH_STAKE },
@@ -448,8 +448,9 @@ export async function buildLedgerPayload(
       pushAgg(sniperAgg, p, leg);
     } else if (p.line === "CLUSTER") {
       pushAgg(cluster, p, leg);
-    } else if (p.line === "COMBO" || p.line === "BANKER" || p.line === "ACCUMULATOR") {
+    } else if (p.line === "COMBO" || p.line === "BANKER" || p.line === "ACCUMULATOR" || p.line === "SINGLE") {
       // v4.5 — VOID rows (buggy-era settlements) stay out of the official record
+      // v7.0 — the DEEP SINGLE line is a single-leg 100-unit position
       if (p.status !== "VOID") singles.push({ p, leg });
     }
     // SHADOW rows stay in the disjoint shadow ledger — never in the record
@@ -567,6 +568,7 @@ export async function buildLedgerPayload(
   const groups: LineStats[] = [
     lineStatsOf("DUAL", dualRows),
     lineStatsOf("BANKER", singleRows.filter((r) => r.line === "BANKER")),
+    lineStatsOf("SINGLE", singleRows.filter((r) => r.line === "SINGLE")),
     lineStatsOf("REGCOMBO", regComboRows),
     lineStatsOf("CLUSTER", clusterRows),
     lineStatsOf("ACCUMULATOR", singleRows.filter((r) => r.line === "ACCUMULATOR")),
@@ -610,7 +612,12 @@ export async function buildLedgerPayload(
   const coreRows = [
     ...dualRows,
     ...singleRows.filter(
-      (r) => r.line === "COMBO" || r.line === "ACCUMULATOR" || r.line === "BANKER"
+      (r) =>
+        r.line === "COMBO" ||
+        r.line === "ACCUMULATOR" ||
+        r.line === "BANKER" ||
+        // v7.0 — the DEEP SINGLE line is a core production line
+        r.line === "SINGLE"
     ),
     ...regComboRows,
     ...clusterRows,
@@ -689,6 +696,8 @@ export async function buildLedgerPayload(
   const comboProfit = lineProfit("COMBO", singleRows);
   const clusterProfit = lineProfit("CLUSTER", clusterRows);
   const bankerProfit = lineProfit("BANKER", singleRows);
+  // v7.0 — the DEEP SINGLE line is an explicit audit term
+  const singleProfit = lineProfit("SINGLE", singleRows);
   const regComboProfit = lineProfit("REGCOMBO", regComboRows);
   const sniperProfit = lineProfit("SNIPER", sniperRows);
   const accumulatorProfit = lineProfit("ACCUMULATOR", singleRows);
@@ -699,6 +708,7 @@ export async function buildLedgerPayload(
     comboProfit,
     clusterProfit,
     bankerProfit,
+    singleProfit,
     regComboProfit,
     sniperProfit,
     accumulatorProfit,
@@ -712,6 +722,7 @@ export async function buildLedgerPayload(
             comboProfit +
             clusterProfit +
             bankerProfit +
+            singleProfit +
             regComboProfit +
             sniperProfit +
             accumulatorProfit)) *
@@ -723,7 +734,7 @@ export async function buildLedgerPayload(
     auditHash: "",
   };
   bankAudit.auditHash = sha256(
-    `${bankAudit.bankStart}|${bankAudit.dualWonProfit}|${bankAudit.dualLostStake}|${bankAudit.comboProfit}|${bankAudit.clusterProfit}|${bankAudit.bankerProfit}|${bankAudit.regComboProfit}|${bankAudit.sniperProfit}|${bankAudit.accumulatorProfit}|${bankAudit.otherProfit}|=${bankAudit.bank}`
+    `${bankAudit.bankStart}|${bankAudit.dualWonProfit}|${bankAudit.dualLostStake}|${bankAudit.comboProfit}|${bankAudit.clusterProfit}|${bankAudit.bankerProfit}|${bankAudit.singleProfit}|${bankAudit.regComboProfit}|${bankAudit.sniperProfit}|${bankAudit.accumulatorProfit}|${bankAudit.otherProfit}|=${bankAudit.bank}`
   );
 
   return {

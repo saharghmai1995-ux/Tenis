@@ -1174,51 +1174,61 @@ function NearGateStrip({ matches }: { matches: AnalyzedMatch[] }) {
   );
 }
 
-// ─── v5.5 Production lines (5 regime tabs — one card per match, 100u each) ──
+// ─── v7.0 Production lines (THREE tabs — master-prompt v7.0 §2 · 100u each) ──
+// TAB 1 · 🔗 MIX-2 (2-leg precision parlay · 1.80x–2.25x · legs 1.34x–1.50x)
+// TAB 2 · 🎯 DEEP SINGLE (1.72x–2.15x · +6.5% probability edge vs live board)
+// TAB 3 · 🏦 BANKER (1.45x–1.65x · Top-25 + Elo gap ≥ 140) + 🔗 ACC-3 (2.70x–3.40x)
+// The dual-coverage / regcombo / cluster / sniper lines are RETIRED by the
+// v7.0 mandate; the shadow ledger strip stays as the honesty appendix.
+
+/** v7.0 — extract the +EV edge + anchor state recorded in the card meta. */
+function deepMetaOf(item: LineItem): { edge: number; anchored: boolean } {
+  try {
+    const meta = item.meta ? (JSON.parse(item.meta) as { edge?: number; anchored?: boolean }) : {};
+    return { edge: meta.edge ?? 0, anchored: meta.anchored ?? false };
+  } catch {
+    return { edge: 0, anchored: false };
+  }
+}
+
+function DeepSingleCard({ item }: { item: LineItem }) {
+  const matchLabel = `${item.playerA} × ${item.playerB}`;
+  const { edge, anchored } = deepMetaOf(item);
+  return (
+    <TiltCard className="rise-in rounded-2xl border border-sky-400/25 bg-sky-400/[0.04]">
+      <div className="p-4">
+        <FlashHeader item={item} matchLabel={matchLabel} />
+        <RegimeBadges item={item} />
+        <div className="mt-3">
+          <MarketBox tone="single" wingLabel="تک‌گزینه عمیق — مارکت رسمی تک‌دکمه (استیک کامل ۱۰۰ واحد)" item={item} />
+        </div>
+        <div className="mt-2.5 rounded-xl border border-sky-400/30 bg-sky-400/10 p-2.5 text-center">
+          <span className="text-[11px] font-bold text-sky-200">
+            {anchored ? (
+              <>
+                برتری احتمال مدل نسبت به ضریب زنده 1xBet:{" "}
+                <span className="mono-num" dir="ltr">+{(edge * 100).toFixed(1)}%</span> — نقطه سر‌به‌سر{" "}
+                <span className="mono-num" dir="ltr">54%</span>
+              </>
+            ) : (
+              <>
+                قیمت فرمولی واقعی 1xBet (<span className="mono-num" dir="ltr">1/(p×1.055)</span>) — فید زنده
+                امروز برای این مارکت عرضه ندارد — نقطه سر‌به‌سر{" "}
+                <span className="mono-num" dir="ltr">54%</span>
+              </>
+            )}
+            {" "}· سود خالص هر برد{" "}
+            <span className="mono-num" dir="ltr">+{Math.round((item.odds - 1) * 100)} واحد</span>
+          </span>
+        </div>
+        <FlashFooter item={item} matchLabel={matchLabel} />
+      </div>
+    </TiltCard>
+  );
+}
 
 export function ProductionLines({ feed }: { feed: FeedPayload }) {
-  const [booster, setBooster] = useState(true);
-  const { dual, banker, regCombo, cluster, accumulator, combo2, combo3, sniper, shadow } =
-    feed.lines;
-
-  // v5.5 — sniper cards group into packaged main + cover pairs (ONE per match)
-  const sniperPairs = useMemo(() => {
-    const byMatch = new Map<string, { main?: LineItem; cover?: LineItem }>();
-    for (const item of sniper) {
-      const cur = byMatch.get(item.matchId) ?? {};
-      if (item.leg === "SNIPER-COVER") cur.cover = item;
-      else cur.main = item;
-      byMatch.set(item.matchId, cur);
-    }
-    return [...byMatch.values()].filter(
-      (p): p is { main: LineItem; cover: LineItem } => !!p.main && !!p.cover
-    );
-  }, [sniper]);
-
-  // v5.0 — the two complementary wings are ONE flashcard per match. Wing
-  // classification uses the official atomic leg map (TS-O25 / GH-F45 /
-  // RC-O215 / RC-U205 are the cover wing even though they do not start with "B").
-  const dualPairs = useMemo(() => {
-    const byMatch = new Map<string, { A?: LineItem; B?: LineItem }>();
-    for (const item of dual) {
-      const cur = byMatch.get(item.matchId) ?? {};
-      if (legLabelOf(item.leg) === "تیپ B") cur.B = item;
-      else cur.A = item;
-      byMatch.set(item.matchId, cur);
-    }
-    return [...byMatch.values()].filter((p): p is { A: LineItem; B: LineItem } => !!p.A && !!p.B);
-  }, [dual]);
-
-  // v5.0 — CLUSTER legs grouped 3-per-match (dutching position)
-  const clusterGroups = useMemo(() => {
-    const byMatch = new Map<string, LineItem[]>();
-    for (const item of cluster) {
-      const arr = byMatch.get(item.matchId) ?? [];
-      arr.push(item);
-      byMatch.set(item.matchId, arr);
-    }
-    return [...byMatch.values()].filter((l) => l.length >= 2);
-  }, [cluster]);
+  const { banker, single, accumulator, combo2, shadow } = feed.lines;
 
   // v2.0 bug fix — the shadow ledger is grouped ONE row per match (the v1.0
   // audit saw every match listed twice). Legs stay separate for settlement;
@@ -1231,26 +1241,8 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
     return first.slice(0, 10);
   }, [shadow]);
 
-  // v5.0 — REGCOMBO grouped into main + cover wings per match
-  const regComboPairs = useMemo(() => {
-    const byMatch = new Map<string, { main?: LineItem; cover?: LineItem }>();
-    for (const item of regCombo) {
-      const cur = byMatch.get(item.matchId) ?? {};
-      if (item.leg.includes("MAIN")) cur.main = item;
-      else cur.cover = item;
-      byMatch.set(item.matchId, cur);
-    }
-    return [...byMatch.values()].filter(
-      (p): p is { main: LineItem; cover: LineItem } => !!p.main && !!p.cover
-    );
-  }, [regCombo]);
-
-  // Principal-Lock Booster display: asymmetric staking preview on dual line
-  const boosterNote = booster
-    ? "شتاب‌دهنده نامتقارن فعال: پس از هر برد، سود قفل می‌شود و نیمی از آن به استیک بعدی تزریق می‌گردد (اصل سرمایه همیشه محفوظ)"
-    : "استیک ثابت ۱۰۰ واحدی — قانون استاندارد نسخه ۵.۵";
-
-  const defaultTab = banker.length > 0 ? "banker" : dualPairs.length > 0 ? "dual" : "combo";
+  const mixSlips = combo2; // v7.0 — 2-leg precision parlay slips only
+  const defaultTab = banker.length > 0 ? "banker" : single.length > 0 ? "single" : "mix";
 
   return (
     <section aria-label="خطوط تولید" className="space-y-4">
@@ -1258,56 +1250,104 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
         <CardHeader className="pb-2">
           <CardTitle className="flex flex-wrap items-center gap-2 text-sm font-bold">
             <Rocket className="h-4 w-4 text-amber-300" />
-            خطوط تولید سیگنال — نسخه ۵.۵ (۵ رژیم غیرخطی · استیک استاندارد ۱۰۰ واحدی)
+            خطوط تولید سیگنال — نسخه ۷.۰ (۳ خط تولید · ضرایب ۱۰۰٪ زنده اتوماتیک · استیک استاندارد ۱۰۰ واحدی)
             <span className="text-[11px] font-normal text-muted-foreground">
-              — خط لوله مارکوف ← کاپولا ← مونت‌کارلو ۱۰هزارتایی ← دروازه سوپروایزر · خروجی امروز:{" "}
-              {dualPairs.length} زوج‌تیپ ({dual.length} بال) · {banker.length} بانکر ·{" "}
-              {regComboPairs.length} کمبو کاپولا · {clusterGroups.length} خوشه دقیق ·{" "}
-              {accumulator.length + combo2.length + combo3.length} برگه میکس/آکومولاتور ·{" "}
-              {sniperPairs.length} اسنایپر +EV · {shadow.length} وتو
+              — خط لوله مارکوف ← کاپولا ← مونت‌کارلو ۱۰هزارتایی ← فید زنده ضرایب ← دروازه سوپروایزر · خروجی امروز:{" "}
+              {mixSlips.length} میکس ۲تایی · {single.length} تک‌گزینه عمیق · {banker.length} بانکر ·{" "}
+              {accumulator.length} آکومولاتور ۳تایی · {shadow.length} وتو
             </span>
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <Tabs defaultValue="dual">
-            <TabsList className="grid w-full grid-cols-3 gap-1 bg-white/5 sm:grid-cols-6">
-              <TabsTrigger value="dual" className="gap-1.5 text-xs">
-                <Target className="h-3.5 w-3.5" /> زوج‌تیپ
+          <Tabs defaultValue={defaultTab}>
+            <TabsList className="grid w-full grid-cols-3 gap-1 bg-white/5">
+              <TabsTrigger value="mix" className="gap-1.5 text-xs">
+                <Link2 className="h-3.5 w-3.5" /> میکس ۲تایی
+              </TabsTrigger>
+              <TabsTrigger value="single" className="gap-1.5 text-xs">
+                <Target className="h-3.5 w-3.5" /> تک‌گزینه عمیق
               </TabsTrigger>
               <TabsTrigger value="banker" className="gap-1.5 text-xs">
-                <Wallet className="h-3.5 w-3.5" /> بانکر
-              </TabsTrigger>
-              <TabsTrigger value="regcombo" className="gap-1.5 text-xs">
-                <Layers className="h-3.5 w-3.5" /> کمبو کاپولا
-              </TabsTrigger>
-              <TabsTrigger value="cluster" className="gap-1.5 text-xs">
-                <Gem className="h-3.5 w-3.5" /> خوشه دقیق
-              </TabsTrigger>
-              <TabsTrigger value="combo" className="gap-1.5 text-xs">
-                <Link2 className="h-3.5 w-3.5" /> میکس/آکومو
-              </TabsTrigger>
-              <TabsTrigger value="sniper" className="gap-1.5 text-xs">
-                <Crosshair className="h-3.5 w-3.5" /> تک‌تیرانداز
+                <Wallet className="h-3.5 w-3.5" /> بانکر + آکومو
               </TabsTrigger>
             </TabsList>
 
-            {/* ── Tab 1 · 🏦 TENNIS BANKER — single safe button ── */}
+            {/* ── Tab 1 · 🔗 MIX-2 — 2-Leg Precision Parlay (1.80x–2.25x) ── */}
+            <TabsContent value="mix" className="mt-4 space-y-3">
+              <div className="rounded-xl border border-cyan-400/25 bg-cyan-400/[0.06] px-3.5 py-2.5">
+                <div className="flex items-center gap-2 text-xs font-bold text-cyan-300">
+                  <Link2 className="h-4 w-4" />
+                  تب ۱ — میکس ۲ تایی سلاطین سرویس (2-Leg Precision Parlay)
+                  <span className="mono-num text-[10px] font-normal text-cyan-200/70" dir="ltr">
+                    legs 1.34x–1.50x · total 1.80x–2.25x · +80 تا +125 واحد هر برد · BE 50%
+                  </span>
+                </div>
+                <div className="mt-1 text-[10px] text-muted-foreground">
+                  دو پایه مستقل از دو بازی مختلف (هندیکپ ست +۱.۵ / برد فاوریت / بالای ۱۹.۵ گیم) در هم ضرب
+                  می‌شوند — هر پایه با ضریب زندهٔ قفل‌شده و استیک ۱۰۰ واحدی.
+                </div>
+              </div>
+              {mixSlips.length === 0 ? (
+                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
+                  جفت پایه‌های مستقل با ضریب کل <span className="mono-num">1.80x–2.25x</span> امروز ساخته نشد —
+                  برگه میکس فقط وقتی صادر می‌شود که حاصل‌ضرب واقعی دو ضریب زنده داخل پنجره قرار بگیرد.
+                </div>
+              ) : (
+                <div className="grid gap-3 xl:grid-cols-2">
+                  {mixSlips.map((item) => (
+                    <ParlaySlipCard key={`${item.line}-${item.matchId}-${item.leg}`} item={item} />
+                  ))}
+                </div>
+              )}
+            </TabsContent>
+
+            {/* ── Tab 2 · 🎯 DEEP SINGLE — Markov-Copula value pick (1.72x–2.15x) ── */}
+            <TabsContent value="single" className="mt-4 space-y-3">
+              <div className="rounded-xl border border-sky-400/25 bg-sky-400/[0.06] px-3.5 py-2.5">
+                <div className="flex items-center gap-2 text-xs font-bold text-sky-300">
+                  <Target className="h-4 w-4" />
+                  تب ۲ — تک‌گزینه عمیق مارکوف-کاپولا (Single Deep-Value Pick)
+                  <span className="mono-num text-[10px] font-normal text-sky-200/70" dir="ltr">
+                    odds 1.72x–2.15x · +EV edge ≥ +6.5% · BE 54%
+                  </span>
+                </div>
+                <div className="mt-1 text-[10px] text-muted-foreground">
+                  فقط «۱ دکمه رسمی» در هر بازی: نتایج دقیق ست ۲-۰ (وقتی P ≥ ۵۶٪)، هندیکپ گیم −۳.۵،
+                  بالای ۲۱.۵/۲۲.۵ گیم یا کمبوی رسمی برد فاوریت و زیر ۲۱.۵ گیم — ضریب ۱۰۰٪ زنده از فید.
+                </div>
+              </div>
+              {single.length === 0 ? (
+                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
+                  امتیاز +EV ≥ <span className="mono-num">+6.5%</span> نسبت به ضریب زنده امروز پیدا نشد —
+                  تک‌گزینه عمیق فقط وقتی صادر می‌شود که مدل، برتری احتمالی واقعی روی تابلوی زنده داشته باشد.
+                </div>
+              ) : (
+                <div className="grid gap-3 xl:grid-cols-2">
+                  {single.map((item) => (
+                    <DeepSingleCard key={`${item.matchId}-${item.leg}`} item={item} />
+                  ))}
+                </div>
+              )}
+            </TabsContent>
+
+            {/* ── Tab 3 · 🏦 SERVICE BANKER + 🔗 3-FOLD ACCA ── */}
             <TabsContent value="banker" className="mt-4 space-y-3">
               <div className="rounded-xl border border-emerald-400/25 bg-emerald-400/[0.06] px-3.5 py-2.5">
                 <div className="flex items-center gap-2 text-xs font-bold text-emerald-300">
                   <Landmark className="h-4 w-4" />
-                  رژیم ۱ — بانکر امن سرویس (TENNIS BANKER)
+                  تب ۳ — تک‌ستون بنکر سرویس + آکومولاتور ۳ تایی (Service Banker & 3-Fold Acca)
                   <span className="mono-num text-[10px] font-normal text-emerald-200/70" dir="ltr">
-                    S_fav ≥ 70% · Hold ≥ 78% · odds 1.38x–1.65x · stake 100u
+                    banker 1.45x–1.65x · Top-25 · Elo gap ≥ 140 · acca 2.70x–3.40x
                   </span>
                 </div>
                 <div className="mt-1 text-[10px] text-muted-foreground">
-                  تک‌دکمه امن با استیک کامل ۱۰۰ واحدی — تغذیه خودکار تب آکومولاتور سلاطین سرویس.
+                  بانکر تک‌شرط (برد مسابقه یا نتایج دقیق ست ۲-۰) با وین‌ریت ۷۸–۸۵٪ برای رشد پایدار بانک +
+                  برگه آکومولاتور ۳ تایی روز با ضریب واقعی بانکرها.
                 </div>
               </div>
               {banker.length === 0 ? (
                 <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  امروز هیچ بازی به پنجره بانکر (S_fav ≥ 70٪ و Hold ≥ 78٪) نرسید.
+                  امروز هیچ بازی به پنجره بنکر سرویس (تاپ-۲۵ با گپ امتیازی ≥ ۱۴۰ و S_fav ≥ ۷۰٪) نرسید.
                 </div>
               ) : (
                 <div className="grid gap-3 xl:grid-cols-2">
@@ -1316,140 +1356,41 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
                   ))}
                 </div>
               )}
-            </TabsContent>
-
-            {/* ── Tab 2 · ⚖️ DUAL-HEDGE + 🧩 COMBO regimes ── */}
-            <TabsContent value="dual" className="mt-4 space-y-4">
-              <div className="flex items-center justify-between rounded-xl border border-amber-300/20 bg-amber-300/5 px-3.5 py-2.5">
-                <div className="flex items-center gap-2">
-                  <Crown className="h-4 w-4 text-amber-300" />
-                  <div>
-                    <div className="text-xs font-bold text-amber-300">
-                      سوییچ شتاب‌دهنده نامتقارن — Principal-Lock Booster
-                    </div>
-                    <div className="text-[10px] text-muted-foreground">{boosterNote}</div>
+              {accumulator.length > 0 && (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 pt-1 text-xs font-bold text-lime-300">
+                    <Link2 className="h-3.5 w-3.5" />
+                    برگه آکومولاتور ۳ تایی روز (ضریب کل <span className="mono-num" dir="ltr">2.70x–3.40x</span>)
                   </div>
-                </div>
-                <Switch checked={booster} onCheckedChange={setBooster} aria-label="شتاب‌دهنده" />
-              </div>
-
-              {dualPairs.length === 0 ? (
-                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center">
-                  <ShieldAlert className="mx-auto h-8 w-8 text-amber-300/60" />
-                  <p className="mt-3 text-sm font-bold">هیچ رژیمی امروز این خط را صادر نکرد</p>
-                  <p className="mx-auto mt-1 max-w-md text-xs leading-6 text-muted-foreground">
-                    روتینگ ۵ رژیمی هر مسابقه را به دقیقاً یک استراتژی هدایت می‌کند — الگوی قهرمان
-                    زوج‌تیپ (ریسک 0-2 زیر <span className="mono-num">8.8%</span>) و کمبوی رسمی
-                    برد×گیم (پوشش مشترک ≥ <span className="mono-num">92%</span> در ۱۰k شبیه‌سازی).
-                  </p>
-                </div>
-              ) : (
-                <div className="grid gap-3 xl:grid-cols-2">
-                  {dualPairs.map((pair) => (
-                    <DualFlashcard key={pair.A.matchId} pair={pair} />
-                  ))}
-                </div>
-              )}
-
-              <NearGateStrip matches={feed.matches} />
-
-              {shadow.length > 0 && (
-                <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-4">
-                  <div className="flex items-center gap-2 text-xs font-bold text-muted-foreground">
-                    <ShieldAlert className="h-3.5 w-3.5" />
-                    🛡️ دفتر سایه — ({shadow.length} تیپ وتوشده، بدون احتساب وین‌ریت)
-                  </div>
-                  <div className="scroll-slim mt-2 grid max-h-40 gap-1.5 overflow-y-auto">
-                    {shadowGroups.map((s) => (
-                      <div key={s.matchId} className="flex items-center gap-2 rounded-lg border border-white/5 px-2.5 py-1.5 text-[11px]">
-                        <span className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${SURFACE_DOT[s.surface]}`} />
-                        <span className="truncate text-muted-foreground">{s.desc}</span>
-                        <span className="mono-num ms-auto shrink-0 text-[10px] text-white/40">
-                          {s.playerA.split(" ").pop()} × {s.playerB.split(" ").pop()}
-                        </span>
-                      </div>
+                  <div className="grid gap-3 xl:grid-cols-2">
+                    {accumulator.map((item) => (
+                      <ParlaySlipCard key={`${item.line}-${item.matchId}-${item.leg}`} item={item} />
                     ))}
                   </div>
                 </div>
               )}
             </TabsContent>
-
-            <TabsContent value="regcombo" className="mt-4 space-y-3">
-              {regComboPairs.length === 0 ? (
-                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  کمبوی کاپولایی با جرم مشترک بالا و پوشش{" "}
-                  <span className="mono-num">≥ ۸۴٪</span> امروز یافت نشد — مسابقه‌ای که همبستگی
-                  کاپولای برد فاوریت × خط گیم را بگذارد اینجا صادر می‌شود (داچینگ ۱۰۰ واحدی).
-                </div>
-              ) : (
-                <div className="grid gap-3 xl:grid-cols-2">
-                  {regComboPairs.map((pair) => (
-                    <RegComboCard key={pair.main.matchId} pair={pair} />
-                  ))}
-                </div>
-              )}
-            </TabsContent>
-
-            <TabsContent value="cluster" className="mt-4 space-y-3">
-              {clusterGroups.length === 0 ? (
-                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  خوشه‌ای با آنتروپی شانون پایین و ۳ سناریوی بالای{" "}
-                  <span className="mono-num">۶۴٪</span> امروز یافت نشد — داچینگ ۱۰۰ واحدی روی
-                  سناریوهای دقیق ست و گیم فقط در مسابقه‌های قطعی صادر می‌شود.
-                </div>
-              ) : (
-                <div className="grid gap-3 xl:grid-cols-2">
-                  {clusterGroups.map((legs) => (
-                    <ClusterCard key={legs[0].matchId} legs={legs} />
-                  ))}
-                </div>
-              )}
-            </TabsContent>
-
-            <TabsContent value="combo" className="mt-4 space-y-3">
-              {[...accumulator, ...combo2, ...combo3].length === 0 ? (
-                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  برگه میکس امنی یا آکومولاتور سلاطین سرویس امروز یافت نشد — آکومولاتور ۲-۳ تایی
-                  به‌صورت خودکار از بهترین بانکرهای روز ساخته می‌شود (وین‌ریت بالای ۷۸٪).
-                </div>
-              ) : (
-                <div className="grid gap-3 xl:grid-cols-2">
-                  {[...accumulator, ...combo2, ...combo3].map((item) => (
-                    <ParlaySlipCard key={`${item.line}-${item.matchId}-${item.leg}`} item={item} />
-                  ))}
-                </div>
-              )}
-            </TabsContent>
-
-            {/* ── Tab 5 · 🎯 Sniper — packaged main + capital-protection cover ── */}
-            <TabsContent value="sniper" className="mt-4 space-y-3">
-              <div className="rounded-xl border border-rose-400/25 bg-rose-400/[0.06] px-3.5 py-2.5">
-                <div className="flex items-center gap-2 text-xs font-bold text-rose-300">
-                  <Crosshair className="h-4 w-4" />
-                  تک‌تیرانداز نسخه ۵.۵ — مین مارکت (Favorite Wins 2-1 / Over 2.5 Sets) + پوشش اصل سرمایه روی ۱۰۰ واحد
-                  <span className="mono-num text-[10px] font-normal text-rose-200/70" dir="ltr">
-                    Copula +EV ≥ 14% · naked 1u/2u stakes DELISTED
-                  </span>
-                </div>
-                <div className="mt-1 text-[10px] text-muted-foreground">
-                  هر پوزیشن فقط وقتی صادر می‌شود که prob مونت‌کارلو × ضریب رسمی − ۱ ≥ ۱۴٪ باشد و همیشه با پوشش اصل سرمایه بسته می‌شود (داچینگ ۱۰۰ واحدی).
-                </div>
-              </div>
-              {sniperPairs.length === 0 ? (
-                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center text-sm text-muted-foreground">
-                  تیر بسته‌شده با پوشش پیدا نشد — اسنایپر نسخه ۵.۵ فقط وقتی{" "}
-                  <span className="mono-num"> +EV ≥ 14%</span> باشد و همراه پوشش اصل سرمایه روی{" "}
-                  <span className="mono-num">۱۰۰ واحد</span> صادر می‌شود؛ تیرهای بدون پوشش و استیک‌های ۱/۲ واحدی حذف شدند.
-                </div>
-              ) : (
-                <div className="grid gap-3 xl:grid-cols-2">
-                  {sniperPairs.map((pair) => (
-                    <SniperPairCard key={pair.main.matchId} main={pair.main} cover={pair.cover} />
-                  ))}
-                </div>
-              )}
-            </TabsContent>
           </Tabs>
+
+          {shadow.length > 0 && (
+            <div className="mt-4 rounded-2xl border border-white/10 bg-white/[0.02] p-4">
+              <div className="flex items-center gap-2 text-xs font-bold text-muted-foreground">
+                <ShieldAlert className="h-3.5 w-3.5" />
+                🛡️ دفتر سایه — ({shadow.length} تیپ وتوشده، بدون احتساب وین‌ریت)
+              </div>
+              <div className="scroll-slim mt-2 grid max-h-40 gap-1.5 overflow-y-auto">
+                {shadowGroups.map((s) => (
+                  <div key={s.matchId} className="flex items-center gap-2 rounded-lg border border-white/5 px-2.5 py-1.5 text-[11px]">
+                    <span className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${SURFACE_DOT[s.surface]}`} />
+                    <span className="truncate text-muted-foreground">{s.desc}</span>
+                    <span className="mono-num ms-auto shrink-0 text-[10px] text-white/40">
+                      {s.playerA.split(" ").pop()} × {s.playerB.split(" ").pop()}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
     </section>
