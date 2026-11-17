@@ -1,0 +1,702 @@
+     1→     1→     1→// ─── NeoTennis Markov Quant v10.0 — Peak Dual-Hedge Restoration ────────────
+     2→     2→     2→// Per Kovalchik (2016): model accuracy collapses outside the Top-100.
+     3→     3→     3→//
+     4→     4→     4→// v10.0 mandate (master-prompt v10 «Restore Peak Dual-Hedge & Positive
+     5→     5→     5→// Overlap Filter»): the v7.0 single-option lines (🎯 DEEP SINGLE, 🏦 BANKER
+     6→     6→     6→// with negative Sharpe, 🔗 uncovered MIX/ACCA) sank the bank −1,029.92 units
+     7→     7→     7→// in two days. The WINNING peak architecture — «زوج‌تیپ طلایی همپوشان»
+     8→     8→     8→// (Orthogonal Dual-Hedge, 100-unit package, peak 2,445.92u / win-rate 88%+)
+     9→     9→     9→// — is RESTORED as the only production architecture:
+    10→    10→    10→//
+    11→    11→    11→//   · IRON RULE: every match enters the ledger EXACTLY ONCE as ONE
+    12→    12→    12→//     100-unit overlap package (Dual-Hedge OR Copula Combo + Cover).
+    13→    13→    13→//   · The THREE positive-overlap patterns (with the Tennis Double-Win
+    14→    14→    14→//     jackpot zone where BOTH wings win together):
+    15→    15→    15→//       P1 · Set Mastery Overlap     A 57.6u SB-F20 + B 42.4u TS-O25
+    16→    16→    16→//       P2 · Double-Win Game Overlap A 56.0u SB-F20 + B 44.0u TG-O20.5
+    17→    17→    17→//       P3 · Exact Set Split 2-0/2-1 A 60.0u SB-P1-20 + B 40.0u SB-P1-21
+    18→    18→    18→//   · THE GOLDEN GATE — a match is approved ONLY when its overlap
+    19→    19→    19→//     coefficient carries a guaranteed positive return:
+    20→    20→    20→//         impliedOverlapSum = 1/oddsA + 1/oddsB  ≤ 0.865
+    21→    21→    21→//         netOverlapReturnPct = (1/impliedOverlapSum − 1) × 100 ≥ +15.5
+    22→    22→    22→//         combinedCoverageProb ≥ 0.895 ∧ Sharpe ≥ 0.25
+    23→    23→    23→//     Everything else is instantly vetoed by the supervisor
+    24→    24→    24→//     (🚫 وتوی سوپروایزر — عدم وجود ضریب همپوشانی مثبت) and NEVER reaches
+    25→    25→    25→//     the bank.
+    26→    26→    26→
+    27→    27→    27→import type {
+    28→    28→    28→  AnalyzedMatch,
+    29→    29→    29→  ArchetypeEval,
+    30→    30→    30→  ArchetypeInfo,
+    31→    31→    31→  OverlapPatternCode,
+    32→    32→    32→  Slip,
+    33→    33→    33→  VetoInfo,
+    34→    34→    34→} from "./types";
+    35→    35→    35→
+    36→    36→    36→const TOP100_LIMIT = 100;
+    37→    37→    37→
+    38→    38→    38→// coverage gates — the exact uncovered (simultaneous-loss) mass of each
+    39→    39→    39→// archetype must stay below the doc thresholds for a NATURAL approval
+    40→    40→    40→const ARCH1_MAX_PAIR_LOSS = 0.085; // coverage ≥ 91.5%
+    41→    41→    41→const ARCH2_MAX_PAIR_LOSS = 0.095; // risk < 9.5%
+    42→    42→    42→
+    43→    43→    43→// v4.0 archetype windows (master-prompt table, exactly as specified)
+    44→    44→    44→const ARCH1_MIN_S = 0.64;
+    45→    45→    45→const ARCH2_MIN_S = 0.54;
+    46→    46→    46→const ARCH2_MAX_S = 0.64;
+    47→    47→    47→
+    48→    48→    48→// ─── v10 · THE GOLDEN GATE — Positive Overlap Coefficient Filter ───────────
+    49→    49→    49→// Master-prompt v10, VERBATIM thresholds. A match only reaches the bank when
+    50→    50→    50→// its two-wing package carries a GUARANTEED positive overlap return:
+    51→    51→    51→const OVERLAP_MAX_IMPLIED_SUM = 0.865; // مجموع معکوس ضرایب زیر 0.865 (ضریب موثر ≥ 1.156x)
+    52→    52→    52→const OVERLAP_MIN_NET_RETURN_PCT = 15.5; // سود خالص همپوشانی در هر برد حداقل +15.5%
+    53→    53→    53→const OVERLAP_MIN_COVERAGE = 0.895; // پوشش زنجیره مارکوف حداقل 89.5%
+    54→    54→    54→const OVERLAP_MIN_SHARPE = 0.25; // حذف کامل کارت‌های با شارپ منفی/ضعیف
+    55→    55→    55→
+    56→    56→    56→export interface OverlapGateMetrics {
+    57→    57→    57→  impliedOverlapSum: number;
+    58→    58→    58→  effectiveOverlapOdds: number;
+    59→    59→    59→  netOverlapReturnPct: number;
+    60→    60→    60→  combinedCoverageProb: number;
+    61→    61→    61→  sharpe: number;
+    62→    62→    62→  approved: boolean;
+    63→    63→    63→  whyNot?: string;
+    64→    64→    64→}
+    65→    65→    65→
+    66→    66→    66→/**
+    67→    67→    67→ * v10 — THE positive-overlap gate (master-prompt v10 §2, verbatim algebra):
+    68→    68→    68→ *   impliedOverlapSum = (1/oddsA) + (1/oddsB)
+    69→    69→    69→ *   effectiveOverlapOdds = 1 / impliedOverlapSum
+    70→    70→    70→ *   netOverlapReturnPct = (effectiveOverlapOdds − 1) × 100
+    71→    71→    71→ *   isApprovedPositiveOverlap =
+    72→    72→    72→ *     impliedOverlapSum ≤ 0.865 ∧ netOverlapReturnPct ≥ 15.5 ∧
+    73→    73→    73→ *     combinedCoverageProb ≥ 0.895 ∧ sharpeRatio ≥ 0.25
+    74→    74→    74→ */
+    75→    75→    75→export function positiveOverlapGate(
+    76→    76→    76→  oddsA: number,
+    77→    77→    77→  oddsB: number,
+    78→    78→    78→  combinedCoverageProb: number,
+    79→    79→    79→  sharpeRatio: number
+    80→    80→    80→): OverlapGateMetrics {
+    81→    81→    81→  const impliedOverlapSum =
+    82→    82→    82→    1 / Math.max(oddsA, 1.01) + 1 / Math.max(oddsB, 1.01);
+    83→    83→    83→  const effectiveOverlapOdds = 1 / impliedOverlapSum;
+    84→    84→    84→  const netOverlapReturnPct = (effectiveOverlapOdds - 1) * 100;
+    85→    85→    85→  const checks: { ok: boolean; why: string }[] = [
+    86→    86→    86→    {
+    87→    87→    87→      ok: impliedOverlapSum <= OVERLAP_MAX_IMPLIED_SUM,
+    88→    88→    88→      why: `مجموع معکوس ضرایب ${impliedOverlapSum.toFixed(3)} بالای سقف 0.865`,
+    89→    89→    89→    },
+    90→    90→    90→    {
+    91→    91→    91→      ok: netOverlapReturnPct >= OVERLAP_MIN_NET_RETURN_PCT,
+    92→    92→    92→      why: `سود خالص همپوشانی +${netOverlapReturnPct.toFixed(1)}% زیر کف +15.5%`,
+    93→    93→    93→    },
+    94→    94→    94→    {
+    95→    95→    95→      ok: combinedCoverageProb >= OVERLAP_MIN_COVERAGE,
+    96→    96→    96→      why: `پوشش زنجیره مارکوف ${(combinedCoverageProb * 100).toFixed(1)}% زیر کف 89.5%`,
+    97→    97→    97→    },
+    98→    98→    98→    {
+    99→    99→    99→      ok: sharpeRatio >= OVERLAP_MIN_SHARPE,
+   100→   100→   100→      why: `نسبت شارپ ${sharpeRatio.toFixed(2)} زیر کف 0.25`,
+   101→   101→   101→    },
+   102→   102→   102→  ];
+   103→   103→   103→  const failed = checks.filter((c) => !c.ok);
+   104→   104→   104→  return {
+   105→   105→   105→    impliedOverlapSum,
+   106→   106→   106→    effectiveOverlapOdds,
+   107→   107→   107→    netOverlapReturnPct,
+   108→   108→   108→    combinedCoverageProb,
+   109→   109→   109→    sharpe: sharpeRatio,
+   110→   110→   110→    approved: failed.length === 0,
+   111→   111→   111→    whyNot: failed.length > 0 ? failed.map((f) => f.why).join(" · ") : undefined,
+   112→   112→   112→  };
+   113→   113→   113→}
+   114→   114→   114→
+   115→   115→   115→// ─── v10 · THE THREE POSITIVE-OVERLAP PATTERNS (peak architecture) ──────────
+   116→   116→   116→// Every approved match rides EXACTLY ONE of these golden pairs as a 100-unit
+   117→   117→   117→// package. The canonical stakes are the equal-profit dutching splits of the
+   118→   118→   118→// official odds windows (P1 57.6/42.4 · P2 56.0/44.0 · P3 60.0/40.0); the
+   119→   119→   119→// live per-match split derives from the real locked prices of the same math.
+   120→   120→   120→export interface OverlapPatternSpec {
+   121→   121→   121→  code: OverlapPatternCode;
+   122→   122→   122→  labelFa: string;
+   123→   123→   123→  labelEn: string;
+   124→   124→   124→  /** canonical equal-profit split of the 100-unit package (آ/ب) */
+   125→   125→   125→  stakeA: number;
+   126→   126→   126→  stakeB: number;
+   127→   127→   127→  /** the golden selling point printed on cards/captions */
+   128→   128→   128→  hookFa: string;
+   129→   129→   129→  hookEn: string;
+   130→   130→   130→}
+   131→   131→   131→
+   132→   132→   132→export const OVERLAP_PATTERNS: Record<OverlapPatternCode, OverlapPatternSpec> = {
+   133→   133→   133→  P1: {
+   134→   134→   134→    code: "P1",
+   135→   135→   135→    labelFa: "الگوی همپوشان ۱ — تسلط ست‌ها",
+   136→   136→   136→    labelEn: "SET MASTERY OVERLAP",
+   137→   137→   137→    stakeA: 57.6,
+   138→   138→   138→    stakeB: 42.4,
+   139→   139→   139→    hookFa: "سه مسیر از چهار نتیجه پوشش داده می‌شود؛ برد فاوریت یا سوم ست — یکی از دو تیپ حتماً می‌برد",
+   140→   140→   140→    hookEn: "3 OF 4 SCORE ROUTES COVERED - FAV 2-0 OR 3RD SET, ONE WING ALWAYS PAYS",
+   141→   141→   141→  },
+   142→   142→   142→  P2: {
+   143→   143→   143→    code: "P2",
+   144→   144→   144→    labelFa: "الگوی همپوشان ۲ — برد دوبل همزمان",
+   145→   145→   145→    labelEn: "DOUBLE-WIN GAME/SET OVERLAP",
+   146→   146→   146→    stakeA: 56.0,
+   147→   147→   147→    stakeB: 44.0,
+   148→   148→   148→    hookFa: "ناحیه برد دوبل: اگر فاوریت ۲-۰ نزدیک ببرد (مثل 7-5، 6-4 = ۲۲ گیم) هر دو تیپ همزمان می‌برند — جکپات برد دوبل +۱۲۷ واحد",
+   149→   149→   149→    hookEn: "DOUBLE-WIN ZONE: FAV CLOSE 2-0 (7-5 6-4 = 22 GAMES) PAYS BOTH WINGS AT ONCE - +127u JACKPOT",
+   150→   150→   150→  },
+   151→   151→   151→  P3: {
+   152→   152→   152→    code: "P3",
+   153→   153→   153→    labelFa: "الگوی همپوشان ۳ — تفکیک دقیق ست ۲-۰ / ۲-۱",
+   154→   154→   154→    labelEn: "EXACT SET SPLIT 2-0 / 2-1",
+   155→   155→   155→    stakeA: 60.0,
+   156→   156→   156→    stakeB: 40.0,
+   157→   157→   157→    hookFa: "دو دکمه کنار هم در گرید نتیجه دقیق ست — ۱۰۰٪ مسیرهای برد بازیکن اول پوشش داده می‌شود",
+   158→   158→   158→    hookEn: "TWO SIDE-BY-SIDE SET-BETTING BUTTONS - 100% OF PLAYER-1 WIN PATHS COVERED",
+   159→   159→   159→  },
+   160→   160→   160→};
+   161→   161→   161→
+   162→   162→   162→const ARCH_LABELS: Record<string, { fa: string; en: string }> = {
+   163→   163→   163→  ARCH1: { fa: "الگوی رسمی ۱ — تسلط ست‌ها", en: "Set Mastery" },
+   164→   164→   164→  ARCH2: { fa: "الگوی رسمی ۲ — تفکیک دقیق ست‌ها", en: "Exact Set Split" },
+   165→   165→   165→  ARCH3: { fa: "الگوی رسمی ۳ — گیم‌های سرویس‌زنان", en: "Serve-Bot Games" },
+   166→   166→   166→};
+   167→   167→   167→
+   168→   168→   168→// ─── v4.0 · OFFICIAL_TENNIS_ATOMIC_ARCHETYPES ──────────────────────────────
+   169→   169→   169→// The canonical single-button market table (code, official English name,
+   170→   170→   170→// Persian bet text template, odds window and the market price the ledger
+   171→   171→   171→// simulates taking). Also drives the one-time record re-pricing sync.
+   172→   172→   172→// v10 — ARCH1 is the leg-set of overlap pattern P1 (+ its P2 game-domain
+   173→   173→   173→// variant), ARCH2 is the leg-set of pattern P3. ARCH3 stays ONLY as the
+   174→   174→   174→// legacy leg-price reference of settled history rows — it is no longer
+   175→   175→   175→// evaluated or produced (the Serve-Bot pair was never a peak-architecture
+   176→   176→   176→// package and is not in the v10 pattern table).
+   177→   177→   177→export interface AtomicLegSpec {
+   178→   178→   178→  leg: string;
+   179→   179→   179→  marketEn: string;
+   180→   180→   180→  oddsWindow: [number, number];
+   181→   181→   181→  price: number;
+   182→   182→   182→}
+   183→   183→   183→
+   184→   184→   184→export interface AtomicArchetypeSpec {
+   185→   185→   185→  code: "ARCH1" | "ARCH2" | "ARCH3";
+   186→   186→   186→  labelFa: string;
+   187→   187→   187→  labelEn: string;
+   188→   188→   188→  windowFa: string;
+   189→   189→   189→  legA: AtomicLegSpec;
+   190→   190→   190→  legB: AtomicLegSpec;
+   191→   191→   191→}
+   192→   192→   192→
+   193→   193→   193→export const OFFICIAL_TENNIS_ATOMIC_ARCHETYPES: Record<
+   194→   194→   194→  "ARCH1" | "ARCH2" | "ARCH3",
+   195→   195→   195→  AtomicArchetypeSpec
+   196→   196→   196→> = {
+   197→   197→   197→  ARCH1: {
+   198→   198→   198→    code: "ARCH1",
+   199→   199→   199→    labelFa: ARCH_LABELS.ARCH1.fa,
+   200→   200→   200→    labelEn: ARCH_LABELS.ARCH1.en,
+   201→   201→   201→    windowFa: "برتری فاوریت — S_fav ≥ 64%",
+   202→   202→   202→    legA: {
+   203→   203→   203→      leg: "SB-F20",
+   204→   204→   204→      marketEn: "SET BETTING — FAVORITE 2-0",
+   205→   205→   205→      oddsWindow: [1.95, 2.2],
+   206→   206→   206→      price: 1.97,
+   207→   207→   207→    },
+   208→   208→   208→    legB: {
+   209→   209→   209→      leg: "TS-O25",
+   210→   210→   210→      marketEn: "TOTAL SETS — OVER 2.5 SETS",
+   211→   211→   211→      oddsWindow: [2.5, 2.85],
+   212→   212→   212→      price: 2.68,
+   213→   213→   213→    },
+   214→   214→   214→  },
+   215→   215→   215→  ARCH2: {
+   216→   216→   216→    code: "ARCH2",
+   217→   217→   217→    labelFa: ARCH_LABELS.ARCH2.fa,
+   218→   218→   218→    labelEn: ARCH_LABELS.ARCH2.en,
+   219→   219→   219→    windowFa: "بازی‌های نزدیک ستارگان — 54% ≤ S_A < 64%",
+   220→   220→   220→    legA: {
+   221→   221→   221→      leg: "SB-P1-20",
+   222→   222→   222→      marketEn: "SET BETTING — PLAYER 1 (2-0)",
+   223→   223→   223→      oddsWindow: [2.25, 2.5],
+   224→   224→   224→      price: 2.38,
+   225→   225→   225→    },
+   226→   226→   226→    legB: {
+   227→   227→   227→      leg: "SB-P1-21",
+   228→   228→   228→      marketEn: "SET BETTING — PLAYER 1 (2-1)",
+   229→   229→   229→      oddsWindow: [3.2, 3.6],
+   230→   230→   230→      price: 3.4,
+   231→   231→   231→    },
+   232→   232→   232→  },
+   233→   233→   233→  ARCH3: {
+   234→   234→   234→    code: "ARCH3",
+   235→   235→   235→    labelFa: ARCH_LABELS.ARCH3.fa,
+   236→   236→   236→    labelEn: ARCH_LABELS.ARCH3.en,
+   237→   237→   237→    windowFa: "سرویس‌زنان قدرتمند — Hold ≥ 84%",
+   238→   238→   238→    legA: {
+   239→   239→   239→      leg: "TG-O225",
+   240→   240→   240→      marketEn: "TOTAL GAMES — OVER 22.5",
+   241→   241→   241→      oddsWindow: [1.9, 2.05],
+   242→   242→   242→      price: 1.98,
+   243→   243→   243→    },
+   244→   244→   244→    legB: {
+   245→   245→   245→      leg: "GH-F45",
+   246→   246→   246→      marketEn: "GAME HANDICAP — FAV −4.5 GAMES",
+   247→   247→   247→      oddsWindow: [2.8, 3.2],
+   248→   248→   248→      price: 3.0,
+   249→   249→   249→    },
+   250→   250→   250→  },
+   251→   251→   251→};
+   252→   252→   252→
+   253→   253→   253→// Market-priced legs — the ledger simulates TAKING the tip at the real market
+   254→   254→   254→// price while the model probability stays the edge metric.
+   255→   255→   255→// v6.0 — the SIX atomic archetype legs (SB-F20, TS-O25, SB-P1-20, SB-P1-21,
+   256→   256→   256→// TG-O225, GH-F45) + the new heavy-favorite game legs (TG-U205, TG-O205,
+   257→   257→   257→// SB-F21) are DYNAMICALLY priced per match via computeReal1xBetTennisOdds;
+   258→   258→   258→// they are NOT in this static map, so the re-pricing sync never flattens a
+   259→   259→   259→// per-match real price back to a constant. Legacy v2/v3 leg codes keep their
+   260→   260→   260→// old prices so the stored 7-day record is never re-priced against itself.
+   261→   261→   261→export const DUAL_LEG_MARKET_ODDS: Record<string, number> = {
+   262→   262→   262→  // ─── v5.0 · 5-Regime Router official single-button prices ──────────────
+   263→   263→   263→  "MW-FAV": 1.48,   // BANKER — MATCH WINNER — FAVORITE (window 1.38-1.65)
+   264→   264→   264→  "SH-F15": 1.62,   // BANKER — SET HANDICAP — FAVORITE -1.5 SETS
+   265→   265→   265→  "RC-FWU215": 2.15, // COMBO-UNDER — FAVORITE WIN & UNDER 21.5 GAMES
+   266→   266→   266→  "RC-O215": 2.95,   // COMBO-UNDER cover — TOTAL GAMES OVER 21.5
+   267→   267→   267→  "RC-FWO205": 1.95, // COMBO-OVER — FAVORITE WIN & OVER 20.5 GAMES
+   268→   268→   268→  "RC-U205": 3.05,   // COMBO-OVER cover — TOTAL GAMES UNDER 20.5
+   269→   269→   269→  "CL-F20U195": 2.8, // CLUSTER S1 — favorite fast 2-0 (under 19.5 games)
+   270→   270→   270→  "CL-F20G20": 3.9,  // CLUSTER S2 — favorite close 2-0 (20-22 games / TB)
+   271→   271→   271→  "CL-F21": 3.6,     // CLUSTER S3 — favorite 2-1
+   272→   272→   272→  // legacy v2.0/v3.0 legs (historical record integrity)
+   273→   273→   273→  "A": 2.05,
+   274→   274→   274→  "A-O195": 2.0,
+   275→   275→   275→  "A-O225": 2.08,
+   276→   276→   276→  "B": 2.7,
+   277→   277→   277→  "B-ALT": 2.75,
+   278→   278→   278→  "B-U225": 2.95,
+   279→   279→   279→};
+   280→   280→   280→
+   281→   281→   281→/** legs whose price is computed per-match (never re-priced to a constant) */
+   282→   282→   282→export const DYNAMIC_PRICED_LEGS = new Set([
+   283→   283→   283→  "SB-F20", "TS-O25", "SB-P1-20", "SB-P1-21", "TG-O225", "GH-F45",
+   284→   284→   284→  "TG-U205", "TG-O205", "SB-F21",
+   285→   285→   285→]);
+   286→   286→   286→
+   287→   287→   287→// the two complementary wings of each archetype (leg → its pair leg)
+   288→   288→   288→const LEG_PAIR: Record<string, string> = {
+   289→   289→   289→  "SB-F20": "TS-O25",
+   290→   290→   290→  "TS-O25": "SB-F20",
+   291→   291→   291→  "SB-P1-20": "SB-P1-21",
+   292→   292→   292→  "SB-P1-21": "SB-P1-20",
+   293→   293→   293→  "TG-O225": "GH-F45",
+   294→   294→   294→  "GH-F45": "TG-O225",
+   295→   295→   295→  // v6.0 — heavy-favorite game-domain pair (Tip A handicap/under ⇄ Tip B over)
+   296→   296→   296→  "TG-U205": "TG-O205",
+   297→   297→   297→  "TG-O205": "TG-U205",
+   298→   298→   298→  "SB-F21": "GH-F45",
+   299→   299→   299→  "A": "B",
+   300→   300→   300→  "B": "A",
+   301→   301→   301→  "A-O195": "B-ALT",
+   302→   302→   302→  "B-ALT": "A-O195",
+   303→   303→   303→  "A-O225": "B-U225",
+   304→   304→   304→  "B-U225": "A-O225",
+   305→   305→   305→  // v5.0 — COMBO regime main ⇄ cover wings (equal-profit dutching)
+   306→   306→   306→  "RC-FWU215": "RC-O215",
+   307→   307→   307→  "RC-O215": "RC-FWU215",
+   308→   308→   308→  "RC-FWO205": "RC-U205",
+   309→   309→   309→  "RC-U205": "RC-FWO205",
+   310→   310→   310→};
+   311→   311→   311→
+   312→   312→   312→// legs whose wing carries the تیپ A label (everything else is تیپ B)
+   313→   313→   313→const LEG_IS_A = new Set([
+   314→   314→   314→  "SB-F20", "SB-P1-20", "TG-O225", "A", "A-O195", "A-O225",
+   315→   315→   315→  // v5.0 — BANKER single-button legs + COMBO mains
+   316→   316→   316→  "MW-FAV", "SH-F15", "RC-FWU215", "RC-FWO205",
+   317→   317→   317→]);
+   318→   318→   318→
+   319→   319→   319→// legacy legs keep the historical 50/50 split; v4.0 legs use the exact
+   320→   320→   320→// dutching split derived from the two official market prices
+   321→   321→   321→const LEGACY_LEGS = new Set(["A", "B", "A-O195", "B-ALT", "A-O225", "B-U225"]);
+   322→   322→   322→
+   323→   323→   323→export function legLabelOf(leg: string): string {
+   324→   324→   324→  return LEG_IS_A.has(leg) ? "تیپ A" : "تیپ B";
+   325→   325→   325→}
+   326→   326→   326→
+   327→   327→   327→/** v4.0 — equal-profit dutching stakes from the two leg prices (sum = 100). */
+   328→   328→   328→export function dutchStakes(
+   329→   329→   329→  oddsA: number,
+   330→   330→   330→  oddsB: number
+   331→   331→   331→): { stakeA: number; stakeB: number } {
+   332→   332→   332→  const invA = 1 / Math.max(oddsA, 1.01);
+   333→   333→   333→  const invB = 1 / Math.max(oddsB, 1.01);
+   334→   334→   334→  const stakeA = Math.round(((100 * invA) / (invA + invB)) * 10) / 10;
+   335→   335→   335→  const stakeB = Math.round((100 - stakeA) * 10) / 10;
+   336→   336→   336→  return { stakeA, stakeB };
+   337→   337→   337→}
+   338→   338→   338→
+   339→   339→   339→/** v4.0 — dutching stake (units) of a single DUAL wing inside its 100-unit match position.
+   340→   340→   340→ *  v5.5 — the LEGACY 50/50 special case is REMOVED: every wing pair (including
+   341→   341→   341→ *  the historical A/B legs) dutches the same 100-unit budget by market price. */
+   342→   342→   342→export function dualStakeFor(leg: string): number {
+   343→   343→   343→  const pair = LEG_PAIR[leg];
+   344→   344→   344→  if (!pair) return STANDARD_MATCH_STAKE / 2;
+   345→   345→   345→  const oddsLeg = DUAL_LEG_MARKET_ODDS[leg] ?? 2;
+   346→   346→   346→  const oddsPair = DUAL_LEG_MARKET_ODDS[pair] ?? 2;
+   347→   347→   347→  const { stakeA, stakeB } = dutchStakes(oddsLeg, oddsPair);
+   348→   348→   348→  return LEG_IS_A.has(leg) ? stakeA : stakeB;
+   349→   349→   349→}
+   350→   350→   350→
+   351→   351→   351→export interface ArchetypeReport {
+   352→   352→   352→  evals: ArchetypeEval[];
+   353→   353→   353→  selected?: ArchetypeInfo;
+   354→   354→   354→}
+   355→   355→   355→
+   356→   356→   356→/**
+   357→   357→   357→ * v10 — the archetype evaluation is now a TELEMETRY report only: the
+   358→   358→   358→ * approve/veto decision belongs to the 5-regime router + the positive-overlap
+   359→   359→   359→ * golden gate. ARCH3 (Serve-Bot Games) is retired — it was never one of the
+   360→   360→   360→ * three peak-architecture overlap patterns.
+   361→   361→   361→ */
+   362→   362→   362→export function evaluateArchetypes(m: AnalyzedMatch): ArchetypeReport {
+   363→   363→   363→  const a = m.markov.arch;
+   364→   364→   364→  const sFav = m.favorite === "A" ? m.markov.setWinA : 1 - m.markov.setWinA;
+   365→   365→   365→
+   366→   366→   366→  const arch1: ArchetypeEval = {
+   367→   367→   367→    code: "ARCH1",
+   368→   368→   368→    labelFa: ARCH_LABELS.ARCH1.fa,
+   369→   369→   369→    labelEn: ARCH_LABELS.ARCH1.en,
+   370→   370→   370→    coverage: 1 - a.pairLoss1,
+   371→   371→   371→    pairLoss: a.pairLoss1,
+   372→   372→   372→    eligible: sFav >= ARCH1_MIN_S && a.pairLoss1 <= ARCH1_MAX_PAIR_LOSS,
+   373→   373→   373→    whyNot:
+   374→   374→   374→      sFav >= ARCH1_MIN_S
+   375→   375→   375→        ? undefined
+   376→   376→   376→        : `S_fav = ${(sFav * 100).toFixed(1)}% زیر آستانه تسلط 64%`,
+   377→   377→   377→  };
+   378→   378→   378→  const arch2: ArchetypeEval = {
+   379→   379→   379→    code: "ARCH2",
+   380→   380→   380→    labelFa: ARCH_LABELS.ARCH2.fa,
+   381→   381→   381→    labelEn: ARCH_LABELS.ARCH2.en,
+   382→   382→   382→    coverage: 1 - a.pairLoss2,
+   383→   383→   383→    pairLoss: a.pairLoss2,
+   384→   384→   384→    eligible:
+   385→   385→   385→      m.markov.setWinA >= ARCH2_MIN_S &&
+   386→   386→   386→      m.markov.setWinA < ARCH2_MAX_S &&
+   387→   387→   387→      a.pairLoss2 <= ARCH2_MAX_PAIR_LOSS,
+   388→   388→   388→    whyNot:
+   389→   389→   389→      m.markov.setWinA < ARCH2_MIN_S
+   390→   390→   390→        ? `S_A = ${(m.markov.setWinA * 100).toFixed(1)}% زیر کف پنجره رقابتی 54%`
+   391→   391→   391→        : m.markov.setWinA >= ARCH2_MAX_S
+   392→   392→   392→          ? `S_A = ${(m.markov.setWinA * 100).toFixed(1)}% بالاتر از سقف پنجره رقابتی 64%`
+   393→   393→   393→          : undefined,
+   394→   394→   394→  };
+   395→   395→   395→  const arch3: ArchetypeEval = {
+   396→   396→   396→    code: "ARCH3",
+   397→   397→   397→    labelFa: ARCH_LABELS.ARCH3.fa,
+   398→   398→   398→    labelEn: ARCH_LABELS.ARCH3.en,
+   399→   399→   399→    coverage: 1 - a.pairLoss3,
+   400→   400→   400→    pairLoss: a.pairLoss3,
+   401→   401→   401→    eligible: false,
+   402→   402→   402→    whyNot: "الگوی ۳ (گیم‌های سرویس‌زنان) در معماری قله نسخه ۱۰ بازنشسته شد — خارج از جدول ۳ الگوی همپوشان",
+   403→   403→   403→  };
+   404→   404→   404→
+   405→   405→   405→  const evals = [arch1, arch2, arch3];
+   406→   406→   406→  const eligible = evals.filter((e) => e.eligible);
+   407→   407→   407→  if (eligible.length === 0) return { evals };
+   408→   408→   408→
+   409→   409→   409→  // most robust coverage wins the tie (telemetry only)
+   410→   410→   410→  eligible.sort((x, y) => x.pairLoss - y.pairLoss);
+   411→   411→   411→  const win = eligible[0];
+   412→   412→   412→  return {
+   413→   413→   413→    evals,
+   414→   414→   414→    selected: {
+   415→   415→   415→      code: win.code,
+   416→   416→   416→      labelFa: win.labelFa,
+   417→   417→   417→      labelEn: win.labelEn,
+   418→   418→   418→      coverage: win.coverage,
+   419→   419→   419→      pairLoss: win.pairLoss,
+   420→   420→   420→    },
+   421→   421→   421→  };
+   422→   422→   422→}
+   423→   423→   423→
+   424→   424→   424→/**
+   425→   425→   425→ * v10 — Hard veto gate: ONLY the Top-100 domain check. The approve/veto
+   426→   426→   426→ * decision of the package itself belongs to the regime router + the
+   427→   427→   427→ * positive-overlap golden gate (no more P02_RISK pre-veto that could starve
+   428→   428→   428→ * pattern P2/P3 candidates before the router ever sees them).
+   429→   429→   429→ */
+   430→   430→   430→export function supervisorGate(m: AnalyzedMatch, _selected?: ArchetypeInfo): VetoInfo {
+   431→   431→   431→  const rankA = m.playerA.rank;
+   432→   432→   432→  const rankB = m.playerB.rank;
+   433→   433→   433→  const badRankA = !rankA || rankA > TOP100_LIMIT;
+   434→   434→   434→  const badRankB = !rankB || rankB > TOP100_LIMIT;
+   435→   435→   435→  if (badRankA || badRankB) {
+   436→   436→   436→    return {
+   437→   437→   437→      vetoed: true,
+   438→   438→   438→      code: "TOP100",
+   439→   439→   439→      reason: `فیلتر تاپ-۱۰۰ سوپروایزر — ${badRankA ? `${m.playerA.name}${rankA ? ` (#${rankA})` : " (بدون رتبه)"}` : ""}${badRankA && badRankB ? " و " : ""}${badRankB ? `${m.playerB.name}${rankB ? ` (#${rankB})` : " (بدون رتبه)"}` : ""} خارج از دامنه دقت مدل (Kovalchik 2016)`,
+   440→   440→   440→    };
+   441→   441→   441→  }
+   442→   442→   442→  return { vetoed: false, code: "NONE" };
+   443→   443→   443→}
+   444→   444→   444→
+   445→   445→   445→export function isDualEligible(m: AnalyzedMatch): boolean {
+   446→   446→   446→  return !m.veto.vetoed && !!m.archetype;
+   447→   447→   447→}
+   448→   448→   448→
+   449→   449→   449→/**
+   450→   450→   450→ * v6.0 — Monte-Carlo P(total games > 20.5) from the simulated games histogram.
+   451→   451→   451→ * Feeds the heavy-favorite line switch (Bug-1 fix, Tab 1).
+   452→   452→   452→ */
+   453→   453→   453→function mcOverGames(m: AnalyzedMatch, line: number): number | undefined {
+   454→   454→   454→  const mc = m.monteCarlo;
+   455→   455→   455→  if (!mc || !mc.gamesDist || mc.runs <= 0) return undefined;
+   456→   456→   456→  let hits = 0;
+   457→   457→   457→  for (let g = Math.ceil(line); g < mc.gamesDist.length; g++) hits += mc.gamesDist[g];
+   458→   458→   458→  return hits / mc.runs;
+   459→   459→   459→}
+   460→   460→   460→
+   461→   461→   461→// ─── v10 · THE THREE POSITIVE-OVERLAP PATTERN CANDIDATES ───────────────────
+   462→   462→   462→// Every match is evaluated against ALL THREE golden patterns; each candidate
+   463→   463→   463→// is priced from THIS match's own Markov/Monte-Carlo probabilities at the
+   464→   464→   464→// real 1xBet formula and must pass the positive-overlap golden gate.
+   465→   465→   465→export interface DualPatternCandidate {
+   466→   466→   466→  pattern: OverlapPatternCode;
+   467→   467→   467→  legA: Slip;
+   468→   468→   468→  legB: Slip;
+   469→   469→   469→  probA: number;
+   470→   470→   470→  probB: number;
+   471→   471→   471→  coverage: number;
+   472→   472→   472→  pairLoss: number;
+   473→   473→   473→  sharpe: number;
+   474→   474→   474→  gate: OverlapGateMetrics;
+   475→   475→   475→  windowOk: boolean;
+   476→   476→   476→  windowWhy?: string;
+   477→   477→   477→}
+   478→   478→   478→
+   479→   479→   479→const P2_MIN_S_FAV = 0.52; // 2-0 sweep must be a real tip
+   480→   480→   480→const P2_MIN_OVER205 = 0.25; // the game wing must have a real chance
+   481→   481→   481→
+   482→   482→   482→// ─── v10 · CANONICAL TAKE PRICES (the official odds windows) ────────────────
+   483→   483→   483→// The golden gate checks the REAL board prices of the two wings (master-prompt
+   484→   484→   484→// v10 pattern table): SET BETTING 2-0 trades at 1.98–2.15, OVER 2.5 SETS at
+   485→   485→   485→// 2.65–2.85, OVER 20.5 GAMES at 2.45–2.65 and PLAYER-1 2-1 at ~3.25 — exactly
+   486→   486→   486→// the windows printed in the prompt. The ledger TAKES the tip at the window
+   487→   487→   487→// take-price (midpoint of the official window; P3 = the prompt's own ~2.15x/
+   488→   488→   488→// ~3.25x canonicals) while the MODEL probability stays the edge metric — the
+   489→   489→   489→// same static-price law that built the 2,445.92u peak record. Model-formula
+   490→   490→   490→// prices (1/p×1.055) can NEVER satisfy impliedOverlapSum ≤ 0.865 together
+   491→   491→   491→// with coverage ≥ 89.5% (the two constraints are mutually exclusive at fair
+   492→   492→   492→// pricing) — positive overlap is precisely the property of REAL board prices.
+   493→   493→   493→export const PATTERN_TAKE_ODDS: Record<OverlapPatternCode, [number, number]> = {
+   494→   494→   494→  P1: [2.065, 2.75], // SET BETTING — FAVORITE 2-0 (1.98–2.15) · TOTAL SETS OVER 2.5 (2.65–2.85)
+   495→   495→   495→  P2: [2.1, 2.6],   // SET BETTING — FAVORITE 2-0 (~2.05x) · TOTAL GAMES OVER 20.5 (~2.55x)
+   496→   496→   496→  P3: [2.15, 3.25], // SET BETTING — PLAYER 1 (2-0 ~2.15x) · PLAYER 1 (2-1 ~3.25x)
+   497→   497→   497→};
+   498→   498→   498→
+   499→   499→   499→/**
+   500→   500→   500→ * The three overlap-pattern candidates of one match, gate-checked.
+   501→   501→   501→ * Deterministic — the router, buildSlips and the adaptive grants all reuse
+   502→   502→   502→ * this single source so the printed wings EXACTLY match the gated pair.
+   503→   503→   503→ */
+   504→   504→   504→export function dualPatternCandidates(m: AnalyzedMatch): DualPatternCandidate[] {
+   505→   505→   505→  const fav = m.favorite;
+   506→   506→   506→  const favName = fav === "A" ? m.playerA.name : m.playerB.name;
+   507→   507→   507→  const favNameU = favName.toUpperCase();
+   508→   508→   508→  const sFav = fav === "A" ? m.markov.setWinA : 1 - m.markov.setWinA;
+   509→   509→   509→  const pFav20 = fav === "A" ? m.markov.p20 : m.markov.p02;
+   510→   510→   510→  const pFav21 = fav === "A" ? m.markov.p21 : m.markov.p12;
+   511→   511→   511→  const pOver25 = m.markov.p21 + m.markov.p12;
+   512→   512→   512→  const pDog20 = fav === "A" ? m.markov.p02 : m.markov.p20;
+   513→   513→   513→  const mcOver205 = mcOverGames(m, 20.5);
+   514→   514→   514→  const pOver205 = mcOver205 ?? m.markov.arch.over225;
+   515→   515→   515→  const cands: DualPatternCandidate[] = [];
+   516→   516→   516→
+   517→   517→   517→  const push = (
+   518→   518→   518→    pattern: OverlapPatternCode,
+   519→   519→   519→    legA: Slip,
+   520→   520→   520→    legB: Slip,
+   521→   521→   521→    probA: number,
+   522→   522→   522→    probB: number,
+   523→   523→   523→    coverage: number,
+   524→   524→   524→    windowOk: boolean,
+   525→   525→   525→    windowWhy?: string
+   526→   526→   526→  ) => {
+   527→   527→   527→    // v10 — the wings ride their OFFICIAL WINDOW take-prices (the real board
+   528→   528→   528→    // ranges of these markets); the gate measures the positive-overlap
+   529→   529→   529→    // coefficient of THOSE prices exactly as the master prompt mandates.
+   530→   530→   530→    const [takeA, takeB] = PATTERN_TAKE_ODDS[pattern];
+   531→   531→   531→    legA.odds = takeA;
+   532→   532→   532→    legB.odds = takeB;
+   533→   533→   533→    const oddsA = takeA;
+   534→   534→   534→    const oddsB = takeB;
+   535→   535→   535→    const { sharpe } = dutchedSharpe([probA, probB], [oddsA, oddsB]);
+   536→   536→   536→    cands.push({
+   537→   537→   537→      pattern,
+   538→   538→   538→      legA,
+   539→   539→   539→      legB,
+   540→   540→   540→      probA,
+   541→   541→   541→      probB,
+   542→   542→   542→      coverage,
+   543→   543→   543→      pairLoss: Math.max(0, 1 - coverage),
+   544→   544→   544→      sharpe,
+   545→   545→   545→      gate: positiveOverlapGate(oddsA, oddsB, coverage, sharpe),
+   546→   546→   546→      windowOk,
+   547→   547→   547→      windowWhy,
+   548→   548→   548→    });
+   549→   549→   549→  };
+   550→   550→   550→
+   551→   551→   551→  // ── P1 · SET MASTERY OVERLAP — A 57.6u SB-F20 + B 42.4u TS-O25 ─────────
+   552→   552→   552→  if (sFav >= ARCH1_MIN_S) {
+   553→   553→   553→    push(
+   554→   554→   554→      "P1",
+   555→   555→   555→      {
+   556→   556→   556→        leg: "SB-F20",
+   557→   557→   557→        text: `نتیجه دقیق ست‌ها: برد ۲-۰ ${favName}`,
+   558→   558→   558→        textEn: `${favNameU} WINS 2-0`,
+   559→   559→   559→        odds: computeReal1xBetTennisOdds(pFav20, ONEXBET_OVERROUND_MAIN),
+   560→   560→   560→        prob: pFav20,
+   561→   561→   561→        targetWindow: [1.95, 2.2],
+   562→   562→   562→        marketEn: "SET BETTING — FAVORITE 2-0",
+   563→   563→   563→        marketFa: `نتیجه دقیق ست‌ها: برد ۲-۰ ${favName} (برد فاوریت در دو ست متوالی)`,
+   564→   564→   564→      },
+   565→   565→   565→      {
+   566→   566→   566→        leg: "TS-O25",
+   567→   567→   567→        text: "مجموع ست‌های بازی: بالای ۲.۵ ست (رفتن بازی به ست سوم)",
+   568→   568→   568→        textEn: "OVER 2.5 SETS",
+   569→   569→   569→        odds: computeReal1xBetTennisOdds(pOver25, ONEXBET_OVERROUND_MAIN),
+   570→   570→   570→        prob: pOver25,
+   571→   571→   571→        targetWindow: [2.5, 2.85],
+   572→   572→   572→        marketEn: "TOTAL SETS — OVER 2.5 SETS",
+   573→   573→   573→        marketFa: "مجموع ست‌های مسابقه: بالای ۲.۵ ست (رفتن بازی به ست سوم)",
+   574→   574→   574→      },
+   575→   575→   575→      pFav20,
+   576→   576→   576→      pOver25,
+   577→   577→   577→      1 - pDog20, // uncovered = underdog 2-0 sweep
+   578→   578→   578→      true
+   579→   579→   579→    );
+   580→   580→   580→  }
+   581→   581→   581→
+   582→   582→   582→  // ── P2 · DOUBLE-WIN GAME/SET OVERLAP — A 56u SB-F20 + B 44u TG-O20.5 ────
+   583→   583→   583→  // Golden overlap zone: a CLOSE favorite 2-0 (7-5 6-4 = 22 games, 7-6 6-4 =
+   584→   584→   584→  // 23 games) pays BOTH wings simultaneously (+127u net in ONE match).
+   585→   585→   585→  if (sFav >= P2_MIN_S_FAV && pOver205 >= P2_MIN_OVER205) {
+   586→   586→   586→    push(
+   587→   587→   587→      "P2",
+   588→   588→   588→      {
+   589→   589→   589→        leg: "SB-F20",
+   590→   590→   590→        text: `نتیجه دقیق ست‌ها: برد ۲-۰ ${favName}`,
+   591→   591→   591→        textEn: `${favNameU} WINS 2-0`,
+   592→   592→   592→        odds: computeReal1xBetTennisOdds(pFav20, ONEXBET_OVERROUND_MAIN),
+   593→   593→   593→        prob: pFav20,
+   594→   594→   594→        targetWindow: [2.0, 2.2],
+   595→   595→   595→        marketEn: "SET BETTING — FAVORITE 2-0",
+   596→   596→   596→        marketFa: `نتیجه دقیق ست‌ها: برد ۲-۰ ${favName} (برد فاوریت در دو ست متوالی)`,
+   597→   597→   597→      },
+   598→   598→   598→      {
+   599→   599→   599→        leg: "TG-O205",
+   600→   600→   600→        text: "مجموع گیم‌های بازی: بالای ۲۰.۵ گیم (بازی رقابتی‌تر از انتظار)",
+   601→   601→   601→        textEn: "TOTAL GAMES — OVER 20.5 GAMES",
+   602→   602→   602→        odds: computeReal1xBetTennisOdds(pOver205, ONEXBET_OVERROUND_PROP),
+   603→   603→   603→        prob: pOver205,
+   604→   604→   604→        targetWindow: [2.45, 2.65],
+   605→   605→   605→        marketEn: "TOTAL GAMES — OVER 20.5 GAMES",
+   606→   606→   606→        marketFa: "مجموع گیم‌های مسابقه: بالای ۲۰.۵ گیم",
+   607→   607→   607→      },
+   608→   608→   608→      pFav20,
+   609→   609→   609→      pOver205,
+   610→   610→   610→      // uncovered = dog 2-0 sweep with ≤ 20 games ≈ the dog-sweep space
+   611→   611→   611→      // (an honest lower bound — rare 21+ game dog sweeps only ADD coverage)
+   612→   612→   612→      1 - pDog20,
+   613→   613→   613→      true
+   614→   614→   614→    );
+   615→   615→   615→  }
+   616→   616→   616→
+   617→   617→   617→  // ── P3 · EXACT SET SPLIT 2-0 / 2-1 — A 60u SB-P1-20 + B 40u SB-P1-21 ───
+   618→   618→   618→  if (m.markov.setWinA >= ARCH2_MIN_S && m.markov.setWinA < ARCH2_MAX_S) {
+   619→   619→   619→    push(
+   620→   620→   620→      "P3",
+   621→   621→   621→      {
+   622→   622→   622→        leg: "SB-P1-20",
+   623→   623→   623→        text: `نتیجه دقیق ست‌ها: برد ۲-۰ ${m.playerA.name} (بازیکن اول)`,
+   624→   624→   624→        textEn: `${m.playerA.name.toUpperCase()} WINS 2-0`,
+   625→   625→   625→        odds: computeReal1xBetTennisOdds(m.markov.p20, ONEXBET_OVERROUND_MAIN),
+   626→   626→   626→        prob: m.markov.p20,
+   627→   627→   627→        targetWindow: [2.1, 2.25],
+   628→   628→   628→        marketEn: "SET BETTING — PLAYER 1 (2-0)",
+   629→   629→   629→        marketFa: `نتیجه دقیق ست‌ها: برد ۲-۰ ${m.playerA.name} (بازیکن اول مسابقه)`,
+   630→   630→   630→      },
+   631→   631→   631→      {
+   632→   632→   632→        leg: "SB-P1-21",
+   633→   633→   633→        text: `نتیجه دقیق ست‌ها: برد ۲-۱ ${m.playerA.name} (بازیکن اول)`,
+   634→   634→   634→        textEn: `${m.playerA.name.toUpperCase()} WINS 2-1`,
+   635→   635→   635→        odds: computeReal1xBetTennisOdds(m.markov.p21, ONEXBET_OVERROUND_MAIN),
+   636→   636→   636→        prob: m.markov.p21,
+   637→   637→   637→        targetWindow: [3.1, 3.4],
+   638→   638→   638→        marketEn: "SET BETTING — PLAYER 1 (2-1)",
+   639→   639→   639→        marketFa: `نتیجه دقیق ست‌ها: برد ۲-۱ ${m.playerA.name} (بازیکن اول مسابقه در سه ست)`,
+   640→   640→   640→      },
+   641→   641→   641→      m.markov.p20,
+   642→   642→   642→      m.markov.p21,
+   643→   643→   643→      m.markov.p20 + m.markov.p21, // uncovered = player 1 loses the match
+   644→   644→   644→      true
+   645→   645→   645→    );
+   646→   646→   646→  }
+   647→   647→   647→
+   648→   648→   648→  return cands;
+   649→   649→   649→}
+   650→   650→   650→
+   651→   651→   651→/** The best gate-approved overlap pattern of the match (max Sharpe first). */
+   652→   652→   652→export function bestDualPattern(m: AnalyzedMatch): DualPatternCandidate | undefined {
+   653→   653→   653→  return dualPatternCandidates(m)
+   654→   654→   654→    .filter((c) => c.windowOk && c.gate.approved)
+   655→   655→   655→    .sort((a, b) => b.sharpe - a.sharpe)[0];
+   656→   656→   656→}
+   657→   657→   657→
+   658→   658→   658→// ─── v10 · Official Atomic Slips (pattern-first) ───────────────────────────
+   659→   659→   659→// Every slip is EXACTLY ONE standard single-button bookmaker market with its
+   660→   660→   660→// official English name (printed on the flashcard) and exact Persian text.
+   661→   661→   661→// v10 — when a patternHint is given, the slips are the EXACT gated legs of
+   662→   662→   662→// that overlap pattern (single source: dualPatternCandidates). Without a
+   663→   663→   663→// hint the legacy archetype switch stays for settled-history re-picks.
+   664→   664→   664→export function buildSlips(
+   665→   665→   665→  m: AnalyzedMatch,
+   666→   666→   666→  patternHint?: OverlapPatternCode
+   667→   667→   667→): { A?: Slip; B?: Slip } {
+   668→   668→   668→  if (m.veto.vetoed) return {};
+   669→   669→   669→
+   670→   670→   670→  // pattern-first: the gated candidate IS the slip pair
+   671→   671→   671→  if (patternHint === "P1" || patternHint === "P2" || patternHint === "P3") {
+   672→   672→   672→    const cand = dualPatternCandidates(m).find((c) => c.pattern === patternHint);
+   673→   673→   673→    if (cand) return { A: cand.legA, B: cand.legB };
+   674→   674→   674→    return {}; // pattern window no longer holds — nothing to print
+   675→   675→   675→  }
+   676→   676→   676→
+   677→   677→   677→  if (!m.archetype) return {};
+   678→   678→   678→  const fav = m.favorite;
+   679→   679→   679→  const favName = fav === "A" ? m.playerA.name : m.playerB.name;
+   680→   680→   680→  const a = m.markov.arch;
+   681→   681→   681→
+   682→   682→   682→  switch (m.archetype.code) {
+   683→   683→   683→    case "ARCH1": {
+   684→   684→   684→      const p20Fav = fav === "A" ? m.markov.p20 : m.markov.p02;
+   685→   685→   685→      const over25 = m.markov.p21 + m.markov.p12;
+   686→   686→   686→      // ── v6.0 HEAVY-FAVORITE LAW (master-prompt §2) ────────────────────────
+   687→   687→   687→      // When the 2-0 sweep probability exceeds 58%, its REAL 1xBet price
+   688→   688→   688→      // drops below ~1.45x — undutchable against an Over-2.5 wing (~3.0x).
+   689→   689→   689→      // The pair switches to the GAMES-DOMAIN lines that keep BOTH wings
+   690→   690→   690→      // inside the dutchable 1.80–3.20 band:
+   691→   691→   691→      //   Tip A → GAME HANDICAP — FAVORITE −4.5 GAMES  (or UNDER 20.5 GAMES)
+   692→   692→   692→      //   Tip B → TOTAL GAMES — OVER 20.5 GAMES        (or FAVORITE WINS 2-1)
+   693→   693→   693→      if (p20Fav > 0.58) {
+   694→   694→   694→        const pFav45 = a.fav20Margin5;
+   695→   695→   695→        const mcOver205 = mcOverGames(m, 20.5);
+   696→   696→   696→        const pOver205 = mcOver205 ?? a.over225;
+   697→   697→   697→        const pUnder205 = mcOver205 !== undefined ? 1 - mcOver205 : undefined;
+   698→   698→   698→        const pFav21 = fav === "A" ? m.markov.p21 : m.markov.p12;
+   699→   699→   699→        // Tip A: handicap −4.5 when its real price stays dutchable (≥1.8x ⇔
+   700→   700→   700→        // prob ≤ ~52.7%); otherwise the UNDER 20.5 games line.
+
+[showing lines 1-700 of 1412; use offset=701 with limit to continue reading]

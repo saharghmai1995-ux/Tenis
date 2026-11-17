@@ -357,10 +357,16 @@ class DataHub {
       }));
   }
 
-  /** Last-resort source: read the tennis DB directly (read-only). */
+  /** Last-resort source: read the tennis DB directly (read-only).
+   *  v10.1 — busy_timeout: the main app's settlement transactions can hold
+   *  the custom.db write-lock for seconds; without a busy timeout the
+   *  read-only open threw «database is locked» and the warm cycle fell back
+   *  to the snapshot. The read connection now waits up to 8s (and enables
+   *  WAL-aware reading) instead of racing the writer. */
   dbFallbackCards(limit = 40): CardMatch[] {
     try {
       const db = new Database(CONFIG.tennisDbPath, { readonly: true });
+      db.exec("PRAGMA busy_timeout = 8000;");
       const rows = db
         .query(
           `SELECT eventKey, playerA, playerB, rankA, rankB, tournament, round, surface,
