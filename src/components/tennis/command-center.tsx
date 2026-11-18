@@ -21,6 +21,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
 import { BankGrowthPro } from "@/components/tennis/bank-growth-pro";
 import { GyroGauge } from "@/components/tennis/gyro-gauge";
 import type { LedgerPayload, ProductionLine, QqlFamilyStat } from "@/lib/tennis/types";
@@ -58,7 +59,15 @@ function FamilyRow({ f }: { f: QqlFamilyStat }) {
         )}
       </TableCell>
       <TableCell className="mono-num text-xs" dir="ltr">
-        {empty ? <span className="text-white/40">—</span> : `${f.won} / ${f.lost}`}
+        {/* v13.0 §3 — no family row ever reads a dead «0 / 0»: a family
+            without decided positions shows the architecture-baseline marker */}
+        {empty || decided === 0 ? (
+          <span className="text-white/40">
+            پایگاه {Math.round(f.modelCoverage * 100)}%
+          </span>
+        ) : (
+          `${f.won} / ${f.lost}`
+        )}
       </TableCell>
       <TableCell className="mono-num text-xs" dir="ltr">
         {`${(winRate * 100).toFixed(0)}%`}
@@ -84,7 +93,9 @@ const LINE_LABELS: Record<ProductionLine, string> = {
   ACCUMULATOR: "آکومولاتور سلاطین سرویس",
   COMBO: "میکس سلاطین سرویس",
   SNIPER: "تک‌تیرانداز ضریب بالا",
-  SHADOW: "دفتر سایه (وتوها)",
+  // v13.0 — master-prompt §4: the shadow line reports the LOSS-AVOIDED
+  // counterfactual (negative), never a “profit”
+  SHADOW: "🛡️ زیان جلوگیری‌شده در دفتر سایه (Loss Avoided)",
 };
 
 const LINE_COLORS: Record<ProductionLine, string> = {
@@ -236,11 +247,25 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
                 <Badge
                   key={g.line}
                   variant="outline"
-                  className="border-white/10 bg-white/[0.03] text-[9.5px] font-normal text-white/70"
+                  className={cn(
+                    "border-white/10 bg-white/[0.03] text-[9.5px] font-normal text-white/70",
+                    // v13.0 — the loss-avoided counterfactual badge is the
+                    // proof-of-work strip of the supervisor filter
+                    g.line === "SHADOW" &&
+                      g.profit < 0 &&
+                      "border-emerald-300/25 bg-emerald-300/[0.05] text-emerald-200"
+                  )}
                 >
-                  <span className={`font-bold ${LINE_COLORS[g.line]}`}>{LINE_LABELS[g.line]}</span>
+                  <span className={`font-bold ${g.line === "SHADOW" ? "text-emerald-300" : LINE_COLORS[g.line]}`}>
+                    {LINE_LABELS[g.line]}
+                  </span>
                   <span className="mono-num" dir="ltr">
-                    {g.picks} ({g.pending}⏳) · {g.won}/{g.lost} · {g.profit >= 0 ? "+" : ""}{g.profit.toFixed(1)}
+                    {g.line === "SHADOW" ? (
+                      // v13.0 §4 — «زیان جلوگیری‌شده … (اثبات کارایی فیلتر سوپروایزر)»
+                      `${g.picks} (${g.pending}⏳) · ${g.won}/${g.lost} · Loss Avoided: ${g.profit.toFixed(1)}u`
+                    ) : (
+                      `${g.picks} (${g.pending}⏳) · ${g.won}/${g.lost} · ${g.profit >= 0 ? "+" : ""}${g.profit.toFixed(1)}`
+                    )}
                   </span>
                 </Badge>
               ))}

@@ -17,7 +17,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "نئوتنیس مارکوف کوانت v12.0 | In-Memory QQL Core · AI RCA · Quantum 10-Option Solver",
+  title: "نئوتنیس مارکوف کوانت v13.0 | In-Memory QQL Core · AI RCA · Quantum 10-Option Solver",
   description:
     "ترمینال کمّی مهندسی تنیس حرفه‌ای ATP/WTA — رادار سه‌بعدی چشم شاهین، زنجیره مارکوف ۴ لایه، مهندسی معکوس ضرایب، سوپروایزر ۳ الگویی با سهمیه تایید ۶۵٪ و کارنامه SHA-256 در سطح مسابقه",
   keywords: [

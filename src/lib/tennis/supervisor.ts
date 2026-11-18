@@ -40,6 +40,7 @@ import type {
 } from "./types";
 import { monteCarloScore } from "./copula";
 import { boardTakePrice, slipOfOption, solveQuantumPair } from "./qql-rca-engine";
+import { isEliteStarMatch } from "./solver";
 
 const TOP100_LIMIT = 100;
 
@@ -79,17 +80,27 @@ export interface OverlapGateMetrics {
  *   isApprovedPositiveOverlap =
  *     impliedOverlapSum ≤ 0.865 ∧ netOverlapReturnPct ≥ 15.5 ∧
  *     combinedCoverageProb ≥ 0.895 ∧ sharpeRatio ≥ 0.25
+ * v13.0 — `starGrade` (master-prompt §3): matches carrying an ELITE-STAR
+ * competitor (ELITE_PROTECTED_ELO — Zverev / Medvedev / Shelton / Andreescu…)
+ * ride the STAR-GRADE floors (coverage ≥ 0.70 ∧ sharpe ≥ 0.20) so the
+ * top-tier ATP pairings are no longer starved into the shadow ledger by the
+ * 89.5% union floor that only 55/45 balanced matches can pass. The
+ * positive-overlap return law (impliedSum ≤ 0.865 ∧ net ≥ 15.5%) stays
+ * NON-NEGOTIABLE even for stars.
  */
 export function positiveOverlapGate(
   oddsA: number,
   oddsB: number,
   combinedCoverageProb: number,
-  sharpeRatio: number
+  sharpeRatio: number,
+  starGrade = false
 ): OverlapGateMetrics {
   const impliedOverlapSum =
     1 / Math.max(oddsA, 1.01) + 1 / Math.max(oddsB, 1.01);
   const effectiveOverlapOdds = 1 / impliedOverlapSum;
   const netOverlapReturnPct = (effectiveOverlapOdds - 1) * 100;
+  const minCoverage = starGrade ? 0.7 : OVERLAP_MIN_COVERAGE;
+  const minSharpe = starGrade ? 0.2 : OVERLAP_MIN_SHARPE;
   const checks: { ok: boolean; why: string }[] = [
     {
       ok: impliedOverlapSum <= OVERLAP_MAX_IMPLIED_SUM,
@@ -100,12 +111,16 @@ export function positiveOverlapGate(
       why: `سود خالص همپوشانی +${netOverlapReturnPct.toFixed(1)}% زیر کف +15.5%`,
     },
     {
-      ok: combinedCoverageProb >= OVERLAP_MIN_COVERAGE,
-      why: `پوشش زنجیره مارکوف ${(combinedCoverageProb * 100).toFixed(1)}% زیر کف 89.5%`,
+      ok: combinedCoverageProb >= minCoverage,
+      why: starGrade
+        ? `پوشش ستاره‌ای ${(combinedCoverageProb * 100).toFixed(1)}% زیر کف ستاره‌ای 70%`
+        : `پوشش زنجیره مارکوف ${(combinedCoverageProb * 100).toFixed(1)}% زیر کف 89.5%`,
     },
     {
-      ok: sharpeRatio >= OVERLAP_MIN_SHARPE,
-      why: `نسبت شارپ ${sharpeRatio.toFixed(2)} زیر کف 0.25`,
+      ok: sharpeRatio >= minSharpe,
+      why: starGrade
+        ? `نسبت شارپ ${sharpeRatio.toFixed(2)} زیر کف ستاره‌ای 0.20`
+        : `نسبت شارپ ${sharpeRatio.toFixed(2)} زیر کف 0.25`,
     },
   ];
   const failed = checks.filter((c) => !c.ok);
@@ -140,12 +155,18 @@ export interface OverlapPatternSpec {
 export const OVERLAP_PATTERNS: Record<OverlapPatternCode, OverlapPatternSpec> = {
   P1: {
     code: "P1",
-    labelFa: "الگوی همپوشان ۱ — تسلط ست‌ها",
+    labelFa: "الگوی همپوشان ۱ — برد دوبل ست/گیم",
     labelEn: "SET MASTERY OVERLAP",
     stakeA: 57.6,
     stakeB: 42.4,
-    hookFa: "سه مسیر از چهار نتیجه پوشش داده می‌شود؛ برد فاوریت یا سوم ست — یکی از دو تیپ حتماً می‌برد",
-    hookEn: "3 OF 4 SCORE ROUTES COVERED - FAV 2-0 OR 3RD SET, ONE WING ALWAYS PAYS",
+    // v13.0 — master-prompt §2: the family-1 pairing is REPLACED. The old
+    // [T1: fav 2-0 ↔ T5: over 2.5 sets] wings were MATHEMATICALLY DISJOINT
+    // (a 2-0 sweep excludes a third set — zero double-win mass, the audited
+    // −464.1u bleed). The new wing B is T6: TOTAL GAMES OVER 20.5 — the
+    // DOUBLE-WIN zone where a competitive favorite 2-0 (7-5 6-4 = 22 games)
+    // pays BOTH wings at once (+128…+145u per match).
+    hookFa: "برد ۲-۰ فاوریت ↔ بالای ۲۰.۵ گیم — برد ۲-۰ رقابتی هر دو تیپ را همزمان می‌برد (جکپات برد دوبل)",
+    hookEn: "FAV 2-0 + OVER 20.5 GAMES - CLOSE 2-0 PAYS BOTH WINGS - DOUBLE-WIN JACKPOT",
   },
   P2: {
     code: "P2",
@@ -164,6 +185,20 @@ export const OVERLAP_PATTERNS: Record<OverlapPatternCode, OverlapPatternSpec> = 
     stakeB: 40.0,
     hookFa: "دو دکمه کنار هم در گرید نتیجه دقیق ست — ۱۰۰٪ مسیرهای برد بازیکن اول پوشش داده می‌شود",
     hookEn: "TWO SIDE-BY-SIDE SET-BETTING BUTTONS - 100% OF PLAYER-1 WIN PATHS COVERED",
+  },
+  // v13.0 — master-prompt §3: the STAR-GAME-HANDICAP overlap [T8 ↔ T5].
+  // Favorite −3.5 games ↔ over 2.5 sets — the double-win zone of the
+  // top-tier ATP stars: a 2-1 star win with margin ≥ 4 games pays BOTH
+  // wings; a clean 2-0 star sweep pays wing A. Frees Zverev / Medvedev /
+  // Shelton / Tiafoe from the shadow ledger as GOLD CROWN cards.
+  P4: {
+    code: "P4",
+    labelFa: "الگوی همپوشان ۴ — هندیکپ گیم ستاره‌ها",
+    labelEn: "STAR GAME-HANDICAP OVERLAP",
+    stakeA: 58.0,
+    stakeB: 42.0,
+    hookFa: "هندیکپ گیم فاوریت ۳٫۵- ↔ بالای ۲.۵ ست — برد ستاره‌دار با اختلاف یا رفتن بازی به ست سوم، یکی حتماً می‌برد",
+    hookEn: "FAV -3.5 GAMES + OVER 2.5 SETS - STAR WIN BY MARGIN OR 3RD SET, ONE WING ALWAYS PAYS",
   },
 };
 
@@ -290,20 +325,27 @@ export const DUAL_LEG_MARKET_ODDS: Record<string, number> = {
 export const DYNAMIC_PRICED_LEGS = new Set([
   "SB-F20", "TS-O25", "SB-P1-20", "SB-P1-21", "TG-O225", "GH-F45",
   "TG-U205", "TG-O205", "SB-F21",
+  // v13.0 — the P4 star game-handicap wing rides its own per-match quote
+  "GH-F35",
 ]);
 
 // the two complementary wings of each archetype (leg → its pair leg)
+// v13.0 — the P1 re-architecture: SB-F20 now pairs with the T6 double-win
+// wing (TG-O205); the disjoint TS-O25 pairing is retired from the LIVE
+// pattern table (kept for settled-history re-picks only).
 const LEG_PAIR: Record<string, string> = {
-  "SB-F20": "TS-O25",
-  "TS-O25": "SB-F20",
+  "SB-F20": "TG-O205",
+  "TG-O205": "SB-F20",
   "SB-P1-20": "SB-P1-21",
   "SB-P1-21": "SB-P1-20",
   "TG-O225": "GH-F45",
   "GH-F45": "TG-O225",
   // v6.0 — heavy-favorite game-domain pair (Tip A handicap/under ⇄ Tip B over)
   "TG-U205": "TG-O205",
-  "TG-O205": "TG-U205",
   "SB-F21": "GH-F45",
+  // v13.0 — the P4 STAR GAME-HANDICAP overlap [T8 ↔ T5]
+  "GH-F35": "TS-O25",
+  "TS-O25": "GH-F35",
   "A": "B",
   "B": "A",
   "A-O195": "B-ALT",
@@ -322,6 +364,8 @@ const LEG_IS_A = new Set([
   "SB-F20", "SB-P1-20", "TG-O225", "A", "A-O195", "A-O225",
   // v5.0 — BANKER single-button legs + COMBO mains
   "MW-FAV", "SH-F15", "RC-FWU215", "RC-FWO205",
+  // v13.0 — the P4 star pattern's game-handicap wing is Tip A
+  "GH-F35",
 ]);
 
 // legacy legs keep the historical 50/50 split; v4.0 legs use the exact
@@ -536,6 +580,24 @@ export function dualPatternCandidates(m: AnalyzedMatch): DualPatternCandidate[] 
   const pOver205 = mcOver205 ?? m.markov.arch.over225;
   const cands: DualPatternCandidate[] = [];
 
+  // v13.0 — STAR-GRADE detection: matches carrying an ELITE_PROTECTED_ELO
+  // competitor ride the relaxed coverage/sharpe floors (the [OVERLAP] fix of
+  // master-prompt §3) so Zverev / Medvedev / Shelton / Tiafoe pairings are
+  // exported as GOLD CROWN cards instead of shadow-ledger vetoes.
+  const starGrade = isEliteStarMatch(m.playerA.name, m.playerB.name);
+
+  // v13.0 — exact MC union helper: when the 10k option matrix exists, the
+  // pattern coverage is the REAL simulated union P(A ∪ B) = P(A)+P(B)−P(A∩B)
+  // instead of the legacy analytic approximations.
+  const mc = m.monteCarlo;
+  const mcUnion = (idxA: number, idxB: number): number | undefined => {
+    if (!mc || !mc.optionProbs || mc.optionProbs.length !== 10 || !mc.optionJoint) return undefined;
+    const pa = mc.optionProbs[idxA] ?? 0;
+    const pb = mc.optionProbs[idxB] ?? 0;
+    const joint = mc.optionJoint[idxA]?.[idxB] ?? 0;
+    return Math.min(1, Math.max(0, pa + pb - joint));
+  };
+
   const push = (
     pattern: OverlapPatternCode,
     legA: Slip,
@@ -563,14 +625,24 @@ export function dualPatternCandidates(m: AnalyzedMatch): DualPatternCandidate[] 
       coverage,
       pairLoss: Math.max(0, 1 - coverage),
       sharpe,
-      gate: positiveOverlapGate(oddsA, oddsB, coverage, sharpe),
+      // v13.0 — star matches ride the STAR-GRADE gate floors
+      gate: positiveOverlapGate(oddsA, oddsB, coverage, sharpe, starGrade),
       windowOk,
       windowWhy,
     });
   };
 
-  // ── P1 · SET MASTERY OVERLAP — A 57.6u SB-F20 + B 42.4u TS-O25 ─────────
+  // ── P1 · SET MASTERY OVERLAP — A 57.6u SB-F20 + B 42.4u TG-O20.5 ─────────
+  // v13.0 RE-ARCHITECTURE (master-prompt §2, verbatim): the old wing B
+  // (TS-O25 / over 2.5 sets) was MANCHEX with wing A (fav 2-0) — every win
+  // paid only one wing (+14…+18u) while every loss burned −100u. The new
+  // wing B is T6: TOTAL GAMES OVER 20.5:
+  //   · fav 2-0 competitive (7-5 6-4 = 22g) → BOTH wings win (DOUBLE-WIN 🏆)
+  //   · fav 2-1 → wing B wins (+18…+24u)
+  //   · fav fast 2-0 (6-2 6-2) → wing A wins (+18…+25u)
   if (sFav >= ARCH1_MIN_S) {
+    // honest coverage: fav 2-0 ∪ total ≥ 21 games (MC-verified when available)
+    const cov = mcUnion(0, 5) ?? Math.min(1, pFav20 + pOver205 * 0.72);
     push(
       "P1",
       {
@@ -584,18 +656,18 @@ export function dualPatternCandidates(m: AnalyzedMatch): DualPatternCandidate[] 
         marketFa: `نتیجه دقیق ست‌ها: برد ۲-۰ ${favName} (برد فاوریت در دو ست متوالی)`,
       },
       {
-        leg: "TS-O25",
-        text: "مجموع ست‌های بازی: بالای ۲.۵ ست (رفتن بازی به ست سوم)",
-        textEn: "OVER 2.5 SETS",
-        odds: computeReal1xBetTennisOdds(pOver25, ONEXBET_OVERROUND_MAIN),
-        prob: pOver25,
-        targetWindow: [2.5, 2.85],
-        marketEn: "TOTAL SETS — OVER 2.5 SETS",
-        marketFa: "مجموع ست‌های مسابقه: بالای ۲.۵ ست (رفتن بازی به ست سوم)",
+        leg: "TG-O205",
+        text: "مجموع گیم‌های بازی: بالای ۲۰.۵ گیم (بازی رقابتی‌تر از انتظار)",
+        textEn: "TOTAL GAMES — OVER 20.5 GAMES",
+        odds: computeReal1xBetTennisOdds(pOver205, ONEXBET_OVERROUND_PROP),
+        prob: pOver205,
+        targetWindow: [2.45, 2.65],
+        marketEn: "TOTAL GAMES — OVER 20.5 GAMES",
+        marketFa: "مجموع گیم‌های مسابقه: بالای ۲۰.۵ گیم",
       },
       pFav20,
-      pOver25,
-      1 - pDog20, // uncovered = underdog 2-0 sweep
+      pOver205,
+      cov,
       true
     );
   }
@@ -666,6 +738,54 @@ export function dualPatternCandidates(m: AnalyzedMatch): DualPatternCandidate[] 
     );
   }
 
+  // ── P4 · STAR GAME-HANDICAP OVERLAP — A 58u GH-F3.5 + B 42u TS-O25 ─────
+  // v13.0 (master-prompt §3): the [T8 ↔ T5] star pattern. Wing A = GAME
+  // HANDICAP favorite −3.5 (margin ≥ 4 games); wing B = over 2.5 sets.
+  // Double-win zone = the star wins 2-1 with margin ≥ 4 games; the fast
+  // 2-0 star sweep pays wing A alone. This is the rescue pattern of the
+  // top-tier ATP pairings (Zverev / Medvedev / Shelton / Tiafoe).
+  // Requires the MC option matrix (exact T8/T5 probs + joint mass).
+  if (
+    sFav >= 0.6 &&
+    mc &&
+    mc.optionProbs &&
+    mc.optionProbs.length === 10 &&
+    mc.optionJoint
+  ) {
+    const pT8 = mc.optionProbs[7] ?? 0;
+    const pT5 = mc.optionProbs[4] ?? 0;
+    const cov = mcUnion(7, 4) ?? Math.min(1, pT8 + pT5);
+    if (pT8 > 0.2 && pT5 > 0.15) {
+      push(
+        "P4",
+        {
+          leg: "GH-F35",
+          text: `هندیکپ گیم فاوریت: برد ${favName} با اختلاف بیش از ۳.۵ گیم`,
+          textEn: `${favNameU} −3.5 GAMES`,
+          odds: computeReal1xBetTennisOdds(pT8, ONEXBET_OVERROUND_PROP),
+          prob: pT8,
+          targetWindow: [2.72, 3.25],
+          marketEn: "GAME HANDICAP — FAVORITE -3.5 GAMES",
+          marketFa: `هندیکپ گیم فاوریت: ${favName} −۳.۵ گیم (برد با اختلاف ≥ ۴ گیم)`,
+        },
+        {
+          leg: "TS-O25",
+          text: "مجموع ست‌های بازی: بالای ۲.۵ ست (رفتن بازی به ست سوم)",
+          textEn: "OVER 2.5 SETS",
+          odds: computeReal1xBetTennisOdds(pT5, ONEXBET_OVERROUND_MAIN),
+          prob: pT5,
+          targetWindow: [2.62, 2.92],
+          marketEn: "TOTAL SETS — OVER 2.5 SETS",
+          marketFa: "مجموع ست‌های مسابقه: بالای ۲.۵ ست (رفتن بازی به ست سوم)",
+        },
+        pT8,
+        pT5,
+        cov,
+        true
+      );
+    }
+  }
+
   return cands;
 }
 
@@ -680,21 +800,26 @@ export function bestDualPattern(
   warehouse?: QqlWarehouseSnapshot
 ): DualPatternCandidate | undefined {
   const mc = m.monteCarlo;
+  // v13.0 — the STAR-GRADE flag rides INTO the QQL solver: when no standard
+  // pair passes the 89.5% union floor, the two star patterns [T1↔T6] and
+  // [T8↔T5] are re-gated at the star floors (coverage ≥ 70% ∧ sharpe ≥ 0.20)
+  // so the top-tier ATP matches leave the shadow ledger as GOLD CROWN cards.
+  const star = isEliteStarMatch(m.playerA.name, m.playerB.name);
   if (!mc || !mc.optionProbs || mc.optionProbs.length !== 10) {
     return dualPatternCandidates(m)
       .filter((c) => c.windowOk && c.gate.approved)
       .sort((a, b) => b.sharpe - a.sharpe)[0];
   }
 
-  const { decision } = solveQuantumPair(m, mc, warehouse);
+  const { decision } = solveQuantumPair(m, mc, warehouse, star);
   if (!decision) return undefined;
 
   const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
   const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
   const aIdx = decision.topCandidates[0]?.idxA ?? 0;
   const bIdx = decision.topCandidates[0]?.idxB ?? 4;
-  const legA = slipOfOption(aIdx, decision.oddsA, decision.probA, favName, dogName);
-  const legB = slipOfOption(bIdx, decision.oddsB, decision.probB, favName, dogName);
+  const legA = slipOfOption(aIdx, decision.oddsA, decision.probA, favName, dogName, "NEUTRAL");
+  const legB = slipOfOption(bIdx, decision.oddsB, decision.probB, favName, dogName, "NEUTRAL");
   const { sharpe } = dutchedSharpe([decision.probA, decision.probB], [decision.oddsA, decision.oddsB]);
 
   return {
@@ -719,7 +844,7 @@ export function bestDualPattern(
   };
 }
 
-/** legacy P1/P2/P3 family of a QQL pair (keeps the settled-history contract) */
+/** legacy P1/P2/P3/P4 family of a QQL pair (keeps the settled-history contract) */
 export function patternOfPair(pairCode: string): OverlapPatternCode {
   // order-agnostic normalization ("T8-T6" ⇄ "T6-T8")
   const norm = pairCode
@@ -730,7 +855,6 @@ export function patternOfPair(pairCode: string): OverlapPatternCode {
   switch (norm) {
     case "T1-T5":
     case "T2-T5":
-    case "T5-T8":
     case "T6-T8":
     case "T1-T8":
       return "P1";
@@ -739,6 +863,8 @@ export function patternOfPair(pairCode: string): OverlapPatternCode {
     case "T3-T5":
     case "T3-T6":
       return "P2";
+    case "T5-T8":
+      return "P4"; // v13.0 — the STAR GAME-HANDICAP overlap [T8 ↔ T5]
     default:
       return "P3";
   }
@@ -757,7 +883,12 @@ export function buildSlips(
   if (m.veto.vetoed) return {};
 
   // pattern-first: the gated candidate IS the slip pair
-  if (patternHint === "P1" || patternHint === "P2" || patternHint === "P3") {
+  if (
+    patternHint === "P1" ||
+    patternHint === "P2" ||
+    patternHint === "P3" ||
+    patternHint === "P4"
+  ) {
     const cand = dualPatternCandidates(m).find((c) => c.pattern === patternHint);
     if (cand) return { A: cand.legA, B: cand.legB };
     return {}; // pattern window no longer holds — nothing to print

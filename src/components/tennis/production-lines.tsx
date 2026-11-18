@@ -31,10 +31,12 @@ import { TiltCard } from "@/components/tennis/spatial-tilt";
 import { OddsCalibrator } from "@/components/tennis/odds-calibrator";
 import { dedupeByKey } from "@/lib/tennis/dedupe";
 import { legLabelOf, OVERLAP_PATTERNS, REGIME_META } from "@/lib/tennis/supervisor";
+import { cn } from "@/lib/utils";
 import type {
   AnalyzedMatch,
   CrownInfo,
   FeedPayload,
+  LedgerPayload,
   LineItem,
   QqlDecision,
   RegimeDecision,
@@ -1098,7 +1100,14 @@ function OverlapGateChip({ item }: { item: LineItem }) {
 // The BANKER / DEEP SINGLE / MIX / ACCA / CLUSTER / SNIPER lines are RETIRED
 // by the v10 mandate (the −1,029.92u drop era) and can never produce a card.
 
-export function ProductionLines({ feed }: { feed: FeedPayload }) {
+export function ProductionLines({
+  feed,
+  ledger,
+}: {
+  feed: FeedPayload;
+  /** v13.0 — the ledger payload drives the Loss-Avoided counterfactual box */
+  ledger?: LedgerPayload;
+}) {
   const { dual, regCombo, shadow } = feed.lines;
 
   // ⚖️ group the DUAL wings into ONE package per match (iron rule: 1 match =
@@ -1233,14 +1242,46 @@ export function ProductionLines({ feed }: { feed: FeedPayload }) {
 
             {/* ── Tab 3 · 🛡️ THE SUPERVISOR VETO LEDGER (honesty appendix) ── */}
             <TabsContent value="shadow" className="mt-4 space-y-3">
+              {/* v13.0 §4 — the mandated LOSS-AVOIDED summary box (formula fix) */}
+              {(() => {
+                const sh = ledger?.groups?.find((g) => g.line === "SHADOW");
+                if (!sh) return null;
+                return (
+                  <div
+                    className={cn(
+                      "rounded-xl border px-3.5 py-2.5",
+                      sh.profit < 0
+                        ? "border-emerald-300/25 bg-emerald-300/[0.06]"
+                        : "border-white/10 bg-white/[0.03]"
+                    )}
+                  >
+                    <div className="flex flex-wrap items-center gap-2 text-xs font-bold text-emerald-300">
+                      <ShieldAlert className="h-4 w-4" />
+                      🛡️ زیان جلوگیری‌شده در دفتر سایه (Loss Avoided by Supervisor Veto):{" "}
+                      <span className="mono-num" dir="ltr">
+                        {sh.profit.toFixed(1)} واحد
+                      </span>
+                      <span className="text-[10px] font-normal text-muted-foreground">
+                        (اثبات کارایی فیلتر سوپروایزر — هر برد وتوشده +۱۸واحد و هر باخت وتوشده −۱۰۰واحد پکیج استاندارد حساب می‌شود)
+                      </span>
+                    </div>
+                    <div className="mt-1 text-[10px] text-muted-foreground">
+                      {sh.won} برد و {sh.lost} باخت وتوشده · {sh.pending} در انتظار — این زیان هرگز به بانک اصلی راه نمی‌یابد؛
+                      فیلتر سوپروایزر (تاپ-۱۰۰ + ضریب همپوشانی مثبت) دقیقاً همین ضرر را از دفترکل دور نگه داشته است.
+                    </div>
+                  </div>
+                );
+              })()}
               <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3.5 py-2.5">
                 <div className="flex items-center gap-2 text-xs font-bold text-muted-foreground">
                   <ShieldAlert className="h-3.5 w-3.5" />
-                  🛡️ دفتر وتو سوپروایزر — ({shadow.length} تیپ وتوشده، بدون احتساب وین‌ریت و بانک)
+                  🛡️ دفتر وتو سوپروایزر — ({shadow.length} تیپ وتوشده امروز، بدون احتساب وین‌ریت و بانک)
                 </div>
                 <div className="mt-1 text-[10px] text-muted-foreground">
-                  «🚫 وتوی سوپروایزر — عدم وجود ضریب همپوشانی مثبت» بازی‌هایی که هیچ‌یک از ۳ الگو در
-                  آن‌ها سود خالص تضمین‌شده ≥ +۱۵.۵٪ نمی‌دهد — هرگز وارد کارنامه و بانک نمی‌شوند.
+                  «🚫 وتوی سوپروایزر — عدم وجود ضریب همپوشانی مثبت» بازی‌هایی که هیچ‌یک از الگوها در
+                  آن‌ها سود خالص تضمین‌شده ≥ +۱۵.۵٪ نمی‌دهد — هرگز وارد کارنامه و بانک نمی‌شوند. نسخه ۱۳:
+                  فیلتر تاپ-۱۰۰ نیز به‌صورت بازگشت‌به‌عقب روی تاریخچه تسویه‌شده اعمال شد و بازی‌های رده‌پایین
+                  WTA 125K به همین دفتر منتقل شدند.
                 </div>
               </div>
               <div className="scroll-slim grid max-h-72 gap-1.5 overflow-y-auto">

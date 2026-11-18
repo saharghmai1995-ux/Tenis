@@ -142,7 +142,7 @@ export default function Home() {
             </section>
 
             <CommandCenter ledger={data.ledger} />
-            <ProductionLines feed={data} />
+            <ProductionLines feed={data} ledger={data.ledger} />
             <RecordTable ledger={data.ledger} />
             {/* v12 — 💻 کنسول پرس‌وجوی علوم داده تنیس (QQL & RCA Explorer) */}
             <QqlExplorer />

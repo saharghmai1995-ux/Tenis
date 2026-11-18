@@ -133,11 +133,16 @@ export const OPT_BY_CODE = new Map(TENNIS_OPTION_POOL.map((o) => [o.code, o]));
 
 // ─── 2 · THE 6 PATTERN FAMILIES (v12 §3-3 — «۶ خانواده الگوی کشف‌شده») ──────
 export const QQL_FAMILIES: Record<QqlFamilyCode, { labelFa: string; labelEn: string }> = {
-  F1: { labelFa: "خانواده ۱ — تسلط ست‌ها [T1↔T5]", labelEn: "SET MASTERY OVERLAP" },
+  F1: { labelFa: "خانواده ۱ — برد دوبل بازقراردادشده [T1↔T6]", labelEn: "DOUBLE-WIN RE-CONTRACTED" },
   F2: { labelFa: "خانواده ۲ — برد دوبل گیم‌ها [T1↔T6]", labelEn: "DOUBLE-WIN GAME OVERLAP" },
-  F3: { labelFa: "خانواده ۳ — نبرد خاک رس [T8↔T5]", labelEn: "CLAY-GRIND HANDICAP" },
-  F4: { labelFa: "خانواده ۴ — فاوریت بازیکن دوم [T3↔T5]", labelEn: "PLAYER-2 FAVORITE" },
-  F5: { labelFa: "خانواده ۵ — سپر رنک نزدیک و تفکیک دقیق", labelEn: "CLOSE-RANK SHIELD & EXACT SPLIT" },
+  F3: { labelFa: "خانواده ۳ — نبرد خاک رس و ستاره‌ها [T8↔T5]", labelEn: "CLAY-GRIND HANDICAP" },
+  // v13.0 — the exact-set-split family: the two side-by-side set-betting
+  // buttons (fav 2-0 + fav 2-1) + the player-2 oriented sweep pairs
+  F4: { labelFa: "خانواده ۴ — تفکیک دقیق ست‌ها [T1↔T2]", labelEn: "EXACT SET SPLIT" },
+  // v13.0 — the serve-battle shield family: the SRV copula-combo variant
+  // (favorite win & over 20.5 games + the disjoint under-20.5/dog-win cover)
+  // of the serve-battle matches + the close-rank shield pairs
+  F5: { labelFa: "خانواده ۵ — سپر سرویس‌زنان و رنک نزدیک [SRV]", labelEn: "SERVE SHIELD & CLOSE-RANK" },
   F6: { labelFa: "خانواده ۶ — کمبوی کاپولا + پوشش", labelEn: "COPULA COMBO + COVER" },
 };
 
@@ -264,6 +269,30 @@ export function evaluateRcaRules(m: AnalyzedMatch): RcaEvaluation {
     });
   }
 
+  // RCA_TENNIS_05_ZERO_DOUBLE_WIN_BAN — v13.0 (master-prompt §2, verbatim):
+  // [T1 ↔ T5] and [T3 ↔ T5] are MATHEMATICALLY DISJOINT — a 2-0 sweep
+  // excludes a third set, so the pair's joint (double-win) mass is EXACTLY
+  // zero: every win pays one wing (+14…+18u) while every loss burns −100u.
+  // This zero-overlap pattern is the audited −464.1u bleed of family 1 — it
+  // is BANNED from the candidate pool for good; the family rides the
+  // double-win replacement [T1 ↔ T6] instead (family tag preserved).
+  hits.push({
+    code: "RCA_TENNIS_05_ZERO_DOUBLE_WIN_BAN",
+    fired: true,
+    steer: "[T1 ↔ T6] (جایگزین قانونی برد دوبل)",
+    noteFa: "جفت‌های [T1 ↔ T5] و [T3 ↔ T5] مانعه‌الجمع‌اند (برد ۲-۰ هیچ‌گاه با رفتن به ست سوم همزمان رخ نمی‌دهد) — جرم برد دوبل دقیقاً صفر است و طبق ممیزی نسخه ۱۳ برای همیشه از استخر کاندیدها حذف شدند؛ خانواده ۱ با الگوی برد دوبل [T1 ↔ T6] ادامه می‌دهد",
+  });
+  blocked.set(
+    pairKey("T1", "T5"),
+    "RCA_TENNIS_05 — مانعه‌الجمعی مطلق: برد دوبل صفر (ممنوع نسخه ۱۳)"
+  );
+  blocked.set(
+    pairKey("T3", "T5"),
+    "RCA_TENNIS_05 — مانعه‌الجمعی مطلق: برد دوبل صفر (ممنوع نسخه ۱۳)"
+  );
+  bonus.set(pairKey("T1", "T6"), (bonus.get(pairKey("T1", "T6")) ?? 0) + 60);
+  bonus.set(pairKey("T8", "T5"), (bonus.get(pairKey("T8", "T5")) ?? 0) + 40);
+
   return { hits, bonus, blocked };
 }
 
@@ -361,7 +390,12 @@ export function familyOfPair(pairCode: string): QqlFamilyCode {
       return "F2";
     case "T6-T8":
     case "T1-T8":
+    case "T5-T8": // v13.0 — the STAR GAME-HANDICAP overlap rides the clay-grind family
       return "F3";
+    // v13.0 — the EXACT SET SPLIT family: the two side-by-side set-betting
+    // buttons (fav 2-0 + fav 2-1) + the player-2 sweep pairs — the family
+    // that carries the P3 pattern of the peak table
+    case "T1-T2":
     case "T3-T5":
     case "T3-T6":
     case "T3-T4":
@@ -376,11 +410,21 @@ export function familyOfPair(pairCode: string): QqlFamilyCode {
  * THE QQL SOLVER — evaluates all 45 candidate pairs of the 10-option pool
  * for one match and returns the winning package + the full trace.
  * 100% synchronous (the warehouse is a pre-loaded snapshot).
+ * v13.0 — `starGrade`: when NO standard pair passes the 89.5% union floor
+ * and the match carries an ELITE_PROTECTED_ELO star, the two star overlap
+ * patterns [T1↔T6] and [T8↔T5] are re-gated at the STAR floors
+ * (coverage ≥ 70% ∧ sharpe ≥ 0.20 ∧ the positive-return law intact) —
+ * the [OVERLAP]-threshold fix that exports Zverev / Medvedev / Shelton /
+ * Tiafoe pairings as 👑 GOLD CROWN cards instead of shadow-ledger vetoes.
+ * The RCA_TENNIS_02 clay-volatility block is waived inside the rescue (the
+ * star Elo anchor already prices the volatility); the RCA_TENNIS_03 upset
+ * shield stays NON-NEGOTIABLE.
  */
 export function solveQuantumPair(
   m: AnalyzedMatch,
   mc: MonteCarloResult,
-  warehouse?: QqlWarehouseSnapshot
+  warehouse?: QqlWarehouseSnapshot,
+  starGrade = false
 ): { decision: QqlDecision | null; candidates: QqlPairCandidate[] } {
   const holdDiff = Math.abs(m.markov.gA - m.markov.gB);
   const matchRho = m.copula?.rhoSetCoupling ?? 0;
@@ -485,7 +529,74 @@ export function solveQuantumPair(
     .filter((c) => c.gatePassed && !c.blockedByRca)
     .sort((a, b) => b.score - a.score);
 
-  const winner = passing[0];
+  let winner = passing[0];
+
+  // ── v13.0 · THE STAR RESCUE PHASE (master-prompt §3, the [OVERLAP] fix) ──
+  // Fires ONLY when: (a) the match carries an elite star, (b) zero standard
+  // pairs passed the 89.5% union floor, (c) one of the TWO star patterns
+  // [T1↔T6] / [T8↔T5] passes the STAR floors with the positive-return law
+  // intact (impliedSum ≤ 0.865 ∧ net ≥ +15.5% ∧ coverage ≥ 70% ∧ sharpe ≥ 0.20).
+  let starRescue = false;
+  if (!winner) {
+    // ── phase A · STAR RESCUE (elite matches — coverage ≥ 70% ∧ sharpe ≥ 0.20)
+    if (starGrade) {
+      const STAR_UNION_MIN = 0.7;
+      const STAR_SHARPE_MIN = 0.2;
+      const starDomain = new Set([pairKey("T1", "T6"), pairKey("T8", "T5")]);
+      const starPassing = candidates
+        .filter((c) => starDomain.has(c.pairCode))
+        .filter((c) => !c.blockedByRca || (c.rcaBlockWhy ?? "").startsWith("RCA_TENNIS_02"))
+        .filter((c) => {
+          const sharpe = dutchedSharpe2([c.probA, c.probB], [c.oddsA, c.oddsB]);
+          return (
+            c.impliedSum <= OVERLAP_MAX_IMPLIED_SUM &&
+            (c.effectiveOverlapOdds - 1) * 100 >= 15.5 &&
+            c.unionProb >= STAR_UNION_MIN &&
+            sharpe >= STAR_SHARPE_MIN
+          );
+        })
+        .sort((a, b) => b.score - a.score);
+      if (starPassing[0]) {
+        winner = starPassing[0];
+        starRescue = true;
+      }
+    }
+
+    // ── phase B · CLOSE-RANK SHIELD RESCUE (v13.0 §3 — the family balance) ──
+    // A coin-flip match (favWin ≤ 62%) can never pass the 89.5% union floor
+    // with ANY pair — its honest package is the RCA_TENNIS_03 shield domain
+    // [T9↔T10] / [T7↔T9]: the underdog +3.5 games / first-set shield pair.
+    // Shield floors: coverage ≥ 78% ∧ sharpe ≥ 0.15 ∧ the positive-return
+    // law intact. This populates family 5 (سپر رنک نزدیک) of the disjoint
+    // ledger — no family of the v13 balance mandate stays at 0/0.
+    if (!winner) {
+      const pFavWinShield =
+        m.favorite === "A"
+          ? mc.outcomes.p20 + mc.outcomes.p21
+          : mc.outcomes.p12 + mc.outcomes.p02;
+      if (pFavWinShield <= 0.62) {
+        const SHIELD_UNION_MIN = 0.78;
+        const SHIELD_SHARPE_MIN = 0.15;
+        const shieldDomain = new Set([pairKey("T9", "T10"), pairKey("T7", "T9")]);
+        const shieldPassing = candidates
+          .filter((c) => shieldDomain.has(c.pairCode) && !c.blockedByRca)
+          .filter((c) => {
+            const sharpe = dutchedSharpe2([c.probA, c.probB], [c.oddsA, c.oddsB]);
+            return (
+              c.impliedSum <= OVERLAP_MAX_IMPLIED_SUM &&
+              (c.effectiveOverlapOdds - 1) * 100 >= 15.5 &&
+              c.unionProb >= SHIELD_UNION_MIN &&
+              sharpe >= SHIELD_SHARPE_MIN
+            );
+          })
+          .sort((a, b) => b.score - a.score);
+        if (shieldPassing[0]) {
+          winner = shieldPassing[0];
+          starRescue = true; // the rescue trace marker (shield variant)
+        }
+      }
+    }
+  }
 
   const surfaceFa = m.surface === "HARD" ? "هاردکورت" : m.surface === "CLAY" ? "خاک رس" : "چمن";
   const fired = rca.hits.filter((h) => h.fired);
@@ -512,9 +623,9 @@ export function solveQuantumPair(
         gatePassedCount: passing.length,
         topCandidates: passing.slice(0, 8),
         rca: rca.hits,
-        queryFa: `💻 QQL EXECUTED — SELECT best pair FROM candidate_45_tennis_pairs (۴۵ ترکیب از ۱۰ آپشن ATP/WTA) LEFT JOIN tennis_historical_warehouse (تایم‌های ${surfaceFa} با |ΔHold−${(holdDiff * 100).toFixed(0)}%| ≤ ۸٪ و |ρ−${m.copula?.rhoSetCoupling.toFixed(2) ?? "0.00"}| ≤ ۰.۰۶) WHERE مجموع معکوس ضرایب ≤ ۰.۸۶۵ ∧ پوشش مونت‌کارلو ≥ ۸۹.۵٪ ∧ RCA = PASS ORDER BY verified_win_rate×۱۰۰ + برد دوبل×۸۰ + سود مؤثر×۱۴۰ DESC LIMIT 1 — ${passing.length} از ${evaluated} ترکیب فیلترها را عبور داد؛ برنده: [${winner.pairCode}]`,
+        queryFa: `💻 QQL EXECUTED — SELECT best pair FROM candidate_45_tennis_pairs (۴۵ ترکیب از ۱۰ آپشن ATP/WTA) LEFT JOIN tennis_historical_warehouse (تایم‌های ${surfaceFa} با |ΔHold−${(holdDiff * 100).toFixed(0)}%| ≤ ۸٪ و |ρ−${m.copula?.rhoSetCoupling.toFixed(2) ?? "0.00"}| ≤ ۰.۰۶) WHERE مجموع معکوس ضرایب ≤ ۰.۸۶۵ ∧ پوشش مونت‌کارلو ≥ ۸۹.۵٪ ∧ RCA = PASS ORDER BY verified_win_rate×۱۰۰ + برد دوبل×۸۰ + سود مؤثر×۱۴۰ DESC LIMIT 1 — ${passing.length} از ${evaluated} ترکیب فیلترها را عبور داد؛ برنده: [${winner.pairCode}]${starRescue ? " · نجات ستاره‌ای v13 (دروازه ستاره‌ای: پوشش ≥ ۷۰٪ ∧ شارپ ≥ ۰.۲۰)" : ""}`,
         traceFa: `🔎 QQL Match Twin: در ${winner.twinCount > 0 ? `${winner.twinCount} مسابقه ${surfaceFa} مشابه با ΔHold=${(holdDiff * 100).toFixed(0)}%` : `شبیه‌سازی ۱۰٬۰۰۰ اجرایی همین بازی (${surfaceFa})`}، الگوی [${winner.pairCode.replace("T", "T").split("-").join(" ↔ ")}] دارای ${(winner.verifiedWinRate * 100).toFixed(1)}٪ وین‌ریت و ${(winner.doubleWinProb * 100).toFixed(0)}٪ برد دوبل همزمان بوده است`,
-        traceEn: `QQL TWIN · ${winner.twinCount > 0 ? `${winner.twinCount} surface twins (ΔHold ${(holdDiff * 100).toFixed(0)}%)` : "10k in-match simulation"} · [${winner.pairCode.replace("-", " ↔ ")}] verified ${(winner.verifiedWinRate * 100).toFixed(1)}% · double-win ${(winner.doubleWinProb * 100).toFixed(0)}% · RCA ${fired.length ? fired.map((f) => f.code.replace("RCA_TENNIS_0", "R")).join("+") : "CLEAN"}`,
+        traceEn: `QQL TWIN · ${winner.twinCount > 0 ? `${winner.twinCount} surface twins (ΔHold ${(holdDiff * 100).toFixed(0)}%)` : "10k in-match simulation"} · [${winner.pairCode.replace("-", " ↔ ")}] verified ${(winner.verifiedWinRate * 100).toFixed(1)}% · double-win ${(winner.doubleWinProb * 100).toFixed(0)}% · RCA ${fired.length ? fired.map((f) => f.code.replace("RCA_TENNIS_0", "R")).join("+") : "CLEAN"}${starRescue ? " · ⭐ STAR-GATE RESCUE v13" : ""}`,
       }
     : null;
 

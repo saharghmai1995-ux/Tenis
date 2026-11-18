@@ -18,8 +18,11 @@ export type ProductionLine =
 export type ArchetypeCode = "ARCH1" | "ARCH2" | "ARCH3";
 
 // ─── v10 · Peak Dual-Hedge Restoration — overlap pattern identity ────────────
-/** The 3 positive-overlap golden pairs of the restored peak architecture. */
-export type OverlapPatternCode = "P1" | "P2" | "P3";
+/** The golden pairs of the restored peak architecture.
+ *  v13.0 — P4 joins the table: the STAR-GAME-HANDICAP overlap [T8↔T5]
+ *  (favorite −3.5 games ↔ over 2.5 sets) that unblocks the top-tier ATP
+ *  stars (Zverev / Medvedev / Shelton / Tiafoe) from the shadow ledger. */
+export type OverlapPatternCode = "P1" | "P2" | "P3" | "P4";
 /** STATION 4 — the positive-overlap gate metrics stamped on every approved package. */
 export interface OverlapGateTelemetry {
   /** (1/oddsA) + (1/oddsB) — must stay ≤ 0.865 */

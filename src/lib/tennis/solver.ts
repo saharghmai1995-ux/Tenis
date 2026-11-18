@@ -78,6 +78,74 @@ export function removeMargin(
 export const ELO_BASE = 1500;
 const ELO_ANCHOR = 650;
 
+// ─── v13.0 · ELITE_PROTECTED_ELO — the protected/star-grade Elo dictionary ──
+// Master-prompt v13 §1.2 (mandated in engine.ts, hosted here as the pure-leaf
+// module so supervisor/qql/settlement can read it WITHOUT a circular import —
+// engine.ts re-exports the same symbols as the official API surface).
+// WHY IT EXISTS: players returning from injury under a PROTECTED RANKING
+// (Bianca Andreescu — the US-Open champion) carry a de-facto live rank that
+// understates their real strength. The points-derived Elo proxy then prices
+// them BELOW weak opponents (Mandlik / Hercog) and the favorite detector
+// inverts — the root cause of the audited −200.0u double loss on
+// Andreescu × Mandlik (FT 2-0) and Hercog × Andreescu (FT 0-2).
+// The dictionary is a HARD Elo FLOOR: when a listed player's points-derived
+// Elo is lower, the star-grade value below wins and the favorite detection
+// resolves to the true champion. It also exempts these stars from the
+// supervisor's TOP-100 domain veto (protected ranking ≠ out-of-domain) and
+// unlocks the [T1↔T6] / [T8↔T5] star-grade overlap gate (master-prompt §3).
+export const ELITE_PROTECTED_ELO: Record<string, number> = {
+  // WTA — protected ranking (the audit's inverted-favorite victim)
+  "bianca andreescu": 1910,
+  "andreescu": 1910,
+  // ATP stars — freed from the shadow ledger by the star-grade overlap gate
+  "carlos alcaraz": 2140,
+  "alcaraz": 2140,
+  "alexander zverev": 2075,
+  "zverev": 2075,
+  "daniil medvedev": 2050,
+  "medvedev": 2050,
+  "taylor fritz": 2010,
+  "fritz": 2010,
+  "ben shelton": 1960,
+  "shelton": 1960,
+  "frances tiafoe": 1950,
+  "tiafoe": 1950,
+};
+
+const normName = (s: string) => s.toLowerCase().trim().replace(/\s+/g, " ");
+
+/**
+ * v13.0 — star-grade Elo override of a player (undefined = no override).
+ * Matches the full normalized name first, then the surname.
+ */
+export function eliteEloOverride(name: string | undefined): number | undefined {
+  if (!name) return undefined;
+  const n = normName(name);
+  if (ELITE_PROTECTED_ELO[n] !== undefined) return ELITE_PROTECTED_ELO[n];
+  const surname = n.split(" ").pop() ?? "";
+  if (surname && ELITE_PROTECTED_ELO[surname] !== undefined) {
+    return ELITE_PROTECTED_ELO[surname];
+  }
+  return undefined;
+}
+
+/** v13.0 — true when EITHER competitor of the match is an elite-protected star. */
+export function isEliteStarMatch(
+  playerA: string | undefined,
+  playerB: string | undefined
+): boolean {
+  return (
+    eliteEloOverride(playerA) !== undefined || eliteEloOverride(playerB) !== undefined
+  );
+}
+
+/** inverse of eloFromPoints — converts an absolute dictionary Elo into the
+ *  equivalent ranking-points value the solver pipeline consumes */
+export function pointsFromElo(elo: number, surface: Surface = "HARD"): number {
+  const k = ELO_K[surface] || ELO_K.HARD;
+  return ELO_ANCHOR * Math.pow(10, (elo - ELO_BASE) / k);
+}
+
 const ELO_K: Record<Surface, number> = {
   HARD: 460, // exponent 1.15
   CLAY: 480, // exponent 1.20
@@ -96,13 +164,22 @@ export function eloFromPoints(points: number | undefined, surface: Surface = "HA
 export function eloWinProbA(
   pointsA: number | undefined,
   pointsB: number | undefined,
-  surface: Surface
+  surface: Surface,
+  eloOverrideA?: number,
+  eloOverrideB?: number
 ): number {
   const pa = Math.max(pointsA ?? 0, 30);
   const pb = Math.max(pointsB ?? 0, 30);
-  // both players outside the points floor → no signal, coin flip
-  if (pa <= 30 && pb <= 30) return 0.5;
-  const d = (eloFromPoints(pa, surface) - eloFromPoints(pb, surface)) * 1.0;
+  // both players outside the points floor AND without a star-grade override →
+  // no signal, coin flip
+  if (pa <= 30 && pb <= 30 && eloOverrideA === undefined && eloOverrideB === undefined) {
+    return 0.5;
+  }
+  // v13.0 — the star-grade Elo FLOOR: a protected/elite player whose derived
+  // Elo is below the dictionary value is priced at the dictionary value
+  const ea = Math.max(eloFromPoints(pa, surface), eloOverrideA ?? 0);
+  const eb = Math.max(eloFromPoints(pb, surface), eloOverrideB ?? 0);
+  const d = (ea - eb) * 1.0;
   const clamped = Math.max(-520, Math.min(520, d));
   const p = 1 / (1 + Math.pow(10, -clamped / 400));
   return Math.max(0.03, Math.min(0.97, p));
@@ -200,14 +277,19 @@ export function spreadPriorFromPoints(
  *  used to collapse onto EXACTLY the same telemetry (Hold 80.9%/54.8% twins).
  *  A deterministic ±0.003 serve-point micro-shift (FNV of the event key, within
  *  the solver's own grid resolution 0.002) separates them — every match now
- *  carries its own continuous telemetry pair, stable across rebuilds. */
+ *  carries its own continuous telemetry pair, stable across rebuilds.
+ *  v13.0 — `eloOverrideA/B`: the ELITE_PROTECTED_ELO star-grade Elo floor
+ *  (Andreescu 1910 …) injected by engine.analyzeMatch so protected-ranking
+ *  stars are priced (and flagged favorite) by their REAL strength. */
 export function reverseAnalysis(
   marketProbA: number | undefined,
   pointsA: number | undefined,
   pointsB: number | undefined,
   surface: Surface,
   tour: Tour = "ATP",
-  tieBreakSeed?: string
+  tieBreakSeed?: string,
+  eloOverrideA?: number,
+  eloOverrideB?: number
 ): {
   pServeA: number;
   pServeB: number;
@@ -222,7 +304,7 @@ export function reverseAnalysis(
   marketGap: boolean;
   method: "shin" | "power";
 } {
-  const eloWinA = eloWinProbA(pointsA, pointsB, surface);
+  const eloWinA = eloWinProbA(pointsA, pointsB, surface, eloOverrideA, eloOverrideB);
   const spread = spreadPriorFromPoints(pointsA, pointsB);
   // v10 — the tour+surface baseline anchor (telemetry-dedupe: every match
   // solves to its OWN realistic pair, never to a shared grid corner)

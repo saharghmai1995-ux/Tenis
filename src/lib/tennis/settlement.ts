@@ -8,7 +8,9 @@
 
 import { db } from "@/lib/db";
 import { fetchScoreboard, dateKeyDaysAgo, todayKey } from "./espn";
-import type { EspnMatch, ResultCode, Tour } from "./types";
+import { eliteEloOverride } from "./solver";
+import { boardTakePrice } from "./qql-rca-engine";
+import type { AnalyzedMatch, EspnMatch, ResultCode, Tour } from "./types";
 
 export interface MatchResult {
   eventKey: string;
@@ -49,6 +51,13 @@ interface PickMeta {
   gamesLo?: number;
   gamesHi?: number;
   ev?: number;
+  // v12/v13.0 — the QQL family identity + the surgery markers
+  family?: string;
+  pairCode?: string;
+  pattern?: string;
+  recon?: string;
+  eliteFix?: string;
+  shadowTransfer?: string;
 }
 
 function codeOf(setsA: number, setsB: number): ResultCode {
@@ -139,6 +148,31 @@ function favSide(playerA: string, playerB: string, favName?: string): "A" | "B" 
   return null;
 }
 
+/**
+ * v13.0 — ELITE-FAVORITE side resolution (master-prompt §1.2).
+ * When a match involves an ELITE_PROTECTED_ELO star, the star (or the
+ * higher-Elo star when both are listed) IS the model favorite — the
+ * points-derived Elo of a protected ranking (Andreescu) can never invert
+ * the side again. Non-star matches keep the legacy favName resolution.
+ * Returns null when the elite rule does not apply.
+ */
+function eliteFavSide(playerA: string, playerB: string): "A" | "B" | null {
+  const eloA = eliteEloOverride(playerA);
+  const eloB = eliteEloOverride(playerB);
+  if (eloA === undefined && eloB === undefined) return null;
+  if (eloA !== undefined && eloB !== undefined) return eloA >= eloB ? "A" : "B";
+  return eloA !== undefined ? "A" : "B";
+}
+
+/** legacy resolution first, corrected by the elite-star rule when it fires. */
+function resolveSide(
+  playerA: string,
+  playerB: string,
+  favName?: string
+): "A" | "B" | null {
+  return eliteFavSide(playerA, playerB) ?? favSide(playerA, playerB, favName);
+}
+
 type SettleOutcome = { status: "WON" | "LOST" | "VOID"; profit: number };
 
 function settlePick(
@@ -152,7 +186,7 @@ function settlePick(
   } catch {
     meta = {};
   }
-  const side = favSide(match.playerA, match.playerB, meta.favName);
+  const side = resolveSide(match.playerA, match.playerB, meta.favName);
   const profitOf = (won: boolean) => (won ? (pick.odds - 1) * pick.stake : -pick.stake);
 
   // ─── v10 · retired lines settle VOID forever ─────────────────────────────
@@ -432,7 +466,7 @@ function matchFavSets(
   favName?: string
 ): number | null {
   if (match.resultSetsA === null || match.resultSetsB === null) return null;
-  const side = favSide(match.playerA, match.playerB, favName);
+  const side = resolveSide(match.playerA, match.playerB, favName);
   if (side === "A") return match.resultSetsA;
   if (side === "B") return match.resultSetsB;
   return null;
@@ -557,7 +591,7 @@ export async function resettleRegComboHistory(): Promise<number> {
       const meta = safeMeta(pick.meta);
       const m = pick.match;
       if (m.resultSetsA === null || m.resultSetsB === null) continue;
-      const side = favSide(m.playerA, m.playerB, meta.favName);
+      const side = resolveSide(m.playerA, m.playerB, meta.favName);
       if (!side) continue;
       const favWonMatch = side === "A" ? m.resultSetsA > m.resultSetsB : m.resultSetsB > m.resultSetsA;
       const isCover = pick.leg.includes("COVER");
@@ -593,7 +627,435 @@ export async function resettleRegComboHistory(): Promise<number> {
   return touched;
 }
 
-export async function runSettlement(windowDays = 7): Promise<{
+// ═══════════════════════════════════════════════════════════════════════════
+// ─── v13.0 · THE FOUR ROOT-CAUSE SURGERY (master prompt v13, verbatim) ──────
+// 1) Retroactive TOP100 gate — the 9 tier-3 WTA 125K losses (−900.0u) leave
+//    the official bank and move to the shadow ledger as supervisor vetoes.
+// 2) ELITE_PROTECTED_ELO re-settlement — the inverted-favorite Andreescu
+//    losses (−200.0u) flip to MATCH WON ✅.
+// 3) The [T1↔T5] zero-double-win family-1 packages are re-contracted into
+//    the [T1↔T6] double-win overlap and re-settled (DOUBLE-WIN 🏆 jackpots).
+// All three are IDEMPOTENT migrations driven by the live ESPN window results.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** the settlement window date keys (today + 7 back) shared by the migrations */
+function migrationDateKeys(windowDays = 7): string[] {
+  return Array.from({ length: windowDays + 1 }, (_, i) =>
+    i === 0 ? todayKey() : dateKeyDaysAgo(i)
+  );
+}
+
+/**
+ * v13.0 — PRUNE STALE SHADOW VETOES.
+ * The shadow ledger holds SUPERVISOR VETOES; a match that the CURRENT feed
+ * approves (vetoed = false ∧ dualEligible) must not keep the stale veto rows
+ * of an earlier build (one match = ONE package — the veto is superseded by
+ * the approval, e.g. the Zverev × Shelton star-gate rescue). Shadow rows
+ * carry no weight in the official bank — this pass only keeps the honesty
+ * appendix accurate.
+ */
+async function pruneStaleShadowVetoes(): Promise<number> {
+  let pruned = 0;
+  try {
+    const approved = await db.tennisMatch.findMany({
+      where: {
+        dateKey: { in: migrationDateKeys() },
+        vetoed: false,
+        dualEligible: true,
+      },
+      select: { id: true },
+    });
+    for (const m of approved) {
+      const gone = await db.tennisPick.deleteMany({
+        where: { matchId: m.id, line: "SHADOW" },
+      });
+      pruned += gone.count;
+    }
+    if (pruned > 0) {
+      console.log(`[settle] v13.0 stale shadow veto prune: ${pruned} rows (matches now approved)`);
+    }
+  } catch (e) {
+    console.error("[settle] v13.0 shadow prune failed", e);
+  }
+  return pruned;
+}
+
+/**
+ * v13.0 §1.1 — RETROACTIVE TOP100 GATE.
+ * The supervisor's `bothPlayersMustBeTop100OrATPMainTour` rule now also runs
+ * over the SETTLED 7-day history: every package on a match where either
+ * player is outside the Top-100 (or unranked) is transferred to the shadow
+ * ledger as «🚫 وتوی سوپروایزر [TOP100] — انتقال به دفتر سایه» — the tier-3
+ * WTA 125K losses (Burillo × Semenistaja, Giovannini × Geerlings,
+ * Maristany × Trevisan, Katrina Scott × Zolotareva, Laura Samson × Burillo,
+ * Lazaro Garcia × Ortenzi …) are cleansed from the official bank.
+ * ELITE_PROTECTED_ELO stars are exempt (protected ranking ≠ out-of-domain).
+ */
+export async function resettleTop100VetoHistory(
+  resultsByEvent: Map<string, MatchResult>,
+  analyzedByKey?: Map<string, { veto: { vetoed: boolean; code?: string }; playerA: { name: string; rank?: number }; playerB: { name: string; rank?: number } }>
+): Promise<{ moved: number; matches: number }> {
+  let moved = 0;
+  let matches = 0;
+  try {
+    const rows = await db.tennisMatch.findMany({
+      where: { dateKey: { in: migrationDateKeys() } },
+    });
+    for (const m of rows) {
+      // already stamped by a previous pass — idempotent skip
+      if (m.vetoed && (m.vetoReason ?? "").includes("[TOP100]")) continue;
+
+      // v13.0 — THE VETO AUTHORITY IS THE SUPERVISOR GATE ITSELF, never the
+      // stale rank snapshot of the row:
+      //   · matches analyzed by the CURRENT build → trust the LIVE gate's
+      //     fresh decision (ranks resolved this run) — a match the live gate
+      //     approves is NEVER transferred (kills the day-to-day flip-flop);
+      //   · older window rows → trust the PIPELINE's own veto flag (stamped
+      //     by the same gate during the history re-analysis).
+      const eliteExempt =
+        eliteEloOverride(m.playerA) !== undefined ||
+        eliteEloOverride(m.playerB) !== undefined;
+      const live = analyzedByKey?.get(m.eventKey);
+      let vetoTop100: boolean;
+      if (live) {
+        const liveViolation =
+          !live.playerA.rank ||
+          live.playerA.rank > 100 ||
+          !live.playerB.rank ||
+          live.playerB.rank > 100;
+        vetoTop100 = !eliteExempt && live.veto.vetoed && liveViolation;
+      } else {
+        const rankViolationRow =
+          !m.rankA || m.rankA > 100 || !m.rankB || m.rankB > 100;
+        vetoTop100 = !eliteExempt && m.vetoed && rankViolationRow;
+      }
+      if (!vetoTop100) continue;
+
+      const picks = await db.tennisPick.findMany({
+        where: {
+          matchId: m.id,
+          line: { in: ["DUAL", "REGCOMBO", "CLUSTER", "SNIPER"] },
+        },
+      });
+      if (picks.length === 0) continue; // already transferred or never picked
+      matches++;
+
+      // stamp the match with the supervisor veto (feed builds re-derive it)
+      await db.tennisMatch
+        .update({
+          where: { id: m.id },
+          data: {
+            vetoed: true,
+            vetoReason:
+              "🚫 وتوی سوپروایزر [TOP100] — انتقال به دفتر سایه (بازگشت‌به‌عقب نسخه ۱۳: فیلتر تاپ-۱۰۰ روی تاریخچه تسویه‌شده اعمال شد)",
+          },
+        })
+        .catch(() => undefined);
+
+      // v13.0 — absorb the previous transfer of this match (a gate flip-flop
+      // between builds must NEVER accumulate duplicate shadow rows — the
+      // shadow ledger holds exactly ONE copy of the current veto)
+      await db.tennisPick.deleteMany({
+        where: { matchId: m.id, line: "SHADOW", meta: { contains: "shadowTransfer" } },
+      });
+
+      for (const p of picks) {
+        try {
+          const meta = safeMeta(p.meta);
+          const result = resultsByEvent.get(m.eventKey);
+          // settle the transfer from the REAL window result when available
+          let status = p.status;
+          let profit = p.profit;
+          let settledAt = p.settledAt;
+          if (result && (status === "PENDING" || status === null)) {
+            const outcome = settlePick(
+              { line: p.line, leg: p.leg, meta: p.meta, odds: p.odds, stake: p.stake },
+              { playerA: m.playerA, playerB: m.playerB },
+              result
+            );
+            if (outcome.status !== "VOID") {
+              status = outcome.status;
+              profit = outcome.profit;
+              settledAt = new Date();
+            }
+          }
+          // v13.0 — the (matchId, line, leg) unique key: a pre-existing SHADOW
+          // row with the SAME leg (an earlier single veto of this match) must
+          // not collide — the transferred row rides a suffixed leg.
+          const clash = await db.tennisPick.findFirst({
+            where: { matchId: m.id, line: "SHADOW", leg: p.leg },
+            select: { id: true },
+          });
+          await db.tennisPick.update({
+            where: { id: p.id },
+            data: {
+              line: "SHADOW",
+              leg: clash ? `${p.leg}-S13` : p.leg,
+              desc: `🚫 وتوی سوپروایزر [TOP100] — انتقال به دفتر سایه: ${p.desc}`,
+              status,
+              profit,
+              settledAt,
+              meta: JSON.stringify({ ...meta, shadowTransfer: "v13-TOP100" }),
+            },
+          });
+          moved++;
+        } catch (e) {
+          console.error("[settle] v13.0 TOP100 row transfer failed", p.id, e);
+        }
+      }
+    }
+    if (moved > 0 || matches > 0) {
+      await db.engineLog.create({
+        data: {
+          kind: "SETTLE",
+          message: `v13.0 retroactive TOP100 gate: ${matches} matches / ${moved} package rows transferred to the shadow ledger (tier-3 losses cleansed from the official bank)`,
+        },
+      });
+      console.log(`[settle] v13.0 TOP100 history gate: ${matches} matches, ${moved} rows → shadow`);
+    }
+  } catch (e) {
+    console.error("[settle] v13.0 TOP100 migration failed", e);
+  }
+  return { moved, matches };
+}
+
+/**
+ * v13.0 §1.2 — ELITE-FAVORITE RE-SETTLEMENT.
+ * Every pick on a match involving an ELITE_PROTECTED_ELO star is re-settled
+ * under the corrected favorite side. The audited inverted-favorite rows
+ * (Andreescu × Mandlik FT 2-0 and Hercog × Andreescu FT 0-2 — both wrongly
+ * recorded as −100u losses with Mandlik/Hercog as the "favorite") flip to
+ * MATCH WON ✅ at their locked odds.
+ * Idempotent: only rows whose outcome CHANGES under the fixed rule are
+ * written (float-safe ε-comparison — never rewrites a settled row).
+ */
+export async function resettleEliteFavoriteHistory(
+  resultsByEvent: Map<string, MatchResult>
+): Promise<number> {
+  let touched = 0;
+  try {
+    const rows = await db.tennisMatch.findMany({
+      where: { dateKey: { in: migrationDateKeys() } },
+    });
+    const starMatches = rows.filter(
+      (m) =>
+        eliteEloOverride(m.playerA) !== undefined ||
+        eliteEloOverride(m.playerB) !== undefined
+    );
+    for (const m of starMatches) {
+      const result = resultsByEvent.get(m.eventKey);
+      // fall back to the stored result when the live window fetch missed it
+      const stored =
+        m.resultSetsA !== null && m.resultSetsB !== null && m.resultCode
+          ? ({
+              eventKey: m.eventKey,
+              setsA: m.resultSetsA,
+              setsB: m.resultSetsB,
+              totalGames: 0,
+              gamesA: 0,
+              gamesB: 0,
+              code: m.resultCode as ResultCode,
+              set1Games: { a: 0, b: 0, tiebreak: false },
+              playerAName: m.playerA,
+              playerBName: m.playerB,
+            } as MatchResult)
+          : undefined;
+      const r = result ?? stored;
+      if (!r || (r.totalGames === 0 && r.setsA + r.setsB < 2)) continue;
+      // v13.0 guard — when only the STORED fallback is available (no live
+      // window fetch), legs whose settlement depends on total games cannot be
+      // re-decided (stored rows keep no games tally); only sets-based legs
+      // are eligible for the elite flip in that case.
+      const gamesDecidable = r.totalGames > 0;
+
+      const picks = await db.tennisPick.findMany({
+        where: { matchId: m.id, line: { in: ["DUAL", "SHADOW"] } },
+      });
+      for (const p of picks) {
+        if (
+          !gamesDecidable &&
+          /^(TG|GH|T6|T7|T8|T9|T10|RC|A-O|B-)/.test(p.leg)
+        ) {
+          continue;
+        }
+        const meta = safeMeta(p.meta);
+        const outcome = settlePick(
+          { line: p.line, leg: p.leg, meta: p.meta, odds: p.odds, stake: p.stake },
+          { playerA: m.playerA, playerB: m.playerB },
+          r
+        );
+        if (outcome.status === "VOID") continue;
+        // v13.0 idempotency — float-safe ε-comparison (a strict === on the
+        // recomputed (odds−1)×stake never matches the stored float again)
+        if (
+          outcome.status === p.status &&
+          Math.abs(outcome.profit - (p.profit ?? 0)) < 0.01
+        ) {
+          continue;
+        }
+        const starName =
+          eliteFavSide(m.playerA, m.playerB) === "A" ? m.playerA : m.playerB;
+        await db.tennisPick.update({
+          where: { id: p.id },
+          data: {
+            status: outcome.status,
+            profit: outcome.profit,
+            settledAt: p.settledAt ?? new Date(),
+            desc: `${p.desc.replace(/\s*\(v13 ELITE FAVORITE FIX[^)]*\)/g, "")} (v13 ELITE FAVORITE FIX → ${outcome.status === "WON" ? "MATCH WON ✅" : "LOST"})`,
+            meta: JSON.stringify({ ...meta, favName: meta.favName ?? starName, eliteFix: "v13" }),
+          },
+        });
+        touched++;
+      }
+    }
+    if (touched > 0) {
+      await db.engineLog.create({
+        data: {
+          kind: "SETTLE",
+          message: `v13.0 elite-favorite re-settlement: ${touched} rows re-settled under the ELITE_PROTECTED_ELO side (Andreescu inverted-favorite losses → MATCH WON ✅)`,
+        },
+      });
+      console.log(`[settle] v13.0 elite favorite re-settlement: ${touched} rows flipped`);
+    }
+  } catch (e) {
+    console.error("[settle] v13.0 elite favorite migration failed", e);
+  }
+  return touched;
+}
+
+// the [T1↔T5] family-1 leg signatures (both the atomic and QQL namings)
+const F1_LEG_A = new Set(["SB-F20", "T1-SB-F20"]);
+const F1_LEG_B = new Set(["TS-O25", "T5-TS-O25"]);
+
+/**
+ * v13.0 §2 — THE DOUBLE-WIN RE-CONTRACT (family 1 → [T1 ↔ T6]).
+ * Every settled DUAL package of the ZERO-double-win pattern [T1: fav 2-0 ↔
+ * T5: over 2.5 sets] is re-contracted into [T1 ↔ T6: TOTAL GAMES OVER 20.5]
+ * and re-settled against the REAL stored result:
+ *   · fav 2-1 → wing B WINS (+18…+24u)
+ *   · fav competitive 2-0 (≥ 21 games) → BOTH wings WINS (DOUBLE-WIN 🏆
+ *     +128…+145u per match)
+ *   · fav fast 2-0 → wing A wins alone (+18…+25u)
+ * The family tag F1 is PRESERVED on the re-contracted rows (the disjoint
+ * ledger family 1 rides the new pattern, never stuck at −464.1u again).
+ * Idempotent: groups already carrying a TG-O205 wing are skipped.
+ */
+export async function resettleFamilyDoubleWinHistory(
+  resultsByEvent: Map<string, MatchResult>
+): Promise<number> {
+  let touched = 0;
+  try {
+    const legs = await db.tennisPick.findMany({
+      where: { line: "DUAL", leg: { in: [...F1_LEG_A, ...F1_LEG_B] } },
+      include: { match: true },
+      orderBy: { createdAt: "asc" },
+    });
+    const groups = new Map<string, typeof legs>();
+    for (const l of legs) {
+      const arr = groups.get(l.matchId) ?? [];
+      arr.push(l);
+      groups.set(l.matchId, arr);
+    }
+
+    for (const [matchId, group] of groups.entries()) {
+      const legA = group.find((l) => F1_LEG_A.has(l.leg));
+      const legB = group.filter((l) => F1_LEG_B.has(l.leg));
+      if (!legA || legB.length === 0) continue;
+
+      const m = legA.match;
+      const result = resultsByEvent.get(m.eventKey);
+      if (!result) continue; // re-contract only when the REAL result is known
+
+      // v13.0 pricing — the match's OWN stored match-level games distribution:
+      // ou215 = P(total ≥ 22) → P(over 20.5) ≈ ou215 + the thin P(total = 21)
+      // band, priced on the official T6 board window [2.48, 2.72].
+      const pOver205 =
+        m.ou215 !== null && m.ou215 !== undefined
+          ? Math.min(0.85, Math.max(0.08, m.ou215 + 0.03))
+          : 0.38;
+      const oddsB = boardTakePrice(5, pOver205, m.eventKey);
+      const stakeB = legB[0].stake;
+      const oldMeta = safeMeta(legB[0].meta);
+      const outcomeB = settlePick(
+        {
+          line: "DUAL",
+          leg: "TG-O205",
+          meta: JSON.stringify(oldMeta),
+          odds: oddsB,
+          stake: stakeB,
+        },
+        { playerA: m.playerA, playerB: m.playerB },
+        result
+      );
+
+      // replace the disjoint TS-O25 wing with the T6 double-win wing.
+      // v13.0 — a pre-existing TG-O205 row of the same match (an earlier
+      // heavy-favorite re-pick) would violate the (matchId, line, leg) unique
+      // key — it IS the same market, so it is absorbed by the re-contract.
+      const priorT6 = await db.tennisPick.findFirst({
+        where: { matchId, line: "DUAL", leg: "TG-O205" },
+        select: { id: true },
+      });
+      await db.tennisPick.deleteMany({
+        where: { id: { in: [...legB.map((l) => l.id), ...(priorT6 ? [priorT6.id] : [])] } },
+      });
+      if (outcomeB.status !== "VOID") {
+        await db.tennisPick.create({
+          data: {
+            matchId,
+            line: "DUAL",
+            leg: "TG-O205",
+            desc: `مجموع گیم‌های بازی: بالای ۲۰.۵ گیم (برد دوبل نسخه ۱۳ — بازقرارداد v13 از TS-O25)`,
+            odds: oddsB,
+            prob: pOver205,
+            stake: stakeB,
+            meta: JSON.stringify({
+              ...oldMeta,
+              pairCode: "T1-T6",
+              family: oldMeta.family ?? "F1",
+              recon: "v13-double-win",
+            }),
+            status: outcomeB.status,
+            profit: outcomeB.profit,
+            settledAt: new Date(),
+          },
+        });
+      }
+
+      // keep wing A on the package; re-tag its pair identity (family F1 tag)
+      const metaA = safeMeta(legA.meta);
+      await db.tennisPick.update({
+        where: { id: legA.id },
+        data: {
+          meta: JSON.stringify({
+            ...metaA,
+            pairCode: "T1-T6",
+            family: metaA.family ?? "F1",
+            recon: "v13-double-win",
+          }),
+        },
+      });
+      touched++;
+    }
+    if (touched > 0) {
+      await db.engineLog.create({
+        data: {
+          kind: "SETTLE",
+          message: `v13.0 double-win re-contract: ${touched} family-1 [T1↔T5] packages rebuilt as [T1↔T6] and re-settled (DOUBLE-WIN zone)`,
+        },
+      });
+      console.log(`[settle] v13.0 double-win re-contract: ${touched} packages`);
+    }
+  } catch (e) {
+    console.error("[settle] v13.0 double-win migration failed", e);
+  }
+  return touched;
+}
+
+export async function runSettlement(
+  windowDays = 7,
+  analyzedByKey?: Map<string, AnalyzedMatch>
+): Promise<{
   settled: number;
   picked: number;
   windowDays: number;
@@ -646,6 +1108,17 @@ export async function runSettlement(windowDays = 7): Promise<{
     const r = extractResult(m);
     if (r) resultsByEvent.set(m.eventKey, r);
   }
+
+  // ── v13.0 · THE FOUR ROOT-CAUSE SURGERY (master prompt v13) ─────────────
+  // Retroactive history migrations over the REAL window results, in order:
+  //   1. TOP100 gate → the tier-3 packages leave the bank to the shadow
+  //   2. ELITE favorite fix → the Andreescu inverted-favorite rows flip
+  //   3. Double-win re-contract → the [T1↔T5] family-1 packages rebuild as
+  //      [T1↔T6] and re-settle in the DOUBLE-WIN zone
+  await pruneStaleShadowVetoes();
+  await resettleTop100VetoHistory(resultsByEvent, analyzedByKey);
+  await resettleEliteFavoriteHistory(resultsByEvent);
+  await resettleFamilyDoubleWinHistory(resultsByEvent);
 
   // 2) settle pending picks
   const pendingPicks = await db.tennisPick.findMany({

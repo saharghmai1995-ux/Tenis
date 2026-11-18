@@ -74,7 +74,7 @@ export function HeaderBar({ onRefresh, refreshing, lastUpdated, sources }: Heade
                 NeoTennis Markov Quant
               </span>
               <Badge className="border-0 bg-amber-300/15 px-1.5 py-0 text-[9px] font-bold text-amber-300">
-                v12.0
+                v13.0
               </Badge>
               <Badge variant="outline" className="gap-1 border-emerald-400/30 bg-emerald-400/5 px-1.5 py-0 text-[9px] font-bold text-emerald-300">
                 QQL Core · AI RCA · Quantum 10-Option Solver

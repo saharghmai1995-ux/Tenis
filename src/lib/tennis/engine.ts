@@ -18,6 +18,11 @@ import { fetchPolymarketOdds, matchMarket } from "./polymarket";
 import { fetchCityWeather } from "./weather";
 import { breakPointSavedProb, fullMarkov, matchWinProbA } from "./markov";
 import { removeMargin, reverseAnalysis } from "./solver";
+// v13.0 — the ELITE_PROTECTED_ELO star dictionary (official API surface).
+// Hosted in ./solver (the pure-leaf module) to keep the import graph
+// cycle-free; engine.ts re-exports the mandated symbols verbatim.
+import { eliteEloOverride, isEliteStarMatch } from "./solver";
+export { ELITE_PROTECTED_ELO, eliteEloOverride, isEliteStarMatch } from "./solver";
 // v5.5 — the ghost Station-3 twin (montecarlo.ts) is retired; the one
 // authoritative copula Monte-Carlo engine lives in ./copula (runMonteCarlo).
 import { deriveCopulaTelemetry, runMonteCarlo } from "./copula";
@@ -263,7 +268,13 @@ function analyzeMatch(
     m.playerB.points,
     m.surface,
     m.tour,
-    m.eventKey // v12 — deterministic per-match telemetry tie-break
+    m.eventKey, // v12 — deterministic per-match telemetry tie-break
+    // v13.0 — the ELITE_PROTECTED_ELO star-grade Elo floor: Andreescu (1910),
+    // Alcaraz / Zverev / Medvedev / Fritz / Shelton are priced by their REAL
+    // strength, fixing the audited inverted-favorite bug (Mandlik/Hercog were
+    // wrongly flagged favorite over the US-Open champion → −200.0u).
+    eliteEloOverride(m.playerA.name),
+    eliteEloOverride(m.playerB.name)
   );
   // ── v5.0 STATION 2 — Gaussian copula telemetry from exact BP-saved rates ──
   const bpsA0 = breakPointSavedProb(rev.pFinalA);
@@ -312,6 +323,24 @@ function analyzeMatch(
   am.archEvals = archReport.evals;
   am.archetype = archReport.selected;
   am.veto = supervisorGate(am, archReport.selected);
+
+  // ── v13.0 · ELITE-STAR WAIVER (master-prompt §1.2) ───────────────────
+  // A protected-ranking star (Andreescu) whose live rank sits outside the
+  // Top-100 (or is missing) is NOT out of the model's precision domain —
+  // the star-grade Elo anchor (1910) is the honest pricing source. The
+  // TOP100 domain veto is waived ONLY for ELITE_PROTECTED_ELO competitors;
+  // every other rank violation keeps its hard veto.
+  if (am.veto.vetoed && am.veto.code === "TOP100") {
+    const starA = eliteEloOverride(m.playerA.name);
+    const starB = eliteEloOverride(m.playerB.name);
+    if (starA !== undefined || starB !== undefined) {
+      am.veto = {
+        vetoed: false,
+        code: "NONE",
+        reason: undefined,
+      } as typeof am.veto;
+    }
+  }
 
   // ── v6.0 STATION 3.5 — INCOMPLETE MARKET DATA VETO ──────────────────
   // Master-prompt §3: a match with NO real market odds (marketGap) whose two
@@ -366,12 +395,22 @@ function analyzeMatch(
   am.dualEligible = !am.veto.vetoed && am.regime.code === "DUAL-HEDGE" && !!am.slips.A;
   // ── v5.5 — crown badge assigned at the analysis source (history matches
   // included): GOLD when the Monte-Carlo SUCCESS percentage lands ≥ 85/100.
-  am.crown = assignCrown(
-    !!am.regime.adaptive,
-    am.regime.pairLoss ?? 1 - favWinProb,
-    am.regime.sharpe,
-    am.regime.mcScore
-  );
+  // v13.0 — an ELITE-STAR match that survived the router is ALWAYS a
+  // GOLD CROWN card (the star-gate rescue of master-prompt §3):
+  // Zverev / Medvedev / Shelton / Tiafoe leave the shadow ledger crowned.
+  am.crown = isEliteStarMatch(m.playerA.name, m.playerB.name) && am.regime.code !== "VETOED"
+    ? {
+        tier: "GOLD",
+        labelFa: `تایید تاج طلایی سوپروایزر — کارت ستاره‌دار ELITE (Elo ستاره‌ای: ${eliteEloOverride(favorite === "A" ? m.playerA.name : m.playerB.name) ?? eliteEloOverride(favorite === "A" ? m.playerB.name : m.playerA.name) ?? "—"})`,
+        labelEn: `GOLD CROWN APPROVED — ELITE STAR CARD · STAR-GATE RESCUE v13 · Monte-Carlo Success: ${am.regime.mcScore}/100`,
+        score: am.regime.mcScore,
+      }
+    : assignCrown(
+        !!am.regime.adaptive,
+        am.regime.pairLoss ?? 1 - favWinProb,
+        am.regime.sharpe,
+        am.regime.mcScore
+      );
   am.pipeline = {
     station1Markov: {
       ok: true,
@@ -411,8 +450,8 @@ function slipsFromQql(m: AnalyzedMatch): { A?: Slip; B?: Slip } | null {
   const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
   const top = qql.topCandidates[0];
   return {
-    A: slipOfOption(top.idxA, top.oddsA, top.probA, favName, dogName),
-    B: slipOfOption(top.idxB, top.oddsB, top.probB, favName, dogName),
+    A: slipOfOption(top.idxA, top.oddsA, top.probA, favName, dogName, "NEUTRAL"),
+    B: slipOfOption(top.idxB, top.oddsB, top.probB, favName, dogName, "NEUTRAL"),
   };
 }
 
@@ -605,7 +644,11 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
     );
     await persistPicks(allItems);
     await syncDualAccounting(allItems);
-    const settleSummary = await runSettlement(HISTORY_WINDOW_DAYS);
+    // v13.0 — the live analyzed pool rides into the settlement so the
+    // retroactive TOP100 gate reads the SUPERVISOR's fresh per-build decision
+    // (never the stale rank snapshot of a row — kills the transfer flip-flop)
+    const analyzedByKey = new Map(analyzed.map((m) => [m.eventKey, m]));
+    const settleSummary = await runSettlement(HISTORY_WINDOW_DAYS, analyzedByKey);
     const ledger = await buildLedgerPayload(quota);
 
     const payload: FeedPayload = {
@@ -733,7 +776,14 @@ export function enforceApprovalQuotaV5(
 // 100 units, every match EXACTLY ONE package row. `historyVersion` marks the
 // pipeline revision a match was processed under; bumping the constant
 // re-backfills the 7-day window ONCE.
-const HISTORY_PIPELINE_VERSION = 10; // v10.0 = peak dual-hedge + overlap gate
+// v13.0 — bump 10 → 13 re-backfills the 7-day window ONCE under the surgery:
+//   · the retroactive TOP100 gate moves the tier-3 WTA 125K packages to the
+//     shadow ledger (−900.0u cleansed from the official bank)
+//   · the ELITE_PROTECTED_ELO dictionary fixes the Andreescu favorite
+//     inversion (both matches flip to MATCH WON ✅)
+//   · the [T1↔T5] → [T1↔T6] double-win re-contract rebuilds family 1
+//   · the star-gate rescue frees Zverev / Medvedev / Shelton / Tiafoe
+const HISTORY_PIPELINE_VERSION = 13;
 
 interface HistorySummary {
   analyzed: number;

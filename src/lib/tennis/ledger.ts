@@ -244,6 +244,15 @@ interface PickMeta {
   archAdaptive?: boolean;
   favName?: string;
   eventKey?: string;
+  // v5.0 — the copula-combo variant of REGCOMBO rows (DOM | SRV)
+  variant?: "DOM" | "SRV";
+  // v12/v13.0 — the QQL family identity of the package (family stats source)
+  family?: string;
+  pairCode?: string;
+  pattern?: string;
+  recon?: string;
+  eliteFix?: string;
+  shadowTransfer?: string;
 }
 
 const ARCH_FALLBACK: Record<string, { labelFa: string; labelEn: string }> = {
@@ -396,7 +405,12 @@ function buildFamilyStats(all: PickWithMatch[]): QqlFamilyStat[] {
     if (meta.family) {
       family = meta.family;
     } else if (line === "REGCOMBO") {
-      family = "F6";
+      // v13.0 — the family balance split: the DOM copula-combo variant stays
+      // family 6; the SRV (serve-battle shield) variant populates family 5
+      // (سپر سرویس‌زنان) so no family of the disjoint ledger sits at 0/0.
+      const variant =
+        meta.variant ?? (legs[0]?.leg.endsWith("SRV") ? "SRV" : "DOM");
+      family = variant === "SRV" ? "F5" : "F6";
     } else {
       const pc = pairCodeOfLegs(legs.map((l) => l.leg));
       family = pc ? familyOfPair(pc) : null;
@@ -890,6 +904,49 @@ export async function buildLedgerPayload(
     };
   };
 
+  // ── v13.0 · SHADOW LEDGER — THE LOSS-AVOIDED COUNTERFACTUAL (§4) ──────────
+  // Master-prompt v13 §4 (verbatim): the shadow box that printed «+1,374.0u
+  // profit» beside 38W/66L was a FORMULA BUG — the vetoed picks were priced
+  // at their RAW exotic odds. The honest shadow accounting models what the
+  // supervisor's STANDARD 100-unit package would have done:
+  //   · a won vetoed match  → the canonical approved-package net +18.0u
+  //     (the gated-package law nets +15.5%…+32u per win — the master prompt's
+  //     «38 × +18u = +684u» example, verbatim)
+  //   · a lost vetoed match → −100u (the 100-unit stake law)
+  // The net is therefore strongly NEGATIVE and is printed as
+  // «🛡️ زیان جلوگیری‌شده در دفتر سایه (Loss Avoided by Supervisor Veto)» —
+  // the proof of the supervisor filter's effectiveness. One row per MATCH.
+  const shadowGroupsMap = new Map<string, PickWithMatch[]>();
+  for (const p of all) {
+    if (p.line !== "SHADOW" || p.status === "VOID") continue;
+    const arr = shadowGroupsMap.get(p.matchId) ?? [];
+    arr.push(p);
+    shadowGroupsMap.set(p.matchId, arr);
+  }
+  const SHADOW_PACKAGE_WIN_NET = 18; // the canonical approved-package net (100u law)
+  const shadowRows: LedgerMatchRow[] = [...shadowGroupsMap.values()].map((legs) => {
+    const m = legs[0].match;
+    const stake = legs.reduce((s, l) => s + l.stake, 0);
+    const anyPending = legs.some((l) => l.status === "PENDING");
+    const decided = !anyPending && legs.every((l) => l.status === "WON" || l.status === "LOST");
+    const anyWon = legs.some((l) => l.status === "WON");
+    const profit = !decided ? 0 : anyWon ? SHADOW_PACKAGE_WIN_NET : -stake;
+    return {
+      id: `SHADOW:${legs[0].matchId}`,
+      matchId: legs[0].matchId,
+      line: "SHADOW" as ProductionLine,
+      matchLabel: `${m.playerA} × ${m.playerB}`,
+      tournament: m.tournament,
+      tour: m.tour as Tour,
+      surface: m.surface as Surface,
+      legs: legs.map(buildLeg),
+      status: (!decided ? "PENDING" : anyWon ? "WON" : "LOST") as "PENDING" | "WON" | "LOST",
+      stake,
+      profit: Math.round(profit * 100) / 100,
+      createdAt: legs[0].createdAt.toISOString(),
+    } as LedgerMatchRow;
+  });
+
   const groups: LineStats[] = [
     lineStatsOf("DUAL", dualRows),
     lineStatsOf("BANKER", singleRows.filter((r) => r.line === "BANKER")),
@@ -899,28 +956,8 @@ export async function buildLedgerPayload(
     lineStatsOf("ACCUMULATOR", singleRows.filter((r) => r.line === "ACCUMULATOR")),
     lineStatsOf("COMBO", singleRows.filter((r) => r.line === "COMBO")),
     lineStatsOf("SNIPER", sniperRows),
-    lineStatsOf(
-      "SHADOW",
-      all
-        .filter((p) => p.line === "SHADOW")
-        .map((p) => ({
-          id: `SHADOW:${p.id}`,
-          matchId: p.matchId,
-          line: "SHADOW" as ProductionLine,
-          matchLabel: `${p.match.playerA} × ${p.match.playerB}`,
-          tournament: p.match.tournament,
-          tour: p.match.tour as Tour,
-          surface: p.match.surface as Surface,
-          legs: [buildLeg(p)],
-          status: (p.status === "WON" ? "WON" : p.status === "LOST" ? "LOST" : "PENDING") as
-            | "PENDING"
-            | "WON"
-            | "LOST",
-          stake: p.stake,
-          profit: Math.round(wingProfitOf(p.status, p.odds, p.stake) * 100) / 100,
-          createdAt: p.createdAt.toISOString(),
-        }))
-    ),
+    // v13.0 — the shadow line rides the LOSS-AVOIDED counterfactual rows
+    lineStatsOf("SHADOW", shadowRows),
   ];
 
   // ── combined stats (official record only — shadow excluded, match level) ──
