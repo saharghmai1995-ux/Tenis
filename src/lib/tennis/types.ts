@@ -30,6 +30,121 @@ export interface OverlapGateTelemetry {
   netReturnPct: number;
 }
 
+// ─── v12 · In-Memory QQL Query Core + AI Causal RCA types ──────────────────
+/** The TEN official single-button options of the open ATP/WTA pool. */
+export type QqlOptionCode = "T1" | "T2" | "T3" | "T4" | "T5" | "T6" | "T7" | "T8" | "T9" | "T10";
+
+/** The 6 discovered pattern families of the QQL ranking query (v12 §3-3). */
+export type QqlFamilyCode = "F1" | "F2" | "F3" | "F4" | "F5" | "F6";
+
+export interface QqlOptionSpec {
+  code: QqlOptionCode;
+  /** index inside the Monte-Carlo 10×10 option matrix (0..9) */
+  idx: number;
+  marketEn: string;
+  marketFa: string;
+  /** official settlement leg code */
+  leg: string;
+  /** the real-board take window of this option [lo, hi] */
+  boardWindow: [number, number];
+  family: QqlFamilyCode;
+}
+
+/** One evaluated pair of the 45 candidate combinations (candidate_45_tennis_pairs row). */
+export interface QqlPairCandidate {
+  pairCode: string;
+  idxA: number;
+  idxB: number;
+  oddsA: number;
+  oddsB: number;
+  probA: number;
+  probB: number;
+  /** markov_union_prob — exact Monte-Carlo union of the two options */
+  unionProb: number;
+  /** double_win_overlap_prob — exact Monte-Carlo joint (both wings win together) */
+  doubleWinProb: number;
+  impliedSum: number;
+  effectiveOverlapOdds: number;
+  stakeA: number;
+  stakeB: number;
+  /** verified_win_rate = COALESCE(surface_twin_win_rate, union_prob) */
+  verifiedWinRate: number;
+  twinCount: number;
+  score: number;
+  gatePassed: boolean;
+  gateWhy?: string;
+  blockedByRca: boolean;
+  rcaBlockWhy?: string;
+}
+
+/** One AI causal root-cause rule evaluation (tennis_rca_rules row). */
+export interface RcaRuleHit {
+  code: string;
+  fired: boolean;
+  steer?: string;
+  noteFa: string;
+}
+
+export interface QqlDecision {
+  ok: boolean;
+  pairCode: string;
+  family: QqlFamilyCode;
+  familyLabelFa: string;
+  oddsA: number;
+  oddsB: number;
+  stakeA: number;
+  stakeB: number;
+  probA: number;
+  probB: number;
+  unionProb: number;
+  doubleWinProb: number;
+  verifiedWinRate: number;
+  twinCount: number;
+  effectiveOverlapOdds: number;
+  netReturnPct: number;
+  evaluated: number;
+  gatePassedCount: number;
+  topCandidates: QqlPairCandidate[];
+  rca: RcaRuleHit[];
+  /** the executed QQL pipeline summary (Persian) */
+  queryFa: string;
+  /** the twin-evidence trace line (Persian) */
+  traceFa: string;
+  traceEn: string;
+}
+
+export interface QqlFamilyStat {
+  family: QqlFamilyCode;
+  labelFa: string;
+  labelEn: string;
+  picks: number;
+  pending: number;
+  won: number;
+  lost: number;
+  winRate: number;
+  profit: number;
+  staked: number;
+  /** baseline coverage of the family from the settled history */
+  modelCoverage: number;
+}
+
+/** v12 — one settled twin entry of the tennis_historical_warehouse. */
+export interface QqlWarehouseEntry {
+  /** |holdA − holdB| of the settled match (ΔHold twin key) */
+  holdDiff: number;
+  /** copula ρ of the settled match */
+  rho: number;
+  /** 1 = the pair WON (either wing), 0 = lost */
+  winFlag: 0 | 1;
+  /** 1 = BOTH wings won together (the double-win jackpot zone) */
+  doubleWinFlag: 0 | 1;
+  /** match-level net P&L of the settled package */
+  profit: number;
+}
+
+/** v12 — the tennis_historical_warehouse: per surface → per pair_code → settled twins. */
+export type QqlWarehouseSnapshot = Record<Surface, Record<string, QqlWarehouseEntry[]>>;
+
 // ─── v5.0 · Copula-Markov-MonteCarlo Pipeline & 5-Regime Router ────────────
 /** STATION 2 — Gaussian copula dependency telemetry of one match. */
 export interface CopulaTelemetry {
@@ -82,6 +197,13 @@ export interface MonteCarloResult {
   favLoseOver205Set1: number;
   /** P(favorite wins set 1) */
   favWonSet1Prob: number;
+  /** v12 — P(favorite wins set 1 AND set-1 games ≥ 10) — T10 option */
+  favWonSet1Over95: number;
+  // ─── v12 · Quantum 10×10 Combinatorial Solver outputs ─────────────────────
+  /** exact MC probability of each of the 10 official options (T1…T10) */
+  optionProbs: number[];
+  /** exact pairwise co-hit matrix — joint P(T_i ∧ T_j) from the same sim */
+  optionJoint: number[][];
   sigmaMatchWinner: number;
   pFavWinBy55: number;
   pFavWinBy35: number;
@@ -128,6 +250,8 @@ export interface RegimeDecision {
   pattern?: OverlapPatternCode;
   /** v10 — positive-overlap gate telemetry (crown gate of the peak architecture) */
   overlap?: OverlapGateTelemetry;
+  /** v12 — the Quantum 10-option QQL decision behind this package (trace + RCA) */
+  qql?: QqlDecision;
   /** CLUSTER — the three dutched exact scenarios */
   scenarios?: {
     label: string;
@@ -347,8 +471,11 @@ export interface ReverseAnalysis {
 }
 
 export interface Slip {
-  /** v4.0 atomic leg codes: SB-F20 | TS-O25 | SB-P1-20 | SB-P1-21 | TG-O225 | GH-F45 */
+  /** v4.0 atomic leg codes: SB-F20 | TS-O25 | SB-P1-20 | SB-P1-21 | TG-O225 | GH-F45
+   *  v12 QQL codes: T1-SB-F20 | T5-TS-O25 | T6-TG-O205 | … */
   leg: string;
+  /** v12 — index of this leg inside the Quantum 10-option pool (pricing domain) */
+  idx?: number;
   text: string;
   textEn: string;
   odds: number;
@@ -479,6 +606,8 @@ export interface LineItem {
   pipeline?: PipelineTelemetry;
   copula?: CopulaTelemetry;
   monteCarlo?: MonteCarloResult;
+  // ─── v12 · QQL & AI RCA trace ──────────────────────────────────────────
+  qql?: QqlDecision;
 }
 
 export interface LedgerRow {
@@ -600,7 +729,7 @@ export interface BankHistory {
   bestDay?: BankPeriodBucket;
   worstDay?: BankPeriodBucket;
   today: { matches: number; wins: number; losses: number; pnl: number; winRate: number };
-  peak: { bank: number; at: string };
+  peak: { bank: number; at: string; /** v11.0 — Tehran-anchored dd/mm label (no mm/dd ambiguity) */ atLabel: string };
   maxDrawdown: { units: number; pct: number; from: string; to: string };
 }
 
@@ -641,6 +770,8 @@ export interface LedgerPayload {
   bankCurve: BankPoint[];
   /** v6.0 — professional bank-growth analytics (daily/weekly/monthly) */
   bankHistory?: BankHistory;
+  /** v12 — the 6 QQL pattern families of the disjoint ledger */
+  families?: QqlFamilyStat[];
   /** v5.0 — Live Bankroll Audit Inspector (🧮 1,647-unit accounting box) */
   bankAudit?: BankAudit;
 }

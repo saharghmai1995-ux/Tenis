@@ -280,6 +280,19 @@ export function runMonteCarlo(
   let over215 = 0;
   let favLoseOver205Set1 = 0;
   let favWonSet1 = 0;
+  let favWonSet1Over95 = 0;
+
+  // ─── v12 · QUANTUM 10×10 COMBINATORIAL MATRIX ────────────────────────────
+  // Per-run boolean hits of the TEN official single-button options (T1…T10)
+  // + the full pairwise co-hit matrix. The 45 candidate pairs (T_a, T_b) read
+  // their EXACT union & double-win probabilities straight from this matrix —
+  // every pair's coverage is measured on the same 10,000-run simulation, so
+  // the QQL solver never relies on independent-event approximations.
+  const OPT_COUNT = 10;
+  const optionHits = new Array<number>(OPT_COUNT).fill(0);
+  const optionCoHits: number[][] = Array.from({ length: OPT_COUNT }, () =>
+    new Array<number>(OPT_COUNT).fill(0)
+  );
 
   for (let run = 0; run < MC_RUNS; run++) {
     let setsA = 0;
@@ -290,6 +303,7 @@ export function runMonteCarlo(
     let lastWinner: "A" | "B" | null = null;
     let setNo = 1;
     let set1Winner: "A" | "B" | null = null;
+    let set1Games = 0;
     while (setsA < 2 && setsB < 2) {
       // copula coupling — signed momentum toward the previous-set winner
       // (m = +winnerShift when A won, −winnerShift when B won) + set-3 fatigue
@@ -302,6 +316,7 @@ export function runMonteCarlo(
       const gB_eff = gameWinProb(pB_eff);
       const [gA, gB, tb] = simSet(gA_eff, gB_eff);
       if (tb) tbInMatch = true;
+      if (setNo === 1) set1Games = gA + gB;
       gamesA += gA;
       gamesB += gB;
       if (gA > gB) setsA++;
@@ -330,8 +345,34 @@ export function runMonteCarlo(
     if (total >= 22) over215++;
     const favWonSet1Flag = favorite === "A" ? set1Winner === "A" : set1Winner === "B";
     if (favWonSet1Flag) favWonSet1++;
+    if (favWonSet1Flag && set1Games >= 10) favWonSet1Over95++;
     // SRV combo uncovered cell: favorite LOSES ∧ over 20.5 games ∧ fav won set 1
     if (!favWon && total >= 21 && favWonSet1Flag) favLoseOver205Set1++;
+
+    // ── v12 · the 10 official option hits of THIS simulated path ──────────
+    const dogWon20 = !favWon && code === (favorite === "A" ? "0-2" : "2-0");
+    const dogWon21 = !favWon && code === (favorite === "A" ? "1-2" : "2-1");
+    const mask = 0
+      | (favWon && code === (favorite === "A" ? "2-0" : "0-2") ? 1 << 0 : 0) // T1 fav 2-0
+      | (favWon && !dogWon20 && code === (favorite === "A" ? "2-1" : "1-2") ? 1 << 1 : 0) // T2 fav 2-1
+      | (dogWon20 ? 1 << 2 : 0) // T3 player-2 wins 2-0
+      | (dogWon21 ? 1 << 3 : 0) // T4 player-2 wins 2-1
+      | (code === "2-1" || code === "1-2" ? 1 << 4 : 0) // T5 over 2.5 sets
+      | (total >= 21 ? 1 << 5 : 0) // T6 over 20.5 games
+      | (total <= 21 ? 1 << 6 : 0) // T7 under 21.5 games
+      | (favWon && margin >= 4 ? 1 << 7 : 0) // T8 fav −3.5 games
+      | (margin <= 3 ? 1 << 8 : 0) // T9 underdog +3.5 games
+      | (favWonSet1Flag && set1Games >= 10 ? 1 << 9 : 0); // T10 fav wins 1st set & over 9.5 games
+    for (let i = 0; i < OPT_COUNT; i++) {
+      if ((mask & (1 << i)) === 0) continue;
+      optionHits[i]++;
+      for (let j = i + 1; j < OPT_COUNT; j++) {
+        if ((mask & (1 << j)) !== 0) {
+          optionCoHits[i][j]++;
+          optionCoHits[j][i]++;
+        }
+      }
+    }
   }
 
   const n = MC_RUNS;
@@ -459,6 +500,12 @@ export function runMonteCarlo(
     favWinShareOver205: pFavWin > 0 ? (favWinOver205 / n) / pFavWin : 0,
     favLoseOver205Set1: favLoseOver205Set1 / n,
     favWonSet1Prob: favWonSet1 / n,
+    // ─── v12 · Quantum 10×10 combinatorial outputs ────────────────────────
+    favWonSet1Over95: favWonSet1Over95 / n,
+    optionProbs: optionHits.map((h) => Math.round((h / n) * 100000) / 100000),
+    optionJoint: optionCoHits.map((row, i) =>
+      row.map((c, j) => (i === j ? optionHits[i] / n : Math.round((c / n) * 100000) / 100000))
+    ),
     sigmaMatchWinner,
     pFavWinBy55: marginSum6 / n,
     pFavWinBy35: marginSum4 / n,

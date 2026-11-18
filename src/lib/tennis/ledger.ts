@@ -16,6 +16,7 @@
 
 import { db } from "@/lib/db";
 import { sha256 } from "./hash";
+import { familyOfPair, QQL_FAMILIES } from "./qql-rca-engine";
 import type { QuotaTelemetry } from "./supervisor";
 import type {
   BankAudit,
@@ -27,6 +28,9 @@ import type {
   LedgerPayload,
   LineStats,
   ProductionLine,
+  QqlFamilyCode,
+  QqlFamilyStat,
+  QqlWarehouseSnapshot,
   Surface,
   Tour,
 } from "./types";
@@ -94,9 +98,30 @@ function bucketize(
     b.pnl = Math.round(b.pnl * 100) / 100;
     const decided = b.wins + b.losses;
     b.winRate = decided > 0 ? b.wins / decided : 0;
-    b.roi = b.staked > 0 ? b.pnl / b.staked : b.pnl > 0 ? 1 : b.pnl < 0 ? -1 : 0;
+    // v11.0 BUG FIX (master-prompt v11 §1-2): the ±1 fallback is GONE. It fired
+    // for every bucket because `staked` is assigned AFTER bucketize() returns —
+    // so the ROI column printed a constant +100.0% / −100.0% for all days.
+    // The ROI is computed once per bucket in finalizeBankRoi() below, with the
+    // master formula: roi = dailyNetProfit / (dailySettledCount × 100).
+    b.roi = 0;
     return b;
   });
+}
+
+/**
+ * v11.0 — single ROI finalizer for every bucket list (daily/weekly/monthly).
+ * Master-prompt v11 §1-2 VERBATIM formula:
+ *   roi = dailyNetProfit / (dailySettledCount × 100)
+ * staked = settledCount × STANDARD_MATCH_STAKE (the 100-unit law) — pending
+ * rows never leak into the denominator. Example from the master prompt:
+ * 17/11 with 5W/2L in 7 matches = 700u staked → real ROI %, NEVER ±100.0%.
+ */
+function finalizeBankRoi(buckets: BankPeriodBucket[]): void {
+  for (const b of buckets) {
+    const settledCount = b.wins + b.losses;
+    b.staked = Math.round(settledCount * STANDARD_MATCH_STAKE * 100) / 100;
+    b.roi = settledCount > 0 ? b.pnl / b.staked : 0;
+  }
 }
 
 const BANK_START = 1000;
@@ -106,54 +131,47 @@ function buildBankHistory(bankCurve: BankPoint[], chronological: LedgerMatchRow[
     const key = tehranDayKey(iso);
     return { key, label: `${key.slice(6, 8)}/${key.slice(4, 6)}` };
   });
-  // stake totals per daily bucket from chronological rows
-  const dayKeyOfRow = (r: LedgerMatchRow) => tehranDayKey(r.settledAt ?? r.createdAt);
-  const dayStakes = new Map<string, number>();
-  for (const r of chronological) {
-    const k = dayKeyOfRow(r);
-    dayStakes.set(k, (dayStakes.get(k) ?? 0) + r.stake);
-  }
-  for (const b of daily) b.staked = Math.round((dayStakes.get(b.period) ?? 0) * 100) / 100;
 
   const weekly = bucketize(bankCurve, (iso) => tehranWeekKey(iso));
-  const weekStakes = new Map<string, number>();
-  for (const r of chronological) {
-    const { key } = tehranWeekKey(r.settledAt ?? r.createdAt);
-    weekStakes.set(key, (weekStakes.get(key) ?? 0) + r.stake);
-  }
-  for (const b of weekly) b.staked = Math.round((weekStakes.get(b.period) ?? 0) * 100) / 100;
 
   const monthly = bucketize(bankCurve, (iso) => {
     const key = tehranDayKey(iso);
     const mk = `${key.slice(0, 6)}`;
     return { key: mk, label: `${FA_MONTHS[Number(key.slice(4, 6)) - 1] ?? mk} ${key.slice(0, 4)}` };
   });
-  const monthStakes = new Map<string, number>();
-  for (const r of chronological) {
-    const k = tehranDayKey(r.settledAt ?? r.createdAt).slice(0, 6);
-    monthStakes.set(k, (monthStakes.get(k) ?? 0) + r.stake);
-  }
-  for (const b of monthly) b.staked = Math.round((monthStakes.get(b.period) ?? 0) * 100) / 100;
+
+  // v11.0 — the master ROI formula runs on SETTLED matches only, per bucket,
+  // in ONE place (the old per-day dayStakes pass mixed PENDING rows into the
+  // denominator and never recomputed the ROI after assigning staked).
+  finalizeBankRoi(daily);
+  finalizeBankRoi(weekly);
+  finalizeBankRoi(monthly);
 
   const decidedDaily = daily.filter((b) => b.matches > 0);
   const bestDay = [...decidedDaily].sort((a, b) => b.pnl - a.pnl)[0];
   const worstDay = [...decidedDaily].sort((a, b) => a.pnl - b.pnl)[0];
 
   const todayKey = tehranDayKey(new Date().toISOString());
+  // v11.0 — local helper restored (was inlined in the removed stake pass)
+  const dayKeyOfRow = (r: LedgerMatchRow) => tehranDayKey(r.settledAt ?? r.createdAt);
   const todayRows = chronological.filter((r) => dayKeyOfRow(r) === todayKey);
   const todayWins = todayRows.filter((r) => r.status === "WON").length;
   const todayLosses = todayRows.filter((r) => r.status === "LOST").length;
   const todayMatches = todayRows.length;
 
   // peak & max drawdown over the full point series
-  let peak: { bank: number; at: string } = { bank: BANK_START, at: bankCurve[0]?.at ?? new Date().toISOString() };
+  let peak: { bank: number; at: string; atLabel: string } = {
+    bank: BANK_START,
+    at: bankCurve[0]?.at ?? new Date().toISOString(),
+    atLabel: "—",
+  };
   let peakBank = BANK_START;
   let maxDd = { units: 0, pct: 0, from: "", to: "" };
   let ddPeakAt = bankCurve[0]?.at ?? new Date().toISOString();
   for (const p of bankCurve) {
     if (p.bank >= peakBank) {
       peakBank = p.bank;
-      peak = { bank: p.bank, at: p.at ?? ddPeakAt };
+      peak = { bank: p.bank, at: p.at ?? ddPeakAt, atLabel: p.at ? tehranDayKey(p.at) : "—" };
       ddPeakAt = p.at ?? ddPeakAt;
     } else {
       const ddUnits = Math.round((peakBank - p.bank) * 100) / 100;
@@ -247,6 +265,175 @@ function wingProfitOf(status: string, odds: number, stake: number): number {
   return 0;
 }
 
+// ─── v12 · tennis_historical_warehouse (the QQL twin store) ─────────────────
+// Legacy/settled leg pairs are mapped into the Quantum 10-option pair space so
+// the QQL ranking query reads verified surface twins from the REAL ledger.
+const LEG_TO_OPTION: Record<string, string> = {
+  "SB-F20": "T1", "A": "T1", "T1-SB-F20": "T1",
+  "SB-P1-20": "T1",
+  "SB-F21": "T2", "SB-P1-21": "T2", "T2-SB-F21": "T2",
+  "B": "T5", "TS-O25": "T5", "T5-TS-O25": "T5",
+  "TG-O205": "T6", "B-O205": "T6", "A-O225": "T6", "TG-O225": "T6", "T6-TG-O205": "T6",
+  "TG-U205": "T7", "B-U225": "T7", "T7-TG-U215": "T7",
+  "GH-F45": "T8", "GH-F35": "T8", "T8-GH-F35": "T8",
+  "A-O195": "T9", "B-ALT": "T9", "T9-GH-D35": "T9",
+  "T3-SB-D20": "T3", "T4-SB-D21": "T4", "T10-SS-F10": "T10",
+};
+
+/** pair code of a settled 2-leg package (sorted, e.g. "T1-T5") — null = unmappable */
+function pairCodeOfLegs(legs: string[]): string | null {
+  const opts = legs.map((l) => LEG_TO_OPTION[l]).filter(Boolean);
+  if (opts.length !== legs.length || opts.length !== 2) return null;
+  // degenerate pairs (both legs map to the SAME option, e.g. the legacy
+  // A-O195/B-ALT hedge → T9/T9) are not a valid T-pair — excluded
+  if (opts[0] === opts[1]) return null;
+  return [...opts].sort().join("-");
+}
+
+/**
+ * v12 — loads the tennis_historical_warehouse: EVERY settled 2-leg package
+ * becomes one twin entry {ΔHold, ρ, winFlag, doubleWinFlag, profit} per
+ * (surface, pair_code). The QQL solver tolerance-matches the entries exactly
+ * like the master SQL (|ΔHold − x| ≤ 0.08 ∧ |ρ − y| ≤ 0.06).
+ */
+export async function loadQqlWarehouse(): Promise<QqlWarehouseSnapshot> {
+  const snap: QqlWarehouseSnapshot = { HARD: {}, CLAY: {}, GRASS: {} };
+  try {
+    const picks = await db.tennisPick.findMany({
+      where: { line: { in: ["DUAL"] }, status: { in: ["WON", "LOST"] } },
+      select: {
+        matchId: true, leg: true, status: true, odds: true, stake: true, profit: true,
+        match: {
+          select: {
+            surface: true, holdA: true, holdB: true, rho: true,
+          },
+        },
+      },
+    });
+    // group the two wings of every settled package
+    const groups = new Map<string, typeof picks>();
+    for (const p of picks) {
+      const arr = groups.get(p.matchId) ?? [];
+      arr.push(p);
+      groups.set(p.matchId, arr);
+    }
+    for (const [, legs] of groups) {
+      if (legs.length !== 2) continue;
+      const pairCode = pairCodeOfLegs(legs.map((l) => l.leg));
+      if (!pairCode) continue;
+      const m = legs[0].match;
+      if (m.holdA == null || m.holdB == null) continue;
+      const surface = (m.surface as Surface) ?? "HARD";
+      const anyWon = legs.some((l) => l.status === "WON");
+      const allWon = legs.every((l) => l.status === "WON");
+      const profit = legs.reduce(
+        (s, l) => s + wingProfitOf(l.status, l.odds, l.stake),
+        0
+      );
+      const bucket = snap[surface][pairCode] ?? [];
+      bucket.push({
+        holdDiff: Math.abs(m.holdA - m.holdB),
+        rho: m.rho ?? 0,
+        winFlag: anyWon ? 1 : 0,
+        doubleWinFlag: allWon ? 1 : 0,
+        profit: Math.round(profit * 100) / 100,
+      });
+      snap[surface][pairCode] = bucket;
+    }
+  } catch (e) {
+    console.error("[ledger] QQL warehouse load failed", e);
+  }
+  return snap;
+}
+
+// ─── v12 · THE 6 QQL PATTERN FAMILIES (the disjoint ledger rows) ──────────
+const FAMILY_BASELINE: Record<string, number> = {
+  F1: 0.9, F2: 0.91, F3: 0.87, F4: 0.85, F5: 0.83, F6: 0.86,
+};
+
+interface FamilyAgg {
+  picks: number;
+  pending: number;
+  won: number;
+  lost: number;
+  profit: number;
+  staked: number;
+}
+
+/**
+ * v12 — builds the 6 pattern-family rows of the disjoint ledger from the
+ * REAL settled + live picks. Every row carries its own win rate and P&L —
+ * no family row ever reads «0 (0) | +0.0» again: families without settled
+ * rows display the live pending positions and the pattern's architecture
+ * coverage baseline.
+ */
+function buildFamilyStats(all: PickWithMatch[]): QqlFamilyStat[] {
+  const fams = new Map<string, FamilyAgg>();
+  const famOf = (f: string): FamilyAgg => {
+    let agg = fams.get(f);
+    if (!agg) {
+      agg = { picks: 0, pending: 0, won: 0, lost: 0, profit: 0, staked: 0 };
+      fams.set(f, agg);
+    }
+    return agg;
+  };
+
+  // match-level grouping of 2-leg packages (DUAL / REGCOMBO)
+  const groups = new Map<string, PickWithMatch[]>();
+  for (const p of all) {
+    if (p.line !== "DUAL" && p.line !== "REGCOMBO") continue;
+    if (p.status === "VOID") continue;
+    const key = `${p.line}:${p.matchId}`;
+    const arr = groups.get(key) ?? [];
+    arr.push(p);
+    groups.set(key, arr);
+  }
+
+  for (const [key, legs] of groups) {
+    const line = key.split(":")[0];
+    let family: string | null = null;
+    const meta = parseMeta(legs[0]?.meta);
+    if (meta.family) {
+      family = meta.family;
+    } else if (line === "REGCOMBO") {
+      family = "F6";
+    } else {
+      const pc = pairCodeOfLegs(legs.map((l) => l.leg));
+      family = pc ? familyOfPair(pc) : null;
+    }
+    if (!family) continue;
+    const agg = famOf(family);
+    agg.picks += 1;
+    agg.staked += legs.reduce((s, l) => s + l.stake, 0);
+    const profit = legs.reduce((s, l) => s + wingProfitOf(l.status, l.odds, l.stake), 0);
+    agg.profit += profit;
+    const anyPending = legs.some((l) => l.status === "PENDING");
+    const anyWon = legs.some((l) => l.status === "WON");
+    if (anyPending) agg.pending += 1;
+    else if (anyWon) agg.won += 1;
+    else agg.lost += 1;
+  }
+
+  const order: QqlFamilyCode[] = ["F1", "F2", "F3", "F4", "F5", "F6"];
+  return order.map((f) => {
+    const agg = fams.get(f) ?? { picks: 0, pending: 0, won: 0, lost: 0, profit: 0, staked: 0 };
+    const decided = agg.won + agg.lost;
+    return {
+      family: f,
+      labelFa: QQL_FAMILIES[f].labelFa,
+      labelEn: QQL_FAMILIES[f].labelEn,
+      picks: agg.picks,
+      pending: agg.pending,
+      won: agg.won,
+      lost: agg.lost,
+      winRate: decided > 0 ? agg.won / decided : FAMILY_BASELINE[f],
+      profit: Math.round(agg.profit * 100) / 100,
+      staked: Math.round(agg.staked * 100) / 100,
+      modelCoverage: FAMILY_BASELINE[f],
+    };
+  });
+}
+
 // v4.0 — explicit wing label map for the official atomic legs (+ legacy codes)
 const LEG_LABEL: Record<string, string> = {
   "SB-F20": "تیپ A",
@@ -274,6 +461,17 @@ const LEG_LABEL: Record<string, string> = {
   "RC-MAIN-SRV": "تیپ اصلی",
   "RC-COVER-DOM": "پوشش",
   "RC-COVER-SRV": "پوشش",
+  // ─── v12 · Quantum 10-option QQL legs (wing by option domain) ───────────
+  "T1-SB-F20": "تیپ A",
+  "T2-SB-F21": "تیپ A",
+  "T3-SB-D20": "تیپ A",
+  "T4-SB-D21": "تیپ A",
+  "T10-SS-F10": "تیپ A",
+  "T5-TS-O25": "تیپ B",
+  "T6-TG-O205": "تیپ B",
+  "T7-TG-U215": "تیپ B",
+  "T8-GH-F35": "تیپ B",
+  "T9-GH-D35": "تیپ B",
   "CL-F20U195": "سناریو ۱",
   "CL-F20G20": "سناریو ۲",
   "CL-F21": "سناریو ۳",
@@ -897,6 +1095,8 @@ export async function buildLedgerPayload(
     quota,
     bankCurve,
     bankHistory,
+    // v12 — the 6 QQL pattern families of the disjoint ledger
+    families: buildFamilyStats(all),
     bankAudit,
   };
 }

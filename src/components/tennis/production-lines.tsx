@@ -36,6 +36,7 @@ import type {
   CrownInfo,
   FeedPayload,
   LineItem,
+  QqlDecision,
   RegimeDecision,
   Surface,
 } from "@/lib/tennis/types";
@@ -163,7 +164,9 @@ function MiniBar({ label, value }: { label: string; value: number }) {
           style={{ width: `${pct}%` }}
         />
       </div>
-      <span className="mono-num w-9 text-right">{Math.round(value * 100)}%</span>
+      {/* v11/v12 — one-decimal telemetry: the per-player continuous values make
+          every card's Hold % / BP Saved % unique (no repeated 81%/55% template) */}
+      <span className="mono-num w-11 text-right">{(value * 100).toFixed(1)}%</span>
     </div>
   );
 }
@@ -765,6 +768,98 @@ function FlashFooter({ item, matchLabel }: { item: LineItem; matchLabel: string 
   );
 }
 
+// ─── v12 · Quantum pattern line + 🧠 AI RCA & QQL trace box ───────────────────
+
+/** Persian-digit formatter for the quantum telemetry (۹۱.۶٪) */
+const faNum = (s: string | number): string =>
+  String(s).replace(/[0-9]/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[+d]);
+
+/** ⚛️ the quantum pattern code of THIS match (v11 §3 — verbatim format) */
+function QuantumPatternLine({ qql, combo }: { qql?: QqlDecision; combo?: boolean }) {
+  if (!combo && !qql) return null;
+  if (combo) {
+    return (
+      <div className="rounded-xl border border-cyan-400/25 bg-cyan-400/[0.06] px-3 py-2 text-center">
+        <span className="text-[10.5px] font-bold text-cyan-200">
+          {"⚛️ بهینه‌ساز کوانتومی از ۴۵ ترکیب: [خانواده ۶ — کمبوی کاپولا + پوشش] • جرم مشترک کاپولا در ۱۰٬۰۰۰ شبیه‌سازی"}
+        </span>
+      </div>
+    );
+  }
+  const pair = (qql?.pairCode ?? "").split("-").join(" ↔ ");
+  return (
+    <div className="rounded-xl border border-violet-400/30 bg-violet-400/[0.08] px-3 py-2 text-center">
+      <span className="text-[10.5px] font-bold text-violet-200">
+        {"⚛️ بهینه‌ساز کوانتومی از "}
+        <span className="mono-num" dir="ltr">{faNum(45)}</span>
+        {" ترکیب: ["}
+        <span className="mono-num font-black text-white" dir="ltr">{pair}</span>
+        {"] • پوشش مونت‌کارلو: "}
+        <span className="mono-num text-emerald-300" dir="ltr">{faNum(((qql?.unionProb ?? 0) * 100).toFixed(1))}٪</span>
+        {" • ناحیه برد دوبل: "}
+        <span className="mono-num text-amber-300" dir="ltr">{faNum(((qql?.doubleWinProb ?? 0) * 100).toFixed(1))}٪</span>
+      </span>
+    </div>
+  );
+}
+
+/** 🧠 the AI RCA & QQL trace box on every flashcard (v12 §3-2 — verbatim format) */
+function QqlTraceBox({ qql }: { qql?: QqlDecision }) {
+  if (!qql || !qql.ok) return null;
+  const fired = qql.rca.filter((r) => r.fired);
+  return (
+    <div className="rounded-xl border border-white/12 bg-black/30 p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="flex items-center gap-1.5 text-[11px] font-black text-white">
+          🧠 تحلیل ریشه‌ای و کوئری انتخاب تیپ (AI RCA &amp; QQL Trace)
+        </span>
+        <Badge variant="outline" className="border-emerald-400/40 bg-emerald-400/10 text-[9.5px] text-emerald-300">
+          {"از "}
+          <span className="mono-num" dir="ltr">{faNum(qql.evaluated)}</span>
+          {" ترکیب — "}
+          <span className="mono-num" dir="ltr">{faNum(qql.gatePassedCount)}</span>
+          {" عبور از فیلتر طلایی"}
+        </Badge>
+      </div>
+      <p className="mt-2 text-[11px] leading-5 text-white/85">{qql.traceFa}</p>
+      {fired.length > 0 && (
+        <div className="mt-2 space-y-1">
+          {fired.map((r) => (
+            <div
+              key={r.code}
+              className="rounded-lg border border-amber-300/25 bg-amber-300/[0.07] px-2.5 py-1.5"
+            >
+              <div className="flex flex-wrap items-center gap-1.5">
+                <BadgeCheck className="h-3 w-3 shrink-0 text-amber-300" />
+                <span className="mono-num text-[9.5px] font-bold text-amber-200" dir="ltr">
+                  {r.code}
+                </span>
+                {r.steer && (
+                  <span className="mono-num text-[9.5px] text-emerald-300" dir="ltr">
+                    steer → {r.steer}
+                  </span>
+                )}
+              </div>
+              <p className="mt-0.5 text-[10px] leading-4 text-white/70">{r.noteFa}</p>
+            </div>
+          ))}
+        </div>
+      )}
+      <details className="mt-2">
+        <summary className="cursor-pointer text-[10px] text-cyan-300/80 hover:text-cyan-200">
+          💻 مشاهده کوئری اجراشده QQL
+        </summary>
+        <p className="mt-1.5 rounded-lg border border-white/10 bg-black/40 p-2 text-[9.5px] leading-4 text-white/70">
+          {qql.queryFa}
+        </p>
+        <p className="mono-num mt-1 text-[9px] leading-4 text-white/50" dir="ltr">
+          {qql.traceEn}
+        </p>
+      </details>
+    </div>
+  );
+}
+
 // ─── v5.0 regime-aware badges row (crown + pipeline + regime) ─────────────
 
 function RegimeBadges({ item }: { item: LineItem }) {
@@ -796,6 +891,11 @@ function DualFlashcard({ pair }: { pair: { A: LineItem; B: LineItem } }) {
           <OverlapGateChip item={A} />
         </div>
         <V5Panel item={A} />
+        {/* v12 — the ⚛️ quantum pattern code + 🧠 RCA & QQL trace of this match */}
+        <div className="mt-3 space-y-2">
+          <QuantumPatternLine qql={A.qql} />
+          <QqlTraceBox qql={A.qql} />
+        </div>
         <div className="mt-3 space-y-2.5">
           <MarketBox
             tone="A"
@@ -852,6 +952,11 @@ function RegComboCard({ pair }: { pair: { main: LineItem; cover: LineItem } }) {
         <V5Panel item={main} />
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <OverlapGateChip item={main} />
+        </div>
+        {/* v12 — the ⚛️ quantum pattern line + 🧠 RCA & QQL trace (family F6) */}
+        <div className="mt-3 space-y-2">
+          <QuantumPatternLine combo />
+          <QqlTraceBox qql={main.qql} />
         </div>
         <div className="mt-3 space-y-2.5">
           <MarketBox tone="violet" wingLabel="کمبوی رسمی تک‌دکمه (تیپ اصلی)" item={main} />

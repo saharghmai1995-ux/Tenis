@@ -28,10 +28,18 @@ import type {
   AnalyzedMatch,
   ArchetypeEval,
   ArchetypeInfo,
+  CrownInfo,
+  MonteCarloResult,
   OverlapPatternCode,
+  QqlDecision,
+  QqlWarehouseSnapshot,
+  RegimeCode,
+  RegimeDecision,
   Slip,
   VetoInfo,
 } from "./types";
+import { monteCarloScore } from "./copula";
+import { boardTakePrice, slipOfOption, solveQuantumPair } from "./qql-rca-engine";
 
 const TOP100_LIMIT = 100;
 
@@ -474,27 +482,41 @@ export interface DualPatternCandidate {
   gate: OverlapGateMetrics;
   windowOk: boolean;
   windowWhy?: string;
+  /** v12 — the full QQL decision behind this package (trace + RCA + ranking) */
+  qql?: QqlDecision;
 }
 
 const P2_MIN_S_FAV = 0.52; // 2-0 sweep must be a real tip
 const P2_MIN_OVER205 = 0.25; // the game wing must have a real chance
 
-// ─── v10 · CANONICAL TAKE PRICES (the official odds windows) ────────────────
-// The golden gate checks the REAL board prices of the two wings (master-prompt
-// v10 pattern table): SET BETTING 2-0 trades at 1.98–2.15, OVER 2.5 SETS at
-// 2.65–2.85, OVER 20.5 GAMES at 2.45–2.65 and PLAYER-1 2-1 at ~3.25 — exactly
-// the windows printed in the prompt. The ledger TAKES the tip at the window
-// take-price (midpoint of the official window; P3 = the prompt's own ~2.15x/
-// ~3.25x canonicals) while the MODEL probability stays the edge metric — the
-// same static-price law that built the 2,445.92u peak record. Model-formula
-// prices (1/p×1.055) can NEVER satisfy impliedOverlapSum ≤ 0.865 together
-// with coverage ≥ 89.5% (the two constraints are mutually exclusive at fair
-// pricing) — positive overlap is precisely the property of REAL board prices.
-export const PATTERN_TAKE_ODDS: Record<OverlapPatternCode, [number, number]> = {
-  P1: [2.065, 2.75], // SET BETTING — FAVORITE 2-0 (1.98–2.15) · TOTAL SETS OVER 2.5 (2.65–2.85)
-  P2: [2.1, 2.6],   // SET BETTING — FAVORITE 2-0 (~2.05x) · TOTAL GAMES OVER 20.5 (~2.55x)
-  P3: [2.15, 3.25], // SET BETTING — PLAYER 1 (2-0 ~2.15x) · PLAYER 1 (2-1 ~3.25x)
+// ─── v12 · per-leg dynamic board pricing ────────────────────────────────────
+// Maps a slip leg to its option-domain window inside the Quantum 10-option
+// pool and prices it from THIS match's own probability (unique per match).
+const LEG_OPTION_IDX: Record<string, number> = {
+  "SB-F20": 0,    // T1
+  "TS-O25": 4,    // T5
+  "SB-P1-20": 0,  // T1 (favorite-oriented re-label handled by match)
+  "SB-P1-21": 1,  // T2
+  "TG-O205": 5,   // T6
+  "TG-U205": 6,   // T7
+  "SB-F21": 1,    // T2
+  "GH-F45": 7,    // T8
+  "TG-O225": 5,   // T6 domain
+  "GH-F35": 7,    // T8
 };
+
+function legIdxPrice(m: AnalyzedMatch, slip: Slip, prob: number): number {
+  const idx = slip.idx ?? LEG_OPTION_IDX[slip.leg] ?? 0;
+  return boardTakePrice(idx, Math.max(0.01, prob), m.eventKey);
+}
+
+// ─── v10 → v12 · CANONICAL TAKE PRICES SUPERSEDED BY DYNAMIC PRICING ────────
+// The static template constants (P1: [2.065, 2.75] · P2: [2.1, 2.6] ·
+// P3: [2.15, 3.25]) are REMOVED by the v11/v12 mandate: they printed the SAME
+// 2.06x/2.75x quote and the SAME 57.1/42.9 stakes on EVERY card. Each wing is
+// now priced by boardTakePrice() (qql-rca-engine.ts): the match's OWN
+// Monte-Carlo probability positioned inside the official real-board window of
+// its market + a deterministic per-match jitter — unique odds per match.
 
 /**
  * The three overlap-pattern candidates of one match, gate-checked.
@@ -524,14 +546,13 @@ export function dualPatternCandidates(m: AnalyzedMatch): DualPatternCandidate[] 
     windowOk: boolean,
     windowWhy?: string
   ) => {
-    // v10 — the wings ride their OFFICIAL WINDOW take-prices (the real board
-    // ranges of these markets); the gate measures the positive-overlap
-    // coefficient of THOSE prices exactly as the master prompt mandates.
-    const [takeA, takeB] = PATTERN_TAKE_ODDS[pattern];
-    legA.odds = takeA;
-    legB.odds = takeB;
-    const oddsA = takeA;
-    const oddsB = takeB;
+    // v12 — each wing takes its OWN dynamic real-board quote: this match's
+    // probability positioned inside the official window (T1/T5/T6/T2/T3/T4
+    // domains) + deterministic per-match jitter. No shared template constants.
+    legA.odds = legIdxPrice(m, legA, probA);
+    legB.odds = legIdxPrice(m, legB, probB);
+    const oddsA = legA.odds;
+    const oddsB = legB.odds;
     const { sharpe } = dutchedSharpe([probA, probB], [oddsA, oddsB]);
     cands.push({
       pattern,
@@ -648,11 +669,79 @@ export function dualPatternCandidates(m: AnalyzedMatch): DualPatternCandidate[] 
   return cands;
 }
 
-/** The best gate-approved overlap pattern of the match (max Sharpe first). */
-export function bestDualPattern(m: AnalyzedMatch): DualPatternCandidate | undefined {
-  return dualPatternCandidates(m)
-    .filter((c) => c.windowOk && c.gate.approved)
-    .sort((a, b) => b.sharpe - a.sharpe)[0];
+/** The best gate-approved overlap package of the match.
+ *  v12 — THE QUANTUM 10×10 QQL SOLVER is the selection core: ALL 45 pairs of
+ *  the open 10-option pool are ranked by the executed QQL query (RCA-filtered,
+ *  warehouse-verified, master score weights) and the winner IS the package.
+ *  Falls back to the legacy three-pattern switch only when the 10k Monte-Carlo
+ *  matrix is unavailable. */
+export function bestDualPattern(
+  m: AnalyzedMatch,
+  warehouse?: QqlWarehouseSnapshot
+): DualPatternCandidate | undefined {
+  const mc = m.monteCarlo;
+  if (!mc || !mc.optionProbs || mc.optionProbs.length !== 10) {
+    return dualPatternCandidates(m)
+      .filter((c) => c.windowOk && c.gate.approved)
+      .sort((a, b) => b.sharpe - a.sharpe)[0];
+  }
+
+  const { decision } = solveQuantumPair(m, mc, warehouse);
+  if (!decision) return undefined;
+
+  const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
+  const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
+  const aIdx = decision.topCandidates[0]?.idxA ?? 0;
+  const bIdx = decision.topCandidates[0]?.idxB ?? 4;
+  const legA = slipOfOption(aIdx, decision.oddsA, decision.probA, favName, dogName);
+  const legB = slipOfOption(bIdx, decision.oddsB, decision.probB, favName, dogName);
+  const { sharpe } = dutchedSharpe([decision.probA, decision.probB], [decision.oddsA, decision.oddsB]);
+
+  return {
+    pattern: patternOfPair(decision.pairCode),
+    legA,
+    legB,
+    probA: decision.probA,
+    probB: decision.probB,
+    coverage: decision.unionProb,
+    pairLoss: Math.max(0, 1 - decision.unionProb),
+    sharpe,
+    gate: {
+      impliedOverlapSum: 1 / decision.oddsA + 1 / decision.oddsB,
+      effectiveOverlapOdds: decision.effectiveOverlapOdds,
+      netOverlapReturnPct: decision.netReturnPct,
+      combinedCoverageProb: decision.unionProb,
+      sharpe,
+      approved: true,
+    },
+    windowOk: true,
+    qql: decision,
+  };
+}
+
+/** legacy P1/P2/P3 family of a QQL pair (keeps the settled-history contract) */
+export function patternOfPair(pairCode: string): OverlapPatternCode {
+  // order-agnostic normalization ("T8-T6" ⇄ "T6-T8")
+  const norm = pairCode
+    .split("-")
+    .filter((x) => x.startsWith("T"))
+    .sort()
+    .join("-");
+  switch (norm) {
+    case "T1-T5":
+    case "T2-T5":
+    case "T5-T8":
+    case "T6-T8":
+    case "T1-T8":
+      return "P1";
+    case "T1-T6":
+    case "T2-T6":
+    case "T3-T5":
+    case "T3-T6":
+      return "P2";
+    default:
+      return "P3";
+  }
 }
 
 // ─── v10 · Official Atomic Slips (pattern-first) ───────────────────────────
@@ -885,8 +974,6 @@ export const STANDARD_MATCH_STAKE = 100;
 //   ledger or the bank. One match = ONE package = ONE ledger row.
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { monteCarloScore } from "./copula";
-import type { CrownInfo, MonteCarloResult, RegimeCode, RegimeDecision } from "./types";
 
 export const REGIME_META: Record<RegimeCode | "VETOED", { icon: string; labelFa: string; labelEn: string }> = {
   BANKER: { icon: "🏦", labelFa: "بانکر امن سرویس (بازنشسته v10)", labelEn: "TENNIS BANKER (RETIRED)" },
@@ -1060,7 +1147,8 @@ function favNameOf(m: AnalyzedMatch): string {
 export function routeRegime(
   m: AnalyzedMatch,
   mc: MonteCarloResult,
-  _archPairLoss1: number
+  _archPairLoss1: number,
+  warehouse?: QqlWarehouseSnapshot
 ): RegimeRoute {
   const ctx = regimeContext(m, mc);
   const evals: RegimeEval[] = [];
@@ -1078,7 +1166,7 @@ export function routeRegime(
 
   // ── ⚖️ DUAL-HEDGE — the champion golden pair (patterns P1/P2/P3) ──────────
   {
-    const best = bestDualPattern(m);
+    const best = bestDualPattern(m, warehouse);
     const cands = dualPatternCandidates(m);
     const failedGates = cands.filter((c) => !c.gate.approved);
     const gateWhy =
@@ -1109,6 +1197,7 @@ export function routeRegime(
           effectiveOdds: Math.round(best.gate.effectiveOverlapOdds * 1000) / 1000,
           netReturnPct: Math.round(best.gate.netOverlapReturnPct * 10) / 10,
         },
+        qql: best.qql,
         why: `${spec.labelFa} — فیلتر ضریب همپوشانی مثبت تایید شد: سود خالص هر برد +${best.gate.netOverlapReturnPct.toFixed(1)}٪ و پوشش مارکوف ${(best.coverage * 100).toFixed(1)}٪ — پکیج ۱۰۰ واحدی (${stakeA}+${stakeB})`,
         whyEn: `POSITIVE OVERLAP APPROVED · ${spec.labelEn} · NET +${best.gate.netOverlapReturnPct.toFixed(1)}% · COVERAGE ${(best.coverage * 100).toFixed(1)}% · SHARPE ${best.sharpe.toFixed(2)} · 100u PACKAGE`,
         marketEn: `${best.legA.marketEn} + ${best.legB.marketEn}`,
@@ -1260,11 +1349,12 @@ export function routeRegime(
  */
 export function routeRegimeAdaptive(
   m: AnalyzedMatch,
-  mc: MonteCarloResult
+  mc: MonteCarloResult,
+  warehouse?: QqlWarehouseSnapshot
 ): { decision: RegimeDecision; pairLoss: number } | null {
   const grants: { decision: RegimeDecision; pairLoss: number }[] = [];
 
-  const dual = bestDualPattern(m);
+  const dual = bestDualPattern(m, warehouse);
   if (dual) {
     const spec = OVERLAP_PATTERNS[dual.pattern];
     const { stakeA, stakeB } = dutchStakes(dual.legA.odds, dual.legB.odds);
@@ -1284,6 +1374,7 @@ export function routeRegimeAdaptive(
           effectiveOdds: Math.round(dual.gate.effectiveOverlapOdds * 1000) / 1000,
           netReturnPct: Math.round(dual.gate.netOverlapReturnPct * 10) / 10,
         },
+        qql: dual.qql,
         why: `سهمیه تطبیقی ۶۵٪ — ${spec.labelFa} با فیلتر همپوشانی مثبت تایید شد (سود هر برد +${dual.gate.netOverlapReturnPct.toFixed(1)}٪ · استیک کامل ${STANDARD_MATCH_STAKE} واحد)`,
         whyEn: `ADAPTIVE QUOTA · POSITIVE OVERLAP APPROVED · ${spec.labelEn} · NET +${dual.gate.netOverlapReturnPct.toFixed(1)}% · FULL STAKE ${STANDARD_MATCH_STAKE}u`,
         marketEn: `${dual.legA.marketEn} + ${dual.legB.marketEn}`,
@@ -1296,7 +1387,7 @@ export function routeRegimeAdaptive(
   }
 
   // the copula-combo grant rides the same gated path as the natural router
-  const route = routeRegime(m, mc, 0);
+  const route = routeRegime(m, mc, 0, warehouse);
   const combo = route.evals.find((e) => e.code === "COMBO");
   if (combo?.eligible && route.decision.code === "COMBO") {
     grants.push({ decision: { ...route.decision, adaptive: true }, pairLoss: combo.pairLoss });
@@ -1364,10 +1455,11 @@ export function finalizeRegimeScore(
 export function forceRegimeRoute(
   m: AnalyzedMatch,
   mc: MonteCarloResult,
-  code: RegimeCode
+  code: RegimeCode,
+  warehouse?: QqlWarehouseSnapshot
 ): { decision: RegimeDecision; pairLoss: number } | null {
   if (code === "DUAL-HEDGE") {
-    const dual = bestDualPattern(m);
+    const dual = bestDualPattern(m, warehouse);
     if (!dual) return null;
     const spec = OVERLAP_PATTERNS[dual.pattern];
     const { stakeA, stakeB } = dutchStakes(dual.legA.odds, dual.legB.odds);
@@ -1386,6 +1478,7 @@ export function forceRegimeRoute(
           effectiveOdds: Math.round(dual.gate.effectiveOverlapOdds * 1000) / 1000,
           netReturnPct: Math.round(dual.gate.netOverlapReturnPct * 10) / 10,
         },
+        qql: dual.qql,
         why: `${spec.labelFa} — فیلتر ضریب همپوشانی مثبت تایید شد (سود هر برد +${dual.gate.netOverlapReturnPct.toFixed(1)}٪ · پکیج ${STANDARD_MATCH_STAKE} واحدی)`,
         whyEn: `POSITIVE OVERLAP APPROVED · ${spec.labelEn} · NET +${dual.gate.netOverlapReturnPct.toFixed(1)}% · 100u PACKAGE`,
         marketEn: `${dual.legA.marketEn} + ${dual.legB.marketEn}`,
@@ -1398,7 +1491,7 @@ export function forceRegimeRoute(
   }
 
   if (code === "COMBO") {
-    const route = routeRegime(m, mc, 0);
+    const route = routeRegime(m, mc, 0, warehouse);
     if (route.decision.code === "COMBO") {
       const combo = route.evals.find((e) => e.code === "COMBO");
       return { decision: route.decision, pairLoss: combo?.pairLoss ?? 0.1 };

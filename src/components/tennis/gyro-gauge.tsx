@@ -92,8 +92,8 @@ export function GyroGauge({
       {/* floating light particles */}
       <span aria-hidden className="float-particle absolute left-3 top-6 h-1.5 w-1.5 rounded-full bg-emerald-300/70" />
       <span aria-hidden className="float-particle absolute right-5 top-10 h-1 w-1 rounded-full bg-cyan-300/70" style={{ animationDelay: "0.8s" }} />
-      <span aria-hidden className="float-particle absolute bottom-10 left-8 h-1 w-1 rounded-full bg-amber-300/70" style={{ animationDelay: "1.6s" }} />
-      <span aria-hidden className="float-particle absolute bottom-4 right-10 h-1.5 w-1.5 rounded-full bg-white/50" style={{ animationDelay: "2.4s" }} />
+      <span aria-hidden className="float-particle absolute bottom-16 left-8 h-1 w-1 rounded-full bg-amber-300/70" style={{ animationDelay: "1.6s" }} />
+      <span aria-hidden className="float-particle absolute bottom-14 right-10 h-1.5 w-1.5 rounded-full bg-white/50" style={{ animationDelay: "2.4s" }} />
 
       <svg viewBox="0 0 220 220" className="w-full max-w-[240px]" role="img" aria-label={`وین‌ریت هسته اصلی ${(pct * 100).toFixed(1)} درصد`}>
         <defs>
@@ -126,7 +126,7 @@ export function GyroGauge({
       {/* v4.5 — sniper stats live OUTSIDE the core gauge */}
       {typeof sniperRate === "number" && (
         <div
-          className="mt-2 flex items-center gap-2 rounded-xl border border-rose-300/25 bg-rose-300/10 px-3 py-1.5 text-[10px]"
+          className="mt-3 flex items-center gap-2 rounded-xl border border-rose-300/25 bg-rose-300/10 px-3 py-1.5 text-[10px]"
           aria-label="وین‌ریت جداگانه تک‌تیرانداز"
         >
           <Crosshair className="h-3 w-3 shrink-0 text-rose-300" />
@@ -137,16 +137,17 @@ export function GyroGauge({
         </div>
       )}
 
-      {/* ring legend */}
-      <div className="mt-1 flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-[10px] text-muted-foreground">
+      {/* v11.0 — ring legend: extra clearance so the «وین‌ریت هسته اصلی» text
+          never collides with the colored dots / floating particles */}
+      <div className="mt-4 flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 px-3 pb-1 pt-1 text-[10px] leading-4 text-muted-foreground">
         <span className="flex items-center gap-1.5">
-          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" /> وین‌ریت هسته اصلی (زوج‌تیپ + میکس امن)
+          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" /> وین‌ریت هسته اصلی (زوج‌تیپ + میکس امن)
         </span>
         <span className="flex items-center gap-1.5">
-          <span className="h-1.5 w-1.5 rounded-full bg-amber-300" /> زوج‌تیپ در سطح مسابقه
+          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-300" /> زوج‌تیپ در سطح مسابقه
         </span>
         <span className="flex items-center gap-1.5">
-          <span className="h-1.5 w-1.5 rounded-full bg-cyan-300" /> بازده روی سرمایه
+          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-cyan-300" /> بازده روی سرمایه
         </span>
       </div>
     </div>

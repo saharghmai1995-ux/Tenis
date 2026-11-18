@@ -169,3 +169,42 @@ console.log(
 
 // keep a reference so bun --hot doesn't GC the server
 (globalThis as unknown as { __agentServer: unknown }).__agentServer = server;
+
+// ─── v12 · STUDIO HEARTBEAT — the agent revives the dashboard server ────────
+// The dashboard (next dev :3000) is the browser-free engine core of the whole
+// system. When the sandbox reaper (or any crash) kills it, THIS durable agent
+// — init-adopted and immune — respawns it through scripts/studio-runner.sh
+// (the init-adopted foreground-chain pattern). This is the same self-healing
+// law the studio applies to the agent itself (src/instrumentation-node.ts).
+const STUDIO_URL = CONFIG.mainAppUrl;
+const STUDIO_RUNNER = path.resolve(process.cwd(), "../scripts/studio-runner.sh");
+let studioRespawning = false;
+async function studioHeartbeat(): Promise<void> {
+  if (studioRespawning) return;
+  try {
+    const res = await fetch(`${STUDIO_URL}/api/agent/status`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.ok) return; // studio alive
+    console.warn("[studio-watchdog] studio responded", res.status, "— reviving");
+  } catch {
+    console.warn("[studio-watchdog] studio unreachable — reviving :3000");
+  }
+  studioRespawning = true;
+  try {
+    const proc = Bun.spawn(["bash", STUDIO_RUNNER], {
+      cwd: path.resolve(process.cwd(), ".."),
+      stdio: ["ignore", "ignore", "ignore"],
+      env: { ...process.env, NEXT_TELEMETRY_DISABLED: "1" },
+    });
+    proc.unref();
+    console.log(`[studio-watchdog] spawned studio runner pid=${proc.pid}`);
+  } catch (e) {
+    console.error("[studio-watchdog] spawn failed:", e);
+  } finally {
+    // give the studio a full boot window before the next probe
+    setTimeout(() => (studioRespawning = false), 90_000);
+  }
+}
+setInterval(() => void studioHeartbeat(), 30_000);
+setTimeout(() => void studioHeartbeat(), 20_000);

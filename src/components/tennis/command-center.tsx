@@ -20,9 +20,60 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { Badge } from "@/components/ui/badge";
 import { BankGrowthPro } from "@/components/tennis/bank-growth-pro";
 import { GyroGauge } from "@/components/tennis/gyro-gauge";
-import type { LedgerPayload, ProductionLine } from "@/lib/tennis/types";
+import type { LedgerPayload, ProductionLine, QqlFamilyStat } from "@/lib/tennis/types";
+
+// ─── v12 · the 6 QQL pattern families of the disjoint ledger ──────────────────
+const FAMILY_TONE: Record<string, string> = {
+  F1: "text-amber-300",
+  F2: "text-emerald-300",
+  F3: "text-orange-300",
+  F4: "text-violet-300",
+  F5: "text-cyan-300",
+  F6: "text-lime-300",
+};
+
+function FamilyRow({ f }: { f: QqlFamilyStat }) {
+  const decided = f.won + f.lost;
+  const winRate = decided > 0 ? f.winRate : f.modelCoverage;
+  const profitTone = f.profit > 0 ? "text-emerald-300" : f.profit < 0 ? "text-rose-300" : "text-white/60";
+  // v12 — a family awaiting its first live position shows its architecture
+  // baseline instead of a dead «0 (0) | +0.0» row (master-prompt v11 §3)
+  const empty = f.picks === 0;
+  return (
+    <TableRow className="hover:bg-transparent">
+      <TableCell className={`text-xs font-bold ${FAMILY_TONE[f.family] ?? "text-white"}`}>
+        {f.labelFa}
+      </TableCell>
+      <TableCell className="mono-num text-xs" dir="ltr">
+        {empty ? (
+          <span className="text-white/55">پایگاه الگو</span>
+        ) : (
+          <>
+            {f.picks}
+            <span className="text-muted-foreground"> ({f.pending}⏳)</span>
+          </>
+        )}
+      </TableCell>
+      <TableCell className="mono-num text-xs" dir="ltr">
+        {empty ? <span className="text-white/40">—</span> : `${f.won} / ${f.lost}`}
+      </TableCell>
+      <TableCell className="mono-num text-xs" dir="ltr">
+        {`${(winRate * 100).toFixed(0)}%`}
+        {decided === 0 && (
+          <span className="ms-1 text-[9px] text-white/45">
+            {empty ? "پوشش معماری" : "پایگاه الگو"}
+          </span>
+        )}
+      </TableCell>
+      <TableCell className={`mono-num text-xs ${profitTone}`} dir="ltr">
+        {empty ? <span className="text-white/40">—</span> : `${f.profit >= 0 ? "+" : ""}${f.profit.toFixed(1)}`}
+      </TableCell>
+    </TableRow>
+  );
+}
 
 const LINE_LABELS: Record<ProductionLine, string> = {
   DUAL: "زوج‌تیپ طلایی مکمل",
@@ -139,56 +190,61 @@ export function CommandCenter({ ledger }: { ledger: LedgerPayload }) {
         <BankGrowthPro history={ledger.bankHistory} bankStart={stats.bankStart} bank={stats.bank} />
       </div>
 
-      {/* disjoint ledger */}
+      {/* disjoint ledger — v12: the 6 QQL pattern families + legacy line stats */}
       <Card className="spatial-card rise-in rounded-2xl">
         <CardHeader className="pb-2">
           <CardTitle className="flex flex-wrap items-center gap-2 text-sm font-bold">
             <ShieldOff className="h-4 w-4 text-amber-300" />
             دفترکل افرازی (Disjoint Ledger)
             <span className="text-[11px] font-normal text-muted-foreground">
-              — زوج‌تیپ در سطح مسابقه تسویه می‌شود (دو بالِ یک پوزیشن)؛ وتوها فقط در دفتر سایه
+              — ۶ خانواده الگوی کشف‌شده QQL در سطح مسابقه تسویه می‌شوند؛ وتوها فقط در دفتر سایه
             </span>
           </CardTitle>
         </CardHeader>
         <CardContent className="grid gap-4 lg:grid-cols-[1.2fr_1fr]">
-          <div className="scroll-slim max-h-64 overflow-y-auto rounded-xl border border-white/5">
-            <Table>
-              <TableHeader>
-                <TableRow className="hover:bg-transparent">
-                  <TableHead className="text-xs">خط تولید</TableHead>
-                  <TableHead className="text-xs">پوزیشن</TableHead>
-                  <TableHead className="text-xs">برد / باخت</TableHead>
-                  <TableHead className="text-xs">وین‌ریت</TableHead>
-                  <TableHead className="text-xs">سود</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {groups.map((g) => (
-                  <TableRow key={g.line}>
-                    <TableCell className={`text-xs font-bold ${LINE_COLORS[g.line]}`}>
-                      {LINE_LABELS[g.line]}
-                    </TableCell>
-                    <TableCell className="mono-num text-xs" dir="ltr">
-                      {g.picks}
-                      <span className="text-muted-foreground"> ({g.pending}⏳)</span>
-                    </TableCell>
-                    <TableCell className="mono-num text-xs" dir="ltr">
-                      {g.won} / {g.lost}
-                    </TableCell>
-                    <TableCell className="mono-num text-xs" dir="ltr">
-                      {g.picks - g.pending > 0 ? `${(g.winRate * 100).toFixed(0)}%` : "—"}
-                    </TableCell>
-                    <TableCell
-                      className={`mono-num text-xs ${g.profit >= 0 ? "text-emerald-300" : "text-rose-300"}`}
-                      dir="ltr"
-                    >
-                      {g.profit >= 0 ? "+" : ""}
-                      {g.profit.toFixed(1)}
-                    </TableCell>
+          <div className="space-y-3">
+            {/* v12 — the SIX pattern-family rows (QQL discovery) */}
+            <div className="scroll-slim max-h-64 overflow-y-auto rounded-xl border border-white/5">
+              <Table>
+                <TableHeader>
+                  <TableRow className="hover:bg-transparent">
+                    <TableHead className="text-xs">خانواده الگو (QQL)</TableHead>
+                    <TableHead className="text-xs">پوزیشن</TableHead>
+                    <TableHead className="text-xs">برد / باخت</TableHead>
+                    <TableHead className="text-xs">وین‌ریت</TableHead>
+                    <TableHead className="text-xs">سود</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+                </TableHeader>
+                <TableBody>
+                  {(ledger.families ?? []).map((f) => (
+                    <FamilyRow key={f.family} f={f} />
+                  ))}
+                  {(ledger.families ?? []).length === 0 && (
+                    <TableRow>
+                      <TableCell colSpan={5} className="text-center text-xs text-muted-foreground">
+                        در انتظار اولین پوزیشن QQL…
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+
+            {/* legacy disjoint line stats (compact chips) */}
+            <div className="flex flex-wrap gap-1.5">
+              {groups.map((g) => (
+                <Badge
+                  key={g.line}
+                  variant="outline"
+                  className="border-white/10 bg-white/[0.03] text-[9.5px] font-normal text-white/70"
+                >
+                  <span className={`font-bold ${LINE_COLORS[g.line]}`}>{LINE_LABELS[g.line]}</span>
+                  <span className="mono-num" dir="ltr">
+                    {g.picks} ({g.pending}⏳) · {g.won}/{g.lost} · {g.profit >= 0 ? "+" : ""}{g.profit.toFixed(1)}
+                  </span>
+                </Badge>
+              ))}
+            </div>
           </div>
 
           <div className="space-y-3">

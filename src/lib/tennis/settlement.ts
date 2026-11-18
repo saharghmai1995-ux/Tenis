@@ -258,6 +258,44 @@ function settlePick(
       const won = result.totalGames <= 20;
       return { status: won ? "WON" : "LOST", profit: profitOf(won) };
     }
+
+    // ─── v12 · QUANTUM 10-OPTION LEGS (T1…T10 — the QQL solver contracts) ──
+    // Every T-leg settles against the exact market semantics of its official
+    // single-button option. Side resolution rides meta.favName exactly like
+    // the legacy legs (the favorite is the model favorite at card-build time).
+    if (pick.leg.startsWith("T") && /^T\d+-/.test(pick.leg)) {
+      const dogWonMatch = !favWonMatch;
+      const dogWon20 =
+        side === "A" ? result.code === "0-2" : side === "B" ? result.code === "2-0" : false;
+      const dogWon21 =
+        side === "A" ? result.code === "1-2" : side === "B" ? result.code === "2-1" : false;
+      const favWonSet1 = side === "A" ? result.set1Games.a > result.set1Games.b : result.set1Games.b > result.set1Games.a;
+      const set1Total = result.set1Games.a + result.set1Games.b;
+      switch (pick.leg) {
+        case "T1-SB-F20": // SET BETTING — FAVORITE 2-0
+          return { status: favWon20 ? "WON" : "LOST", profit: profitOf(favWon20) };
+        case "T2-SB-F21": // SET BETTING — FAVORITE 2-1
+          return { status: favWonMatch && result.code === (side === "A" ? "2-1" : "1-2") ? "WON" : "LOST", profit: profitOf(favWonMatch && result.code === (side === "A" ? "2-1" : "1-2")) };
+        case "T3-SB-D20": // SET BETTING — PLAYER 2 (underdog) WINS 2-0
+          return { status: dogWon20 ? "WON" : "LOST", profit: profitOf(dogWon20) };
+        case "T4-SB-D21": // SET BETTING — PLAYER 2 (underdog) WINS 2-1
+          return { status: dogWon21 ? "WON" : "LOST", profit: profitOf(dogWon21) };
+        case "T5-TS-O25": // TOTAL SETS — OVER 2.5
+          return { status: result.code === "2-1" || result.code === "1-2" ? "WON" : "LOST", profit: profitOf(result.code === "2-1" || result.code === "1-2") };
+        case "T6-TG-O205": // TOTAL GAMES — OVER 20.5
+          return { status: result.totalGames >= 21 ? "WON" : "LOST", profit: profitOf(result.totalGames >= 21) };
+        case "T7-TG-U215": // TOTAL GAMES — UNDER 21.5
+          return { status: result.totalGames <= 21 ? "WON" : "LOST", profit: profitOf(result.totalGames <= 21) };
+        case "T8-GH-F35": // GAME HANDICAP — FAVORITE −3.5 (margin ≥ 4)
+          return { status: favWonMatch && favMargin >= 4 ? "WON" : "LOST", profit: profitOf(favWonMatch && favMargin >= 4) };
+        case "T9-GH-D35": // GAME HANDICAP — UNDERDOG +3.5 (favorite margin ≤ 3 or dog win)
+          return { status: dogWonMatch || favMargin <= 3 ? "WON" : "LOST", profit: profitOf(dogWonMatch || favMargin <= 3) };
+        case "T10-SS-F10": // 1ST SET WINNER — FAVORITE & OVER 9.5 GAMES
+          return { status: favWonSet1 && set1Total >= 10 ? "WON" : "LOST", profit: profitOf(favWonSet1 && set1Total >= 10) };
+        default:
+          return { status: "VOID", profit: 0 };
+      }
+    }
     return { status: "VOID", profit: 0 };
   }
 

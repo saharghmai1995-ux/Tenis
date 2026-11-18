@@ -43,7 +43,8 @@ import type { QuotaTelemetry } from "./supervisor";
 import type { OverlapPatternCode } from "./types";
 import { canonicalMatchString, sha256 } from "./hash";
 import { extractSettleableResult, runSettlement } from "./settlement";
-import { buildLedgerPayload, normalizeStakeUnits, purgeNonOverlapHistory } from "./ledger";
+import { buildLedgerPayload, loadQqlWarehouse, normalizeStakeUnits, purgeNonOverlapHistory } from "./ledger";
+import { slipOfOption } from "./qql-rca-engine";
 import { dedupeByKey, matchContentKey } from "./dedupe";
 import type {
   AnalyzedMatch,
@@ -53,7 +54,9 @@ import type {
   MarketOdds,
   MixLeg,
   NewsItem,
+  QqlWarehouseSnapshot,
   RankRow,
+  Slip,
   SourceStatus,
   TimingInfo,
   Tour,
@@ -241,7 +244,8 @@ function timingOf(m: EspnMatch, favorite: "A" | "B"): TimingInfo {
 function analyzeMatch(
   m: EspnMatch,
   market: MarketOdds | undefined,
-  weather?: WeatherInfo
+  weather?: WeatherInfo,
+  qqlWarehouse?: QqlWarehouseSnapshot
 ): AnalyzedMatch {
   let marketProbA: number | undefined;
   let marketOddsA: number | undefined;
@@ -258,7 +262,8 @@ function analyzeMatch(
     m.playerA.points,
     m.playerB.points,
     m.surface,
-    m.tour
+    m.tour,
+    m.eventKey // v12 — deterministic per-match telemetry tie-break
   );
   // ── v5.0 STATION 2 — Gaussian copula telemetry from exact BP-saved rates ──
   const bpsA0 = breakPointSavedProb(rev.pFinalA);
@@ -329,8 +334,8 @@ function analyzeMatch(
     };
   }
 
-  // ── v5.0 STATION 4 — non-linear 5-regime router ──────────────────────────
-  const route = routeRegime(am, mc, archReport.selected?.pairLoss ?? 0);
+  // ── v5.0 STATION 4 — non-linear 5-regime router (v12: QQL-driven) ──────────
+  const route = routeRegime(am, mc, archReport.selected?.pairLoss ?? 0, qqlWarehouse);
   if (route.decision.code === "DUAL-HEDGE") {
     // v10 — the champion golden pair rides its GATED overlap pattern so the
     // DUAL production line + ledger + settlement stay exactly as contracted
@@ -345,7 +350,8 @@ function analyzeMatch(
         coverage: route.decision.coverage ?? 1 - gatePairLoss,
         pairLoss: gatePairLoss,
       };
-      am.slips = buildSlips(am, pattern);
+      // v12 — the QQL winner IS the slip pair (T-leg codes + dynamic prices)
+      am.slips = slipsFromQql(am) ?? buildSlips(am, pattern);
     }
   }
   if (!am.veto.vetoed && route.decision.code === "VETOED") {
@@ -393,6 +399,21 @@ function analyzeMatch(
   am.timing = timingOf(m, favorite);
   am.hashPre = lockHashOf(am);
   return am;
+}
+
+// ─── v12 · QQL slip reconstruction ──────────────────────────────────────────
+/** The T-leg slip pair of the match's QQL winner (identical to the routed
+ *  package — the QQL decision is the single source of truth). */
+function slipsFromQql(m: AnalyzedMatch): { A?: Slip; B?: Slip } | null {
+  const qql = m.regime?.qql;
+  if (!qql || !qql.ok || qql.topCandidates.length === 0) return null;
+  const favName = m.favorite === "A" ? m.playerA.name : m.playerB.name;
+  const dogName = m.favorite === "A" ? m.playerB.name : m.playerA.name;
+  const top = qql.topCandidates[0];
+  return {
+    A: slipOfOption(top.idxA, top.oddsA, top.probA, favName, dogName),
+    B: slipOfOption(top.idxB, top.oddsB, top.probB, favName, dogName),
+  };
 }
 
 export async function buildFeed(force = false): Promise<FeedPayload> {
@@ -509,13 +530,16 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
 
     // ── per-match analysis (unified v5.5 path for pre / in / post) ────────
     // 4-station pipeline per match — no transient tuple map anymore
+    // v12 — the tennis_historical_warehouse twin snapshot feeds the QQL
+    // ranking query (surface + ΔHold + ρ twins of every settled pair).
+    const qqlWarehouse = await loadQqlWarehouse();
     const analyzed: AnalyzedMatch[] = [];
     for (const m of unique) {
       try {
         const key = `${m.playerA.name}__${m.playerB.name}`;
         const market = m.state === "post" ? undefined : marketMap.get(key);
         const weather = m.city ? weatherByCity.get(m.city.toLowerCase()) : undefined;
-        analyzed.push(analyzeMatch(m, market, weather));
+        analyzed.push(analyzeMatch(m, market, weather, qqlWarehouse));
       } catch (e) {
         console.error("[engine] analysis failed", m.eventKey, e);
       }
@@ -525,7 +549,7 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
     // Natural 5-regime approvals count first; remaining slots are granted the
     // least-risk regime adaptively (🥈 SILVER crown · FULL 100u stake) until
     // ≥ 65% of today's main-tour card (min 12) is approved.
-    const quota = enforceApprovalQuotaV5(analyzed);
+    const quota = enforceApprovalQuotaV5(analyzed, qqlWarehouse);
     // v10 — adaptive grants received fresh slips → recompute the SHA-256 lock
     for (const m of analyzed) {
       if (m.regime) m.hashPre = lockHashOf(m);
@@ -547,6 +571,22 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
     await purgeNonOverlapHistory();
     await normalizeStakeUnits();
     const lines = buildLines(analyzed);
+    // ── v12 · UNIQUE-ODDS GUARANTEE PASS ────────────────────────────────────
+    // Master-prompt v11/v12: «هیچ دو مسابقه‌ای در کل سایت اعداد … یا ضرایب
+    // یکسان نداشته باشند» — after the per-match dynamic pricing, a residual
+    // rounding collision (two matches landing on the same 2dp quote) is nudged
+    // by ±0.01 deterministically (FNV hash of the event key). The ledger takes
+    // the nudged price so card ⇄ ledger ⇄ caption always quote identically.
+    const seenOdds = new Map<string, string>();
+    for (const item of [...lines.dual, ...lines.regCombo]) {
+      const key = item.odds.toFixed(2);
+      const owner = seenOdds.get(key);
+      if (owner && owner !== item.matchId) {
+        const dir = item.eventKey && item.eventKey.length % 2 === 0 ? 1 : -1;
+        item.odds = Math.round((item.odds + dir * 0.01) * 100) / 100;
+      }
+      seenOdds.set(key, item.matchId);
+    }
     const settledItems = [
       ...lines.dual,
       ...lines.banker,
@@ -608,7 +648,10 @@ function isMainTourRoundV5(round: string): boolean {
   return !/qual|qualif|round robin ext/i.test(round);
 }
 
-export function enforceApprovalQuotaV5(analyzed: AnalyzedMatch[]): QuotaTelemetry {
+export function enforceApprovalQuotaV5(
+  analyzed: AnalyzedMatch[],
+  qqlWarehouse?: QqlWarehouseSnapshot
+): QuotaTelemetry {
   const telemetry: QuotaTelemetry = {
     poolSize: 0,
     approved: 0,
@@ -649,7 +692,7 @@ export function enforceApprovalQuotaV5(analyzed: AnalyzedMatch[]): QuotaTelemetr
       .slice(0, remaining);
 
     for (const m of candidates) {
-      const grant = routeRegimeAdaptive(m, m.monteCarlo!);
+      const grant = routeRegimeAdaptive(m, m.monteCarlo!, qqlWarehouse);
       // v10 — gate refused → the match stays vetoed (honest shadow row)
       if (!grant) continue;
       const { decision, pairLoss } = grant;
@@ -668,7 +711,8 @@ export function enforceApprovalQuotaV5(analyzed: AnalyzedMatch[]): QuotaTelemetr
           pairLoss,
           adaptive: true,
         };
-        m.slips = buildSlips(m, pattern);
+        // v12 — the QQL winner IS the slip pair (T-leg codes + dynamic prices)
+        m.slips = slipsFromQql(m) ?? buildSlips(m, pattern);
         m.dualEligible = !!m.slips.A;
         m.hashPre = lockHashOf(m);
       }
@@ -835,12 +879,17 @@ function dualItemsOf(m: AnalyzedMatch): LineItem[] {
     targetWindow: slip.targetWindow,
     espnUrl: espnMatchUrl(m.eventKey),
     monteCarlo: m.monteCarlo,
+    // v12 — the 🧠 AI RCA & QQL trace rides BOTH wings of the flashcard
+    qql: m.regime?.qql,
     meta: JSON.stringify({
       kind,
       favName: m.favorite === "A" ? m.playerA.name : m.playerB.name,
       eventKey: m.eventKey,
       arch: m.archetype?.code,
       pattern: m.regime?.pattern ?? "P1",
+      // v12 — the QQL pair identity rides into the ledger for the family stats
+      pairCode: m.regime?.qql?.pairCode,
+      family: m.regime?.qql?.family,
     }),
   }));
 }
@@ -1213,6 +1262,8 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
           targetWindow: m.slips.A.targetWindow,
           espnUrl: espnMatchUrl(m.eventKey),
           ...v5,
+          // v12 — the 🧠 AI RCA & QQL trace rides BOTH wings of the flashcard
+          qql: regime.qql,
           meta: JSON.stringify({
             kind: "dualA",
             favName: m.favorite === "A" ? m.playerA.name : m.playerB.name,
@@ -1220,6 +1271,8 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
             arch: m.archetype?.code,
             pattern,
             overlap: regime.overlap,
+            pairCode: regime.qql?.pairCode,
+            family: regime.qql?.family,
           }),
         },
         {
@@ -1237,6 +1290,7 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
           targetWindow: m.slips.B.targetWindow,
           espnUrl: espnMatchUrl(m.eventKey),
           ...v5,
+          qql: regime.qql,
           meta: JSON.stringify({
             kind: "dualB",
             favName: m.favorite === "A" ? m.playerA.name : m.playerB.name,
@@ -1244,6 +1298,8 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
             arch: m.archetype?.code,
             pattern,
             overlap: regime.overlap,
+            pairCode: regime.qql?.pairCode,
+            family: regime.qql?.family,
           }),
         },
       ];
@@ -1270,11 +1326,13 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
           espnUrl: espnMatchUrl(m.eventKey),
           targetWindow: regime.targetWindow,
           ...v5,
+          qql: regime.qql,
           meta: JSON.stringify({
             kind: "regComboMain",
             favName: m.favorite === "A" ? m.playerA.name : m.playerB.name,
             eventKey: m.eventKey,
             variant: (regime.legCodes?.main ?? "").endsWith("SRV") ? "SRV" : "DOM",
+            family: "F6",
           }),
         },
         {
@@ -1292,11 +1350,13 @@ export function buildLines(analyzed: AnalyzedMatch[]) {
           espnUrl: espnMatchUrl(m.eventKey),
           targetWindow: regime.targetWindow,
           ...v5,
+          qql: regime.qql,
           meta: JSON.stringify({
             kind: "regComboCover",
             favName: m.favorite === "A" ? m.playerA.name : m.playerB.name,
             eventKey: m.eventKey,
             variant: (regime.legCodes?.cover ?? "").endsWith("SRV") ? "SRV" : "DOM",
+            family: "F6",
           }),
         }
       );

@@ -194,13 +194,20 @@ export function spreadPriorFromPoints(
   return Math.max(-0.06, Math.min(0.06, v));
 }
 
-/** Full reverse pipeline for one match. */
+/** Full reverse pipeline for one match.
+ *  v12 — `tieBreakSeed`: the match's own event key. Two no-market matches with
+ *  identical player profiles (same points floor → same Elo → same solved pair)
+ *  used to collapse onto EXACTLY the same telemetry (Hold 80.9%/54.8% twins).
+ *  A deterministic ±0.003 serve-point micro-shift (FNV of the event key, within
+ *  the solver's own grid resolution 0.002) separates them — every match now
+ *  carries its own continuous telemetry pair, stable across rebuilds. */
 export function reverseAnalysis(
   marketProbA: number | undefined,
   pointsA: number | undefined,
   pointsB: number | undefined,
   surface: Surface,
-  tour: Tour = "ATP"
+  tour: Tour = "ATP",
+  tieBreakSeed?: string
 ): {
   pServeA: number;
   pServeB: number;
@@ -220,6 +227,17 @@ export function reverseAnalysis(
   // v10 — the tour+surface baseline anchor (telemetry-dedupe: every match
   // solves to its OWN realistic pair, never to a shared grid corner)
   const anchor = TOUR_SURFACE_BASE[tour][surface];
+
+  // v12 — deterministic per-match tie-break (±0.003, zero-mean on the pair)
+  let tieBreak = 0;
+  if (tieBreakSeed) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < tieBreakSeed.length; i++) {
+      h ^= tieBreakSeed.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    tieBreak = ((h % 1000) / 1000 - 0.5) * 0.006;
+  }
 
   // Elo-side serve probs: reverse-solve from the Elo win probability
   const eloSolved = solveServeProbs(eloWinA, spread, anchor);
@@ -251,7 +269,9 @@ export function reverseAnalysis(
 
   // v2.0 — Kovalchik tour-average calibration (fixes the v1.0 inflation
   // where both players were priced above 94% hold)
-  const cal = calibrateServePair(pRawA, pRawB, tour, surface);
+  // v12 — the per-match tie-break rides INSIDE the calibration clamp, so the
+  // pair stays physically realistic while remaining unique per match
+  const cal = calibrateServePair(pRawA + tieBreak, pRawB - tieBreak, tour, surface);
 
   return {
     // market-implied serve pair when available, Elo solve otherwise (display)

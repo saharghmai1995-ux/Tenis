@@ -15,6 +15,7 @@ import { RankingsNews } from "@/components/tennis/rankings-news";
 import { TennisFooter } from "@/components/tennis/footer";
 import { AnalysisDialog } from "@/components/tennis/analysis-dialog";
 import { SupervisorMonitor } from "@/components/tennis/supervisor-monitor";
+import { QqlExplorer } from "@/components/tennis/qql-explorer";
 import PosterStudio from "@/components/tennis/poster-studio";
 import type { AnalyzedMatch } from "@/lib/tennis/types";
 
@@ -143,6 +144,8 @@ export default function Home() {
             <CommandCenter ledger={data.ledger} />
             <ProductionLines feed={data} />
             <RecordTable ledger={data.ledger} />
+            {/* v12 — 💻 کنسول پرس‌وجوی علوم داده تنیس (QQL & RCA Explorer) */}
+            <QqlExplorer />
             <Scoreboard matches={data.matches} onAnalyze={openAnalysis} />
             <RankingsNews rankings={data.rankings} news={data.news} />
             <PosterStudio matches={posterMatches} allMatches={data.matches.filter((m) => m.state !== "post")} />

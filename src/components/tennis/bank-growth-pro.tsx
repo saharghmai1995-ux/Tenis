@@ -284,7 +284,9 @@ export function BankGrowthPro({ history, bankStart, bank }: { history?: BankHist
             label="قله تاریخی بانک"
             value={(history?.peak.bank ?? bankStart).toLocaleString("en-US")}
             tone="text-amber-300"
-            sub={history?.peak.at ? `ثبت در ${history.peak.at.slice(0, 10)}` : "شروع ۱۰۰۰ واحدی"}
+            // v11.0 — Tehran-anchored dd/mm peak label (fixes the 2026-12-11 ⇄
+            // 2026-11-12 month/day swap of the raw UTC ISO slice)
+            sub={history?.peak.atLabel ? `ثبت در ${history.peak.atLabel.slice(4, 6)}/${history.peak.atLabel.slice(6, 8)}` : "شروع ۱۰۰۰ واحدی"}
           />
           <StatCell
             icon={Activity}
