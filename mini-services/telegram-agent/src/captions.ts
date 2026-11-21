@@ -256,8 +256,21 @@ export function captionBriefing(
   return lines.join("\n") + FOOT;
 }
 
+// v14 — honest win-rate line: the CERTIFIED (hash-verified) rate leads the
+// caption; the raw core rate is still shown for full transparency.
+function coreRateLine(stats: { coreWinRate: number; certifiedWinRate?: number; certifiedDecided?: number }): string {
+  if (
+    typeof stats.certifiedWinRate === "number" &&
+    typeof stats.certifiedDecided === "number" &&
+    stats.certifiedDecided > 0
+  ) {
+    return `📈 وین‌ریت تأییدشده (فقط رکوردهای هش سالم): ٪${fa(Math.round(stats.certifiedWinRate * 100))} از ${fa(stats.certifiedDecided)} بازی — کل هسته: ٪${fa(Math.round(stats.coreWinRate * 100))}`;
+  }
+  return `📈 وین‌ریت هسته سیستم (بدون تأیید هش): ٪${fa(Math.round(stats.coreWinRate * 100))}`;
+}
+
 export function captionAggregate(
-  stats: { coreWinRate: number; profit: number; picks: number; settled: number; streak: number },
+  stats: { coreWinRate: number; certifiedWinRate?: number; certifiedDecided?: number; profit: number; picks: number; settled: number; streak: number },
   rows: SettledRow[],
   night: boolean
 ): string {
@@ -265,7 +278,7 @@ export function captionAggregate(
     BRAND,
     night ? "🌙 برآیند شبانه — گزارش کانال عمومی" : "📊 برآیند روزانه — کانال VIP",
     "",
-    `📈 وین‌ریت هسته سیستم: ٪${fa(Math.round(stats.coreWinRate * 100))}`,
+    coreRateLine(stats),
     `💰 سود خالص (واحد): ${fa(stats.profit)}+ واحد`,
     `🎯 کل پیک‌ها: ${fa(stats.picks)} | تسویه‌شده: ${fa(stats.settled)}`,
     `🔥 استریک فعلی: ${fa(Math.abs(stats.streak))} ${stats.streak >= 0 ? "برد پیاپی" : "باخت پیاپی"}`,
@@ -292,14 +305,14 @@ export function captionAggregate(
 }
 
 export function captionWeekly(
-  stats: { coreWinRate: number; profit: number; picks: number; settled: number },
+  stats: { coreWinRate: number; certifiedWinRate?: number; certifiedDecided?: number; profit: number; picks: number; settled: number },
   rows: SettledRow[]
 ): string {
   const lines: string[] = [
     BRAND,
     "📅 گزارش هفتگی — رکورد رسمی ۷ روز گذشته",
     "",
-    `📈 وین‌ریت هسته سیستم: ٪${fa(Math.round(stats.coreWinRate * 100))}`,
+    coreRateLine(stats),
     `💰 سود هفته: ${fa(stats.profit)}+ واحد | پیک‌ها: ${fa(stats.picks)} | تسویه‌شده: ${fa(stats.settled)}`,
     "",
     "🧾 مهم‌ترین نتایج هفته:",
@@ -318,13 +331,13 @@ export function captionWeekly(
 
 export function captionFtResults(
   rows: SettledRow[],
-  stats: { coreWinRate: number; won: number; lost: number }
+  stats: { coreWinRate: number; certifiedWinRate?: number; certifiedDecided?: number; won: number; lost: number }
 ): string {
   const lines: string[] = [
     BRAND,
     "🏁 نتایج FT امروز + وین‌ریت",
     "",
-    `📈 وین‌ریت کلی سیستم: ٪${fa(Math.round(stats.coreWinRate * 100))} (${fa(stats.won)} برد / ${fa(stats.lost)} باخت)`,
+    coreRateLine(stats) + ` (${fa(stats.won)} برد / ${fa(stats.lost)} باخت)`,
     "",
     "🧾 کارت‌های تسویه‌شده امروز:",
   ];
@@ -413,12 +426,12 @@ export function captionAcademy(lessonIndex: number): string {
   ].join("\n");
 }
 
-export function captionBanner(stats: { coreWinRate: number; profit: number; picks: number }): string {
+export function captionBanner(stats: { coreWinRate: number; certifiedWinRate?: number; certifiedDecided?: number; profit: number; picks: number }): string {
   return [
     BRAND,
     "🎰 بنر ساعتی VIP ARCADE ARENA",
     "",
-    `📈 وین‌ریت هسته سیستم: ٪${fa(Math.round(stats.coreWinRate * 100))}`,
+    coreRateLine(stats),
     `💰 سود رسمی ثبت‌شده: ${fa(stats.profit)}+ واحد`,
     `🎯 کل پیک‌های رکورد: ${fa(stats.picks)}`,
     "",

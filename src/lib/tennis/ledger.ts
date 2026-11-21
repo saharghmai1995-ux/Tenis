@@ -15,7 +15,7 @@
 // record (disjoint / no double counting).
 
 import { db } from "@/lib/db";
-import { sha256 } from "./hash";
+import { sha256, canonicalMatchString } from "./hash";
 import { familyOfPair, QQL_FAMILIES } from "./qql-rca-engine";
 import type { QuotaTelemetry } from "./supervisor";
 import type {
@@ -229,6 +229,11 @@ interface PickWithMatch {
     playerA: string;
     playerB: string;
     hashPre: string | null;
+    dateKey: string;
+    slipAText: string | null;
+    slipAOdds: number | null;
+    slipBText: string | null;
+    slipBOdds: number | null;
     resultSetsA: number | null;
     resultSetsB: number | null;
     resultCode: string | null;
@@ -986,6 +991,35 @@ export async function buildLedgerPayload(
   ];
   const coreDecided = coreRows.filter((r) => r.status !== "PENDING");
   const coreWon = coreDecided.filter((r) => r.status === "WON").length;
+  // ── Audit v14 · CERTIFIED win rate ─────────────────────────────────────
+  // Marketing numbers may only be computed over rows whose match STILL
+  // passes its SHA-256 pre-lock hash — i.e. rows never mutated by the v13
+  // retro migrations. The uncensored coreWinRate stays available for the
+  // forensic audit; banners/captions must use the certified one.
+  const certifiedCoreDecided = coreDecided.filter((r) => {
+    const m = r.match as unknown as {
+      hashPre: string | null; dateKey: string; tour: string; tournament: string;
+      surface: string; round: string; playerA: string; playerB: string;
+      slipAText: string | null; slipAOdds: number | null;
+      slipBText: string | null; slipBOdds: number | null;
+    };
+    if (!m?.hashPre) return false;
+    const canon = canonicalMatchString({
+      dateKey: m.dateKey,
+      tour: m.tour,
+      tournament: m.tournament,
+      surface: m.surface,
+      round: m.round,
+      playerA: m.playerA,
+      playerB: m.playerB,
+      slipAText: m.slipAText ?? undefined,
+      slipAOdds: m.slipAOdds ?? undefined,
+      slipBText: m.slipBText ?? undefined,
+      slipBOdds: m.slipBOdds ?? undefined,
+    });
+    return sha256(canon) === m.hashPre;
+  });
+  const certifiedCoreWon = certifiedCoreDecided.filter((r) => r.status === "WON").length;
   // v4.5 — stake-weighted alternative: Σ won stake / Σ decided stake over the
   // whole official record
   const wonStake = decidedRows
@@ -1104,6 +1138,10 @@ export async function buildLedgerPayload(
       combinedWinRate: decidedRows.length > 0 ? combinedWonCount / decidedRows.length : 0,
       // v5.0 — core system win rate (DUAL + BANKER + COMBO + CLUSTER; sniper excluded)
       coreWinRate: coreDecided.length > 0 ? coreWon / coreDecided.length : 0,
+      // v14 — CERTIFIED win rate: hash-verified rows only (honest marketing)
+      certifiedWinRate: certifiedCoreDecided.length > 0 ? certifiedCoreWon / certifiedCoreDecided.length : 0,
+      certifiedDecided: certifiedCoreDecided.length,
+      certifiedWon: certifiedCoreWon,
       // v4.5 — stake-weighted win rate over the official record
       stakeWeightedWinRate: combinedStake > 0 ? wonStake / combinedStake : 0,
       bank: Math.round(bank * 100) / 100,

@@ -550,7 +550,7 @@ function briefingRequest(
 function aggregateRequest(
   title: string,
   kind: PosterKind,
-  stats: { coreWinRate: number; profit: number; picks: number; settled: number; streak: number },
+  stats: { coreWinRate: number; certifiedWinRate?: number; certifiedDecided?: number; profit: number; picks: number; settled: number; streak: number },
   rows: { matchLabel: string; status: string; profit: number; result?: string }[]
 ): PosterRequest {
   return {
@@ -559,7 +559,7 @@ function aggregateRequest(
     subtitle: `${tehranDateKey()} - OFFICIAL LEDGER`,
     theme: "RESULTS",
     stats: [
-      { label: "WIN RATE - CORE", value: `${Math.round(stats.coreWinRate * 100)}%`, accent: true },
+      { label: "WIN RATE - CERTIFIED", value: `${Math.round((stats.certifiedWinRate ?? stats.coreWinRate) * 100)}%`, accent: true },
       { label: "NET UNITS", value: `${stats.profit >= 0 ? "+" : ""}${Math.round(stats.profit)}U` },
       { label: "PICKS", value: String(stats.picks) },
       { label: "SETTLED", value: String(stats.settled) },
@@ -635,6 +635,8 @@ function academyRequest(index: number): PosterRequest {
 
 function bannerRequest(stats: {
   coreWinRate: number;
+  certifiedWinRate?: number;
+  certifiedDecided?: number;
   profit: number;
   picks: number;
 }): PosterRequest {
@@ -644,7 +646,7 @@ function bannerRequest(stats: {
     subtitle: "INSERT COIN - JOIN THE WINNING SIDE",
     theme: "MARKETING",
     stats: [
-      { label: "WIN RATE - CORE", value: `${Math.round(stats.coreWinRate * 100)}%`, accent: true },
+      { label: "WIN RATE - CERTIFIED", value: `${Math.round((stats.certifiedWinRate ?? stats.coreWinRate) * 100)}%`, accent: true },
       { label: "NET UNITS", value: `${stats.profit >= 0 ? "+" : ""}${Math.round(stats.profit)}U` },
       { label: "PICKS ON RECORD", value: String(stats.picks) },
     ],

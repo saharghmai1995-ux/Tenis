@@ -50,6 +50,7 @@ import { canonicalMatchString, sha256 } from "./hash";
 import { extractSettleableResult, runSettlement } from "./settlement";
 import { buildLedgerPayload, loadQqlWarehouse, normalizeStakeUnits, purgeNonOverlapHistory } from "./ledger";
 import { slipOfOption } from "./qql-rca-engine";
+import { oddsSourceForItem } from "./reality";
 import { dedupeByKey, matchContentKey } from "./dedupe";
 import type {
   AnalyzedMatch,
@@ -565,6 +566,37 @@ export async function buildFeed(force = false): Promise<FeedPayload> {
         };
         console.log(`[engine] ESPN core odds live for ${espnFilled}/${missingOddsMatches.length} matches`);
       }
+    }
+
+    // ── Audit v14 · Market Reality Layer — record real MW pairs + load cache ──
+    // Every real match-winner price already pulled above (Polymarket exchange
+    // or ESPN Core) is persisted with its source tag, so the reality report
+    // can prove WHERE each price came from. If both feeds are empty the audit
+    // trail records the CRITICAL "ODDS FEED STARVED" event instead of letting
+    // synthetic model prices masquerade as market prices.
+    try {
+      const { recordMWQuotes, refreshRealOdds } = await import("./reality");
+      const realPairs: Array<{ eventKey: string; playerA: string; playerB: string; oddsA: number; oddsB: number; source: "ESPN" | "POLYMARKET" }> = [];
+      for (const [key, mo] of marketMap) {
+        if (!(mo.oddsA > 1.01) || !(mo.oddsB > 1.01)) continue;
+        const em = unique.find((x) => `${x.playerA.name}__${x.playerB.name}` === key);
+        if (!em || !/^\d+$/.test(em.eventKey)) continue;
+        realPairs.push({
+          eventKey: em.eventKey,
+          playerA: em.playerA.name,
+          playerB: em.playerB.name,
+          oddsA: mo.oddsA,
+          oddsB: mo.oddsB,
+          source: mo.source === "polymarket" ? "POLYMARKET" : "ESPN",
+        });
+      }
+      await refreshRealOdds(
+        unique.map((m) => ({ eventKey: m.eventKey, tour: m.tour, playerA: m.playerA.name, playerB: m.playerB.name })),
+        realPairs,
+        { probePolymarket: false, probeEspn: false }
+      );
+    } catch (e) {
+      console.error("[engine] reality layer refresh failed", e);
     }
 
     // ── per-match analysis (unified v5.5 path for pre / in / post) ────────
@@ -1204,6 +1236,7 @@ async function persistPicks(items: LineItem[]) {
           stake: item.stake,
           meta: item.meta ?? null,
           status: "PENDING",
+          oddsSource: oddsSourceForItem(item.eventKey, item.leg),
         },
         update: {
           desc: item.desc,
@@ -1211,6 +1244,7 @@ async function persistPicks(items: LineItem[]) {
           prob: item.prob,
           stake: item.stake,
           meta: item.meta ?? null,
+          // provenance of an already-recorded price is never rewritten
         },
       });
     } catch (e) {

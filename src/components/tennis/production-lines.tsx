@@ -927,12 +927,16 @@ function DualFlashcard({ pair }: { pair: { A: LineItem; B: LineItem } }) {
             labelEn: isComboRegime ? "COMBO MAIN" : "TYPE A",
             modelOdds: A.odds,
             marketEn: A.marketEn,
+            eventKey: A.eventKey,
+            leg: A.leg,
           }}
           legB={{
             label: isComboRegime ? "پوشش مکمل" : "تیپ B",
             labelEn: isComboRegime ? "COVER" : "TYPE B",
             modelOdds: B.odds,
             marketEn: B.marketEn,
+            eventKey: B.eventKey,
+            leg: B.leg,
           }}
           matchLabel={matchLabel}
         />
@@ -966,8 +970,8 @@ function RegComboCard({ pair }: { pair: { main: LineItem; cover: LineItem } }) {
         </div>
         {/* v6.0 — live 1xBet calibrator on the copula combo pair */}
         <OddsCalibrator
-          legA={{ label: "تیپ اصلی", labelEn: "COMBO MAIN", modelOdds: main.odds, marketEn: main.marketEn }}
-          legB={{ label: "پوشش مکمل", labelEn: "COVER", modelOdds: cover.odds, marketEn: cover.marketEn }}
+          legA={{ label: "تیپ اصلی", labelEn: "COMBO MAIN", modelOdds: main.odds, marketEn: main.marketEn, eventKey: main.eventKey, leg: main.leg }}
+          legB={{ label: "پوشش مکمل", labelEn: "COVER", modelOdds: cover.odds, marketEn: cover.marketEn, eventKey: cover.eventKey, leg: cover.leg }}
           matchLabel={matchLabel}
         />
         <FlashFooter item={main} matchLabel={matchLabel} />

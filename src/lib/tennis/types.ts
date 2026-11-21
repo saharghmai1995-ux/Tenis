@@ -741,6 +741,10 @@ export interface LedgerPayload {
     combinedWinRate: number;
     /** v4.5 — core system win rate: DUAL + COMBO only (sniper excluded) */
     coreWinRate: number;
+    /** v14 — CERTIFIED win rate: hash-verified rows only (honest marketing) */
+    certifiedWinRate: number;
+    certifiedDecided: number;
+    certifiedWon: number;
     /** v4.5 — stake-weighted win rate over the official record */
     stakeWeightedWinRate: number;
     bank: number;

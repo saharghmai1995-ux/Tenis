@@ -319,11 +319,22 @@ const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x
  *      convention. Every match gets its own quote — the fixed 2.06x/2.75x
  *      template is gone by construction.
  */
+import { realOptionQuote } from "./reality";
+
+/**
+ * Audit v14 — REAL-QUOTE LOCK. If a verified market quote exists for this
+ * exact option domain (ESPN exchange / operator-typed BetForward or 1xBet
+ * board price), it LOCKS the take price. The window model below only runs
+ * when no real quote is available, and the ledger stamps those legs
+ * oddsSource = MODEL_BOARD so past performance is honestly attributable.
+ */
 export function boardTakePrice(
   idx: number,
   prob: number,
   seedKey: string
 ): number {
+  const real = realOptionQuote(seedKey, idx);
+  if (real && real > 1.01) return Math.round(real * 100) / 100;
   const spec = TENNIS_OPTION_POOL[idx];
   const [lo, hi] = spec.boardWindow;
   const pLo = 1 / hi; // weakest allowed model prob (→ highest board quote)

@@ -16,6 +16,7 @@ import { TennisFooter } from "@/components/tennis/footer";
 import { AnalysisDialog } from "@/components/tennis/analysis-dialog";
 import { SupervisorMonitor } from "@/components/tennis/supervisor-monitor";
 import { QqlExplorer } from "@/components/tennis/qql-explorer";
+import { AuditLab } from "@/components/tennis/audit-lab";
 import PosterStudio from "@/components/tennis/poster-studio";
 import type { AnalyzedMatch } from "@/lib/tennis/types";
 
@@ -85,7 +86,7 @@ export default function Home() {
   );
 
   return (
-    <div className="flex min-h-screen flex-col">
+    <div className="flex min-h-screen flex-col overflow-x-clip">
       <HeaderBar
         onRefresh={() => void reload(true)}
         refreshing={refreshing || loading}
@@ -144,6 +145,8 @@ export default function Home() {
             <CommandCenter ledger={data.ledger} />
             <ProductionLines feed={data} ledger={data.ledger} />
             <RecordTable ledger={data.ledger} />
+            {/* v14 — آزمایشگاه راستی‌آزمایی و بازسازی معماری (Audit Lab) */}
+            <AuditLab />
             {/* v12 — 💻 کنسول پرس‌وجوی علوم داده تنیس (QQL & RCA Explorer) */}
             <QqlExplorer />
             <Scoreboard matches={data.matches} onAnalyze={openAnalysis} />

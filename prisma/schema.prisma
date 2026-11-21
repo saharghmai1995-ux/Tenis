@@ -112,6 +112,12 @@ model TennisPick {
   profit  Float?
   settledAt DateTime?
 
+  // ── Audit v14 — where did this price come from?
+  // MODEL_BOARD  = model probability inside the board window (not market-verified)
+  // REAL_MARKET  = a real bookmaker/exchange quote locked this price
+  // MANUAL_REAL  = operator-verified price entered via the Odds Reality panel
+  oddsSource String @default("MODEL_BOARD")
+
   createdAt DateTime @default(now())
 
   @@unique([matchId, line, leg])
@@ -122,5 +128,36 @@ model EngineLog {
   kind    String // FEED | SETTLE | TELEGRAM
   message String
   meta    String?
+  createdAt DateTime @default(now())
+}
+
+// ── Audit v14 · Market Reality Layer ─────────────────────────────────────
+// Real, verifiable bookmaker/exchange prices. The engine NEVER writes a
+// synthetic row here. Sources: ESPN | POLYMARKET | BETFORWARD | ONEXBET | MANUAL.
+model RealOddsQuote {
+  id        String   @id @default(cuid())
+  eventKey  String
+  market    String   // MW | SB_2_0 | SB_2_1 | TS_O25 | TG_O205 | TG_U215 | GH_F35 ...
+  line      String   // "" for MW, "2.5", "-3.5", "20.5" ...
+  price     Float
+  source    String
+  // audit context
+  playerA   String?
+  playerB   String?
+  matchLabel String?
+  fetchedAt DateTime @default(now())
+
+  @@unique([eventKey, market, line, source])
+}
+
+// ── Audit v14 · Append-only integrity trail ─────────────────────────────
+// Written once, never rewritten. Records hash-verification results, gated
+// migrations, real-quote locks and reality-check deviations.
+model AuditEvent {
+  id        String   @id @default(cuid())
+  kind      String   // HASH_VERIFY | MIGRATION_SKIPPED | QUOTE_LOCKED | REALITY_CHECK | TIP_A_BACKTEST
+  severity  String   @default("INFO") // INFO | WARN | CRITICAL
+  message   String
+  payload   String?
   createdAt DateTime @default(now())
 }

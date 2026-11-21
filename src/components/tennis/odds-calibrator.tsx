@@ -18,6 +18,25 @@ export interface CalibratorLeg {
   labelEn: string;      // TYPE A / TYPE B
   modelOdds: number;    // the card's real-1xBet model price
   marketEn?: string;    // official market name (context row)
+  eventKey?: string;    // ESPN event key — enables the REAL-QUOTE LOCK
+  leg?: string;         // engine leg code — resolves the market to lock
+}
+
+/** Audit v14 — map an engine leg code to its real-market coordinates. */
+export function marketOfLeg(leg?: string): { market: string; line: string } | null {
+  const l = leg ?? "";
+  if (/^A(-|$)/.test(l) || /^B(-|$)/.test(l) || l.startsWith("A-O") || l.startsWith("B-A"))
+    return { market: "MW_A", line: "" };
+  if (l.startsWith("SB-P1-20") || l.includes("SB-F20") || l === "T1-SB-F20") return { market: "SB_2_0", line: "" };
+  if (l.startsWith("SB-P1-21") || l.includes("SB-F21") || l === "T2-SB-F21") return { market: "SB_2_1", line: "" };
+  if (l.startsWith("TS-O25")) return { market: "TS_O25", line: "2.5" };
+  if (l.startsWith("TG-O205")) return { market: "TG_O205", line: "20.5" };
+  if (l.startsWith("TG-O225")) return { market: "TG_O225", line: "22.5" };
+  if (l.startsWith("TG-U205")) return { market: "TG_U205", line: "20.5" };
+  if (l.startsWith("TG-U215")) return { market: "TG_U215", line: "21.5" };
+  if (l.startsWith("GH-F35")) return { market: "GH_F35", line: "-3.5" };
+  if (l.startsWith("GH-F45")) return { market: "GH_F45", line: "-4.5" };
+  return null;
 }
 
 interface SplitResult {
@@ -92,6 +111,31 @@ export function OddsCalibrator({
     () => dutchSplit(legA.modelOdds, legB.modelOdds),
     [legA.modelOdds, legB.modelOdds]
   );
+
+  const [lockState, setLockState] = useState<"idle" | "saving" | "done" | "error">("idle");
+  const [lockMsg, setLockMsg] = useState<string | null>(null);
+
+  const lockRealQuote = async (leg: CalibratorLeg, typedOdds: number) => {
+    if (!leg.eventKey) return;
+    const mk = marketOfLeg(leg.leg);
+    if (!mk) return;
+    setLockState("saving");
+    setLockMsg(null);
+    try {
+      const res = await fetch("/api/tennis/reality", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ eventKey: leg.eventKey, market: mk.market, line: mk.line, price: typedOdds, matchLabel }),
+      });
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error ?? "ثبت ناموفق");
+      setLockState("done");
+      setLockMsg(`✔ ضریب واقعی ${typedOdds.toFixed(2)} برای ${mk.market}${mk.line ? ` ${mk.line}` : ""} قفل شد — چرخه بعدی موتور همین را چاپ می‌کند.`);
+    } catch (e) {
+      setLockState("error");
+      setLockMsg(e instanceof Error ? `✖ ${e.message}` : "✖ ثبت ناموفق");
+    }
+  };
 
   return (
     <div
@@ -213,6 +257,30 @@ export function OddsCalibrator({
             </span>
           </div>
         )
+      )}
+
+      {/* v14 — REAL-QUOTE LOCK: persist the operator-verified board price */}
+      {legA.eventKey && marketOfLeg(legA.leg) && (
+        <div className="mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-emerald-400/30 bg-emerald-400/[0.06] p-2">
+          <span className="text-[10px] font-black text-emerald-200">🔒 قفل در پایگاه واقعیت بازار:</span>
+          <button
+            type="button"
+            className="rounded-md border border-emerald-400/40 bg-emerald-500/80 px-2 py-1 text-[10px] font-black text-white transition hover:bg-emerald-400 disabled:opacity-50"
+            onClick={() => void lockRealQuote(legA, num(oddsA, legA.modelOdds))}
+            disabled={lockState === "saving"}
+          >
+            {legA.label}: {num(oddsA, legA.modelOdds).toFixed(2)}
+          </button>
+          <button
+            type="button"
+            className="rounded-md border border-emerald-400/40 bg-emerald-500/80 px-2 py-1 text-[10px] font-black text-white transition hover:bg-emerald-400 disabled:opacity-50"
+            onClick={() => void lockRealQuote(legB, num(oddsB, legB.modelOdds))}
+            disabled={lockState === "saving"}
+          >
+            {legB.label}: {num(oddsB, legB.modelOdds).toFixed(2)}
+          </button>
+          {lockMsg && <span className="text-[10px] font-bold text-emerald-200">{lockMsg}</span>}
+        </div>
       )}
 
       <p className="mt-1 truncate text-center text-[9px] text-white/35" dir="ltr">

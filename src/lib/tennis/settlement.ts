@@ -1115,10 +1115,37 @@ export async function runSettlement(
   //   2. ELITE favorite fix → the Andreescu inverted-favorite rows flip
   //   3. Double-win re-contract → the [T1↔T5] family-1 packages rebuild as
   //      [T1↔T6] and re-settle in the DOUBLE-WIN zone
-  await pruneStaleShadowVetoes();
-  await resettleTop100VetoHistory(resultsByEvent, analyzedByKey);
-  await resettleEliteFavoriteHistory(resultsByEvent);
-  await resettleFamilyDoubleWinHistory(resultsByEvent);
+  // ── Audit v14 · RETRO MIGRATIONS — DEFAULT OFF ──────────────────────────
+  // The v13 retroactive history migrations (TOP100 gate re-seat, elite
+  // favorite flip, double-win re-contract + post-hoc re-pricing) REWROTE
+  // settled ledger rows: 168/370 matches now fail their own SHA-256 pre-lock
+  // hash and 13 picks carry settledAt < createdAt. Rewriting settled history
+  // destroys auditability, so these migrations now run ONLY when the
+  // operator explicitly opts in with NEOBET_RETRO_MIGRATIONS=1.
+  if (process.env.NEOBET_RETRO_MIGRATIONS === "1") {
+    await pruneStaleShadowVetoes();
+    await resettleTop100VetoHistory(resultsByEvent, analyzedByKey);
+    await resettleEliteFavoriteHistory(resultsByEvent);
+    await resettleFamilyDoubleWinHistory(resultsByEvent);
+  } else {
+    try {
+      const existing = await db.auditEvent.findFirst({
+        where: { kind: "MIGRATION_SKIPPED", createdAt: { gte: new Date(Date.now() - 6 * 3600 * 1000) } },
+      });
+      if (!existing) {
+        await db.auditEvent.create({
+          data: {
+            kind: "MIGRATION_SKIPPED",
+            severity: "INFO",
+            message:
+              "Retro history migrations skipped (immutable ledger policy, NEOBET_RETRO_MIGRATIONS unset) — settled rows stay exactly as recorded",
+          },
+        });
+      }
+    } catch {
+      // audit trail is best-effort
+    }
+  }
 
   // 2) settle pending picks
   const pendingPicks = await db.tennisPick.findMany({

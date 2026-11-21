@@ -192,6 +192,9 @@ export function matchToCard(m: AnalyzedMatch): CardMatch {
 
 export interface LedgerStats {
   coreWinRate: number;
+  certifiedWinRate?: number;
+  certifiedDecided?: number;
+  certifiedWon?: number;
   combinedWinRate: number;
   profit: number;
   picks: number;
@@ -283,6 +286,9 @@ class DataHub {
     const s = f.ledger.stats;
     return {
       coreWinRate: s.coreWinRate,
+      certifiedWinRate: s.certifiedWinRate,
+      certifiedDecided: s.certifiedDecided,
+      certifiedWon: s.certifiedWon,
       combinedWinRate: s.combinedWinRate,
       profit: s.profit,
       picks: s.picks,

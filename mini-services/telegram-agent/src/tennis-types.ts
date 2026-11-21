@@ -111,6 +111,9 @@ export interface FeedPayload {
     stats: {
       combinedWinRate: number;
       coreWinRate: number;
+      certifiedWinRate?: number;
+      certifiedDecided?: number;
+      certifiedWon?: number;
       stakeWeightedWinRate: number;
       bank: number;
       bankStart: number;
